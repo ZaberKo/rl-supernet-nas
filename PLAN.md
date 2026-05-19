@@ -33,10 +33,12 @@ All listed implementation items are complete and smoke-tested.
 
 4. Stage 2: representation learning
    - Load the single mixed Arrow dataset produced by stage 1B.
-   - Treat merged `dones` as sequence boundaries so latent dynamics windows do not cross terminated or truncated episodes.
+   - Stage 1 writes only learnable rows by dropping `terminated=True` transitions while keeping time-limit truncated transitions.
+   - Train on shuffled one-step transitions and treat every input row as usable.
    - Initialize the supernet from stage 1 weights when provided.
    - Train sampled subnets with sandwich sampling: max teacher, min subnet, and random subnets.
-   - Use direct loss functions for latent dynamics prediction and cosine latent KD.
+   - Use direct loss functions for one-step latent dynamics prediction and cosine latent KD.
+   - Use AdamW with separate backbone/head learning rates and warmup + cosine scheduling.
    - Save the trained supernet checkpoint and record stage metrics/artifacts to W&B.
 
 5. Stage 3: EvoX NSGA-II subnet search

@@ -115,9 +115,11 @@ python stage2_train_supernet.py --trajectory_data runs/stage1_mix/mixed_trajecto
 
 - 从 stage1A backbone checkpoint 继承初始参数。
 - 从 stage1B 生成的单个 mixed Arrow dataset 读取 PPO + random 轨迹。
+- stage1 数据写入时已过滤 `terminated=True` transition；`truncated=True, terminated=False` transition 会保留。
+- stage2 直接 shuffle one-step transition：`s_t, a_t -> s_{t+1}`，默认输入数据中的每一行都可用于表征学习。
 - 每个 batch 使用 sandwich 采样：最大网络作为 teacher，最小 subnet 与若干随机 subnet 作为 student。
-- 读取轨迹时使用合并后的 `dones` 作为序列边界，避免 latent dynamics window 跨过 episode terminated 或 time-limit truncated。
 - 使用函数式 `latent_dynamics_loss` 和 `cosine_kd_loss` 训练 supernet backbone。
+- 使用 backbone/head 两组 AdamW learning rate，并使用 warmup + cosine scheduler。
 - 保存 `supernet_backbone_stage2.pt`、`metrics.jsonl`、`manifest.json`。
 
 stage2 的 AdamW 使用 PyTorch 默认 beta/eps；DataLoader 的 shuffle/pin_memory/drop_last 也 hardcode 为常规训练默认值。
@@ -126,7 +128,7 @@ stage2 的 AdamW 使用 PyTorch 默认 beta/eps；DataLoader 的 shuffle/pin_mem
 
 ```bash
 source .venv/bin/activate
-python stage2_train_supernet.py --trajectory_data runs/stage1_mix/mixed_trajectories.arrow --epochs 10 --random_subnets 4 --projection_dim 128
+python stage2_train_supernet.py --trajectory_data runs/stage1_mix/mixed_trajectories.arrow --train_steps 5000 --random_subnets 4 --projection_dim 128
 ```
 
 ## Stage 3: NSGA-II subnet 搜索
@@ -174,7 +176,7 @@ python stage1_mix_random_data.py --ppo_trajectory_file runs/smoke_stage1/ppo_tra
 
 ```bash
 source .venv/bin/activate
-python stage2_train_supernet.py --trajectory_data runs/smoke_mix/mixed_trajectories.arrow --stage1_backbone runs/smoke_stage1/supernet_backbone_stage1.pt --output_dir runs/smoke_stage2 --epochs 1 --max_batches_per_epoch 1 --batch_size 2 --horizon 2 --random_subnets 1 --projection_dim 16 --predictor_hidden_dim 32 --ppo_config_override ppo.features_dim=32
+python stage2_train_supernet.py --trajectory_data runs/smoke_mix/mixed_trajectories.arrow --stage1_backbone runs/smoke_stage1/supernet_backbone_stage1.pt --output_dir runs/smoke_stage2 --train_steps 1 --batch_size 2 --random_subnets 1 --projection_dim 16 --predictor_hidden_dim 32 --ppo_config_override ppo.features_dim=32
 ```
 
 ```bash

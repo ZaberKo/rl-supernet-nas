@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Sequence
-
 import gymnasium as gym
 import torch
 import torch.nn as nn
@@ -26,24 +24,17 @@ class LatentDynamicsPredictor(nn.Module):
         self,
         latent_dim: int,
         action_dim: int,
-        horizon: int,
         hidden_dim: int = 512,
     ):
         super().__init__()
         self.latent_dim = latent_dim
         self.action_dim = action_dim
-        self.horizon = horizon
-        self.predictors = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.Linear(latent_dim + action_dim * (step + 1), hidden_dim),
-                    nn.SiLU(inplace=True),
-                    nn.Linear(hidden_dim, hidden_dim),
-                    nn.SiLU(inplace=True),
-                    nn.Linear(hidden_dim, latent_dim),
-                )
-                for step in range(horizon)
-            ]
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim + action_dim, hidden_dim),
+            nn.SiLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(inplace=True),
+            nn.Linear(hidden_dim, latent_dim),
         )
 
     def forward(
@@ -51,30 +42,17 @@ class LatentDynamicsPredictor(nn.Module):
         start_latent: torch.Tensor,
         action_features: torch.Tensor,
     ) -> torch.Tensor:
-        predictions = []
-        for step, predictor in enumerate(self.predictors):
-            partial_actions = action_features[:, : step + 1].reshape(
-                action_features.size(0),
-                -1,
-            )
-            predictions.append(predictor(torch.cat([start_latent, partial_actions], dim=-1)))
-        return torch.stack(predictions, dim=1)
+        return self.net(torch.cat([start_latent, action_features], dim=-1))
 
 
 def latent_dynamics_loss(
     predictions: torch.Tensor,
     teacher_targets: torch.Tensor,
-    beta: Sequence[float] | torch.Tensor | None = None,
 ) -> torch.Tensor:
     predictions = F.normalize(predictions, dim=-1)
     teacher_targets = F.normalize(teacher_targets.detach(), dim=-1)
     distance = 2.0 - 2.0 * F.cosine_similarity(predictions, teacher_targets, dim=-1)
-    if beta is None:
-        return distance.mean()
-    beta_tensor = torch.as_tensor(beta, dtype=distance.dtype, device=distance.device)
-    if beta_tensor.numel() != distance.size(1):
-        raise ValueError("beta length must match the prediction horizon.")
-    return (distance * beta_tensor.view(1, -1)).mean()
+    return distance.mean()
 
 
 def cosine_kd_loss(
@@ -98,16 +76,16 @@ def get_action_dim(action_space: gym.Space) -> int:
     raise TypeError(f"Unsupported action space: {type(action_space).__name__}")
 
 
-def encode_action_sequence(actions: torch.Tensor, action_space: gym.Space) -> torch.Tensor:
+def encode_action_batch(actions: torch.Tensor, action_space: gym.Space) -> torch.Tensor:
     if isinstance(action_space, gym.spaces.Discrete):
-        return F.one_hot(actions.long(), num_classes=int(action_space.n)).float()
+        return F.one_hot(actions.long().view(-1), num_classes=int(action_space.n)).float()
     if isinstance(action_space, gym.spaces.Box):
-        return actions.float().view(actions.size(0), actions.size(1), -1)
+        return actions.float().view(actions.size(0), -1)
     if isinstance(action_space, gym.spaces.MultiDiscrete):
         parts = []
         for index, classes in enumerate(action_space.nvec):
-            parts.append(F.one_hot(actions[..., index].long(), num_classes=int(classes)).float())
+            parts.append(F.one_hot(actions[:, index].long(), num_classes=int(classes)).float())
         return torch.cat(parts, dim=-1)
     if isinstance(action_space, gym.spaces.MultiBinary):
-        return actions.float().view(actions.size(0), actions.size(1), -1)
+        return actions.float().view(actions.size(0), -1)
     raise TypeError(f"Unsupported action space: {type(action_space).__name__}")

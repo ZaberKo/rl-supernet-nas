@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 import gymnasium as gym
 import numpy as np
@@ -102,21 +102,39 @@ def write_metadata(path: str | Path, metadata: dict[str, Any]) -> None:
     Path(path, TRAJECTORY_METADATA_FILE).write_text(json.dumps(metadata, indent=2))
 
 
-def normalize_segment(segment: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-    observations = np.asarray(segment["observations"])
-    actions = np.asarray(segment["actions"])
-    rewards = np.asarray(segment["rewards"], dtype=np.float32)
-    terminateds = np.asarray(segment["terminateds"], dtype=np.bool_)
-    truncateds = np.asarray(segment["truncateds"], dtype=np.bool_)
-    next_observations = np.asarray(segment["next_observations"])
-    if observations.shape[0] != rewards.shape[0]:
-        raise ValueError("Segment observations and rewards must have the same length.")
+def read_metadata(path: str | Path) -> dict[str, Any]:
+    path = Path(path)
+    if is_arrow_trajectory(path):
+        metadata_path = path / TRAJECTORY_METADATA_FILE
+        if metadata_path.exists():
+            return json.loads(metadata_path.read_text())
+        return {}
+
+    loaded = np.load(path, allow_pickle=False)
+    if "metadata" not in loaded:
+        return {}
+    return json.loads(str(loaded["metadata"]))
+
+
+def normalize_trajectory_arrays(arrays: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    observations = np.asarray(arrays["observations"])
+    actions = np.asarray(arrays["actions"])
+    rewards = np.asarray(arrays["rewards"], dtype=np.float32)
+    terminateds = np.asarray(arrays["terminateds"], dtype=np.bool_)
+    truncateds = np.asarray(arrays["truncateds"], dtype=np.bool_)
+    next_observations = np.asarray(arrays["next_observations"])
+
+    if rewards.ndim != 2:
+        raise ValueError("rewards must have shape [num_steps, num_envs].")
+    if observations.shape[:2] != rewards.shape:
+        raise ValueError("observations must start with [num_steps, num_envs].")
     if next_observations.shape != observations.shape:
-        raise ValueError("Segment next_observations must match observations shape.")
-    if actions.shape[0] != rewards.shape[0]:
-        raise ValueError("Segment actions and rewards must have the same length.")
+        raise ValueError("next_observations must match observations shape.")
+    if actions.shape[:2] != rewards.shape:
+        raise ValueError("actions must start with [num_steps, num_envs].")
     if terminateds.shape != rewards.shape or truncateds.shape != rewards.shape:
-        raise ValueError("Segment done flags must match rewards shape.")
+        raise ValueError("done flags must have shape [num_steps, num_envs].")
+
     return {
         "observations": observations,
         "actions": actions,
@@ -125,89 +143,136 @@ def normalize_segment(segment: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         "truncateds": truncateds,
         "dones": terminateds | truncateds,
         "next_observations": next_observations,
-        "env_index": np.asarray(segment.get("env_index", 0), dtype=np.int64),
     }
 
 
-def segments_from_arrays(arrays: dict[str, np.ndarray]) -> list[dict[str, np.ndarray]]:
-    observations = np.asarray(arrays["observations"])
-    actions = np.asarray(arrays["actions"])
-    rewards = np.asarray(arrays["rewards"], dtype=np.float32)
-    terminateds = np.asarray(arrays["terminateds"], dtype=np.bool_)
-    truncateds = np.asarray(arrays["truncateds"], dtype=np.bool_)
-    next_observations = np.asarray(arrays["next_observations"])
-    if rewards.ndim != 2:
-        raise ValueError("rewards must have shape [num_steps, num_envs].")
-    num_envs = int(rewards.shape[1])
-    segments = []
+def load_done_arrays(loaded: np.lib.npyio.NpzFile) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if "terminateds" in loaded and "truncateds" in loaded:
+        terminateds = np.asarray(loaded["terminateds"], dtype=np.bool_)
+        truncateds = np.asarray(loaded["truncateds"], dtype=np.bool_)
+        dones = np.asarray(loaded["dones"], dtype=np.bool_)
+        return terminateds, truncateds, dones
+
+    dones = np.asarray(loaded["dones"], dtype=np.bool_)
+    terminateds = dones.copy()
+    truncateds = np.zeros_like(dones, dtype=np.bool_)
+    return terminateds, truncateds, dones
+
+
+def load_npz_trajectory_arrays(path: str | Path) -> dict[str, np.ndarray]:
+    loaded = np.load(Path(path), allow_pickle=False)
+    terminateds, truncateds, dones = load_done_arrays(loaded)
+    return {
+        "observations": loaded["observations"],
+        "actions": loaded["actions"],
+        "rewards": loaded["rewards"],
+        "terminateds": terminateds,
+        "truncateds": truncateds,
+        "dones": dones,
+        "next_observations": loaded["next_observations"],
+    }
+
+
+def iter_rows_from_arrays(
+    arrays: dict[str, np.ndarray],
+    trajectory_offset: int = 0,
+    skip_terminated: bool = True,
+) -> Iterable[dict[str, Any]]:
+    data = normalize_trajectory_arrays(arrays)
+    num_steps, num_envs = data["rewards"].shape
     for env_index in range(num_envs):
-        segments.append(
+        trajectory_id = int(trajectory_offset + env_index)
+        saved_step_index = 0
+        for source_step_index in range(num_steps):
+            terminated = bool(data["terminateds"][source_step_index, env_index])
+            if skip_terminated and terminated:
+                continue
+            truncated = bool(data["truncateds"][source_step_index, env_index])
+            yield {
+                "trajectory_id": trajectory_id,
+                "step_index": int(saved_step_index),
+                "env_index": int(env_index),
+                "observation": data["observations"][source_step_index, env_index],
+                "action": scalar_or_array_value(data["actions"][source_step_index, env_index]),
+                "reward": float(data["rewards"][source_step_index, env_index]),
+                "terminated": terminated,
+                "truncated": truncated,
+                "done": bool(terminated or truncated),
+                "next_observation": data["next_observations"][source_step_index, env_index],
+            }
+            saved_step_index += 1
+
+
+def load_arrow_rows(path: str | Path) -> list[dict[str, Any]]:
+    path = Path(path)
+    metadata = read_metadata(path)
+    dataset = ArrowDataset.load_from_disk(str(path)).with_format("numpy")
+    if len(dataset) == 0:
+        raise ValueError(f"Trajectory dataset is empty: {path}")
+
+    first = dataset[0]
+    observation_dtype = np.dtype(metadata.get("observation_dtype", np.asarray(first["observation"]).dtype))
+    action_dtype = np.dtype(metadata.get("action_dtype", np.asarray(first["action"]).dtype))
+    has_trajectory_id = "trajectory_id" in dataset.column_names
+    rows = []
+    for row in dataset:
+        trajectory_id = int(row["trajectory_id"]) if has_trajectory_id else int(row["env_index"])
+        terminated = bool(row.get("terminated", row.get("done", False)))
+        truncated = bool(row.get("truncated", False))
+        done = bool(row.get("done", terminated or truncated))
+        rows.append(
             {
-                "observations": observations[:, env_index],
-                "actions": actions[:, env_index],
-                "rewards": rewards[:, env_index],
-                "terminateds": terminateds[:, env_index],
-                "truncateds": truncateds[:, env_index],
-                "next_observations": next_observations[:, env_index],
-                "env_index": np.asarray(env_index, dtype=np.int64),
+                "trajectory_id": trajectory_id,
+                "step_index": int(row["step_index"]),
+                "env_index": int(row["env_index"]),
+                "observation": np.asarray(row["observation"], dtype=observation_dtype),
+                "action": scalar_or_array_value(np.asarray(row["action"], dtype=action_dtype)),
+                "reward": float(row["reward"]),
+                "terminated": terminated,
+                "truncated": truncated,
+                "done": done,
+                "next_observation": np.asarray(row["next_observation"], dtype=observation_dtype),
             }
         )
-    return segments
+    return sorted(rows, key=lambda item: (int(item["trajectory_id"]), int(item["step_index"])))
 
 
-def trajectory_rows_from_segments(segments: Sequence[dict[str, np.ndarray]]):
-    for trajectory_id, raw_segment in enumerate(segments):
-        segment = normalize_segment(raw_segment)
-        env_index = int(np.asarray(segment["env_index"]).item())
-        num_steps = int(segment["rewards"].shape[0])
-        for step_index in range(num_steps):
-            yield {
-                "trajectory_id": int(trajectory_id),
-                "step_index": int(step_index),
-                "env_index": env_index,
-                "observation": segment["observations"][step_index],
-                "action": scalar_or_array_value(segment["actions"][step_index]),
-                "reward": float(segment["rewards"][step_index]),
-                "terminated": bool(segment["terminateds"][step_index]),
-                "truncated": bool(segment["truncateds"][step_index]),
-                "done": bool(segment["dones"][step_index]),
-                "next_observation": segment["next_observations"][step_index],
-            }
-
-
-def save_trajectory_segments(
-    path: str | Path,
-    segments: Sequence[dict[str, np.ndarray]],
-    metadata: dict[str, Any] | None = None,
-) -> None:
+def load_trajectory_rows(path: str | Path) -> list[dict[str, Any]]:
     path = Path(path)
-    path.mkdir(parents=True, exist_ok=True)
-    normalized = [normalize_segment(segment) for segment in segments]
-    if not normalized:
-        raise ValueError("At least one trajectory segment is required.")
+    if is_arrow_trajectory(path):
+        return load_arrow_rows(path)
+    return list(iter_rows_from_arrays(load_npz_trajectory_arrays(path)))
 
-    first = normalized[0]
-    observation_shape = tuple(int(value) for value in first["observations"].shape[1:])
-    observation_dtype = first["observations"].dtype
-    action_shape = tuple(int(value) for value in first["actions"].shape[1:])
-    action_dtype = first["actions"].dtype
-    for segment in normalized[1:]:
-        if tuple(segment["observations"].shape[1:]) != observation_shape:
-            raise ValueError("All trajectory segments must share the same observation shape.")
-        if tuple(segment["actions"].shape[1:]) != action_shape:
-            raise ValueError("All trajectory segments must share the same action shape.")
 
-    lengths = [int(segment["rewards"].shape[0]) for segment in normalized]
+def trajectory_metadata_from_rows(rows: Sequence[dict[str, Any]], metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    first = rows[0]
+    observation_shape = tuple(int(value) for value in np.asarray(first["observation"]).shape)
+    action_shape = tuple(int(value) for value in np.asarray(first["action"]).shape)
+    observation_dtype = np.asarray(first["observation"]).dtype
+    action_dtype = np.asarray(first["action"]).dtype
+
+    trajectory_lengths: dict[int, int] = {}
+    for row in rows:
+        if tuple(np.asarray(row["observation"]).shape) != observation_shape:
+            raise ValueError("All trajectory rows must share the same observation shape.")
+        if tuple(np.asarray(row["next_observation"]).shape) != observation_shape:
+            raise ValueError("All next observations must share the same observation shape.")
+        if tuple(np.asarray(row["action"]).shape) != action_shape:
+            raise ValueError("All trajectory rows must share the same action shape.")
+        trajectory_id = int(row["trajectory_id"])
+        trajectory_lengths[trajectory_id] = trajectory_lengths.get(trajectory_id, 0) + 1
+
+    lengths = [trajectory_lengths[key] for key in sorted(trajectory_lengths)]
     payload_metadata = dict(metadata or {})
     payload_metadata.update(
         {
-            "trajectory_schema_version": 4,
+            "trajectory_schema_version": 5,
             "trajectory_storage_format": TRAJECTORY_STORAGE_FORMAT,
-            "num_trajectories": int(len(normalized)),
+            "num_trajectories": int(len(lengths)),
             "num_steps": int(max(lengths)),
-            "num_envs": int(len(normalized)),
-            "num_transitions": int(sum(lengths)),
-            "trajectory_lengths": lengths,
+            "num_envs": int(len(lengths)),
+            "num_transitions": int(len(rows)),
+            "trajectory_lengths": [int(value) for value in lengths],
             "observation_shape": list(observation_shape),
             "observation_dtype": str(observation_dtype),
             "action_shape": list(action_shape),
@@ -215,17 +280,45 @@ def save_trajectory_segments(
             "reward_dtype": "float32",
         }
     )
+    return payload_metadata
 
+
+def save_trajectory_rows(
+    path: str | Path,
+    rows: Sequence[dict[str, Any]],
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        raise ValueError("At least one trajectory row is required.")
+
+    payload_metadata = trajectory_metadata_from_rows(rows, metadata=metadata)
     features = build_trajectory_features(
-        observation_shape=observation_shape,
-        observation_dtype=observation_dtype,
-        action_shape=action_shape,
-        action_dtype=action_dtype,
+        observation_shape=payload_metadata["observation_shape"],
+        observation_dtype=np.dtype(payload_metadata["observation_dtype"]),
+        action_shape=payload_metadata["action_shape"],
+        action_dtype=np.dtype(payload_metadata["action_dtype"]),
     )
-    dataset = ArrowDataset.from_generator(
-        lambda: trajectory_rows_from_segments(normalized),
-        features=features,
-    )
+
+    def row_generator():
+        for row in rows:
+            terminated = bool(row["terminated"])
+            truncated = bool(row["truncated"])
+            yield {
+                "trajectory_id": int(row["trajectory_id"]),
+                "step_index": int(row["step_index"]),
+                "env_index": int(row["env_index"]),
+                "observation": np.asarray(row["observation"]),
+                "action": scalar_or_array_value(row["action"]),
+                "reward": float(row["reward"]),
+                "terminated": terminated,
+                "truncated": truncated,
+                "done": bool(row.get("done", terminated or truncated)),
+                "next_observation": np.asarray(row["next_observation"]),
+            }
+
+    dataset = ArrowDataset.from_generator(row_generator, features=features)
     dataset.save_to_disk(str(path))
     write_metadata(path, payload_metadata)
 
@@ -248,130 +341,50 @@ def save_trajectory_dataset(
         "truncateds": np.asarray(truncateds, dtype=np.bool_),
         "next_observations": np.asarray(next_observations),
     }
-    save_trajectory_segments(path, segments_from_arrays(arrays), metadata=metadata)
-
-
-def load_done_arrays(loaded: np.lib.npyio.NpzFile) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    if "terminateds" in loaded and "truncateds" in loaded:
-        terminateds = np.asarray(loaded["terminateds"], dtype=np.bool_)
-        truncateds = np.asarray(loaded["truncateds"], dtype=np.bool_)
-        dones = np.asarray(loaded["dones"], dtype=np.bool_)
-        return terminateds, truncateds, dones
-
-    dones = np.asarray(loaded["dones"], dtype=np.bool_)
-    terminateds = dones.copy()
-    truncateds = np.zeros_like(dones, dtype=np.bool_)
-    return terminateds, truncateds, dones
-
-
-def read_metadata(path: str | Path) -> dict[str, Any]:
-    path = Path(path)
-    if is_arrow_trajectory(path):
-        metadata_path = path / TRAJECTORY_METADATA_FILE
-        if metadata_path.exists():
-            return json.loads(metadata_path.read_text())
-        return {}
-
-    loaded = np.load(path, allow_pickle=False)
-    if "metadata" not in loaded:
-        return {}
-    return json.loads(str(loaded["metadata"]))
-
-
-def load_npz_trajectory_arrays(path: str | Path) -> dict[str, np.ndarray]:
-    loaded = np.load(Path(path), allow_pickle=False)
-    terminateds, truncateds, dones = load_done_arrays(loaded)
-    return {
-        "observations": loaded["observations"],
-        "actions": loaded["actions"],
-        "rewards": loaded["rewards"],
-        "terminateds": terminateds,
-        "truncateds": truncateds,
-        "dones": dones,
-        "next_observations": loaded["next_observations"],
-    }
-
-
-def load_arrow_trajectory_segments(path: str | Path) -> list[dict[str, np.ndarray]]:
-    path = Path(path)
-    metadata = read_metadata(path)
-    dataset = ArrowDataset.load_from_disk(str(path)).with_format("numpy")
-    if len(dataset) == 0:
-        raise ValueError(f"Trajectory dataset is empty: {path}")
-    if "trajectory_id" not in dataset.column_names:
-        return segments_from_arrays(load_arrow_trajectory_arrays(path))
-
-    first = dataset[0]
-    observation_dtype = np.dtype(metadata.get("observation_dtype", np.asarray(first["observation"]).dtype))
-    action_dtype = np.dtype(metadata.get("action_dtype", np.asarray(first["action"]).dtype))
-    groups: dict[int, list[dict[str, Any]]] = {}
-    for row in dataset:
-        groups.setdefault(int(row["trajectory_id"]), []).append(row)
-
-    segments = []
-    for trajectory_id in sorted(groups):
-        rows = sorted(groups[trajectory_id], key=lambda item: int(item["step_index"]))
-        observations = np.stack([np.asarray(row["observation"], dtype=observation_dtype) for row in rows], axis=0)
-        next_observations = np.stack([np.asarray(row["next_observation"], dtype=observation_dtype) for row in rows], axis=0)
-        actions = np.stack([np.asarray(row["action"], dtype=action_dtype) for row in rows], axis=0)
-        rewards = np.asarray([row["reward"] for row in rows], dtype=np.float32)
-        terminateds = np.asarray([row["terminated"] for row in rows], dtype=np.bool_)
-        truncateds = np.asarray([row["truncated"] for row in rows], dtype=np.bool_)
-        segments.append(
-            {
-                "observations": observations,
-                "actions": actions,
-                "rewards": rewards,
-                "terminateds": terminateds,
-                "truncateds": truncateds,
-                "next_observations": next_observations,
-                "env_index": np.asarray(rows[0]["env_index"], dtype=np.int64),
-            }
-        )
-    return segments
+    save_trajectory_rows(path, list(iter_rows_from_arrays(arrays)), metadata=metadata)
 
 
 def load_arrow_trajectory_arrays(path: str | Path) -> dict[str, np.ndarray]:
-    path = Path(path)
-    metadata = read_metadata(path)
-    dataset = ArrowDataset.load_from_disk(str(path)).with_format("numpy")
-    if len(dataset) == 0:
-        raise ValueError(f"Trajectory dataset is empty: {path}")
+    rows = load_arrow_rows(path)
+    groups: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        groups.setdefault(int(row["trajectory_id"]), []).append(row)
 
-    step_indices = np.asarray(dataset["step_index"], dtype=np.int64)
-    env_indices = np.asarray(dataset["env_index"], dtype=np.int64)
-    num_steps = int(metadata.get("num_steps", int(step_indices.max()) + 1))
-    num_envs = int(metadata.get("num_envs", int(env_indices.max()) + 1))
+    sorted_ids = sorted(groups)
+    lengths = [len(groups[trajectory_id]) for trajectory_id in sorted_ids]
+    if len(set(lengths)) != 1:
+        raise ValueError(f"Trajectory rows do not form a rectangular array: {path}")
 
-    first = dataset[0]
-    observation_dtype = np.dtype(metadata.get("observation_dtype", np.asarray(first["observation"]).dtype))
-    action_dtype = np.dtype(metadata.get("action_dtype", np.asarray(first["action"]).dtype))
-    observation_shape = tuple(int(value) for value in metadata.get("observation_shape", np.asarray(first["observation"]).shape))
-    action_shape = tuple(int(value) for value in metadata.get("action_shape", np.asarray(first["action"]).shape))
+    num_steps = lengths[0]
+    first = groups[sorted_ids[0]][0]
+    observation_shape = tuple(np.asarray(first["observation"]).shape)
+    action_shape = tuple(np.asarray(first["action"]).shape)
+    observation_dtype = np.asarray(first["observation"]).dtype
+    action_dtype = np.asarray(first["action"]).dtype
+    num_trajectories = len(sorted_ids)
 
-    observations = np.empty((num_steps, num_envs, *observation_shape), dtype=observation_dtype)
+    observations = np.empty((num_steps, num_trajectories, *observation_shape), dtype=observation_dtype)
     next_observations = np.empty_like(observations)
-    actions = np.empty((num_steps, num_envs, *action_shape), dtype=action_dtype)
-    rewards = np.empty((num_steps, num_envs), dtype=np.float32)
-    terminateds = np.empty((num_steps, num_envs), dtype=np.bool_)
-    truncateds = np.empty((num_steps, num_envs), dtype=np.bool_)
-    dones = np.empty((num_steps, num_envs), dtype=np.bool_)
+    actions = np.empty((num_steps, num_trajectories, *action_shape), dtype=action_dtype)
+    rewards = np.empty((num_steps, num_trajectories), dtype=np.float32)
+    terminateds = np.empty((num_steps, num_trajectories), dtype=np.bool_)
+    truncateds = np.empty((num_steps, num_trajectories), dtype=np.bool_)
+    dones = np.empty((num_steps, num_trajectories), dtype=np.bool_)
 
-    seen = np.zeros((num_steps, num_envs), dtype=np.bool_)
-    for row in dataset:
-        step_index = int(row["step_index"])
-        env_index = int(row["env_index"])
-        observations[step_index, env_index] = np.asarray(row["observation"], dtype=observation_dtype)
-        next_observations[step_index, env_index] = np.asarray(row["next_observation"], dtype=observation_dtype)
-        actions[step_index, env_index] = np.asarray(row["action"], dtype=action_dtype)
-        rewards[step_index, env_index] = np.float32(row["reward"])
-        terminateds[step_index, env_index] = bool(row["terminated"])
-        truncateds[step_index, env_index] = bool(row["truncated"])
-        dones[step_index, env_index] = bool(row["done"])
-        seen[step_index, env_index] = True
-
-    if not bool(seen.all()):
-        raise ValueError(f"Trajectory dataset has missing step/env rows: {path}")
+    for trajectory_index, trajectory_id in enumerate(sorted_ids):
+        trajectory_rows = sorted(groups[trajectory_id], key=lambda item: int(item["step_index"]))
+        expected_steps = list(range(num_steps))
+        actual_steps = [int(row["step_index"]) for row in trajectory_rows]
+        if actual_steps != expected_steps:
+            raise ValueError(f"Trajectory {trajectory_id} has non-contiguous step indices.")
+        for step_index, row in enumerate(trajectory_rows):
+            observations[step_index, trajectory_index] = np.asarray(row["observation"], dtype=observation_dtype)
+            next_observations[step_index, trajectory_index] = np.asarray(row["next_observation"], dtype=observation_dtype)
+            actions[step_index, trajectory_index] = np.asarray(row["action"], dtype=action_dtype)
+            rewards[step_index, trajectory_index] = np.float32(row["reward"])
+            terminateds[step_index, trajectory_index] = bool(row["terminated"])
+            truncateds[step_index, trajectory_index] = bool(row["truncated"])
+            dones[step_index, trajectory_index] = bool(row["done"])
 
     return {
         "observations": observations,
@@ -391,11 +404,23 @@ def load_trajectory_arrays(path: str | Path) -> dict[str, np.ndarray]:
     return load_npz_trajectory_arrays(path)
 
 
-def load_trajectory_segments(path: str | Path) -> list[dict[str, np.ndarray]]:
-    path = Path(path)
-    if is_arrow_trajectory(path):
-        return load_arrow_trajectory_segments(path)
-    return segments_from_arrays(load_npz_trajectory_arrays(path))
+def remap_trajectory_ids(rows: Sequence[dict[str, Any]], trajectory_offset: int) -> tuple[list[dict[str, Any]], int]:
+    id_map: dict[int, int] = {}
+    next_step_index: dict[int, int] = {}
+    remapped = []
+    for row in sorted(rows, key=lambda item: (int(item["trajectory_id"]), int(item["step_index"]))):
+        if bool(row["terminated"]):
+            continue
+        old_id = int(row["trajectory_id"])
+        if old_id not in id_map:
+            id_map[old_id] = trajectory_offset + len(id_map)
+        new_id = int(id_map[old_id])
+        new_row = dict(row)
+        new_row["trajectory_id"] = new_id
+        new_row["step_index"] = int(next_step_index.get(new_id, 0))
+        next_step_index[new_id] = int(new_row["step_index"]) + 1
+        remapped.append(new_row)
+    return remapped, trajectory_offset + len(id_map)
 
 
 def write_mixed_trajectory_dataset(
@@ -403,10 +428,12 @@ def write_mixed_trajectory_dataset(
     output_path: str | Path,
     metadata: dict[str, Any] | None = None,
 ) -> None:
-    segments: list[dict[str, np.ndarray]] = []
+    rows: list[dict[str, Any]] = []
+    trajectory_offset = 0
     for input_path in input_paths:
-        segments.extend(load_trajectory_segments(input_path))
-    save_trajectory_segments(output_path, segments, metadata=metadata)
+        input_rows, trajectory_offset = remap_trajectory_ids(load_trajectory_rows(input_path), trajectory_offset)
+        rows.extend(input_rows)
+    save_trajectory_rows(output_path, rows, metadata=metadata)
 
 
 class TrajectoryBuffer:
@@ -551,46 +578,25 @@ def collect_random_trajectories(
     return buffer
 
 
-class TrajectoryDataset(TorchDataset):
-    def __init__(self, trajectory_files: Sequence[str | Path], horizon: int):
-        self.horizon = int(horizon)
-        if self.horizon <= 0:
-            raise ValueError("horizon must be positive.")
-        self.files: list[dict[str, np.ndarray]] = []
-        self.indices: list[tuple[int, int, int]] = []
+class TransitionDataset(TorchDataset):
+    def __init__(self, trajectory_files: Sequence[str | Path]):
+        self.rows: list[dict[str, Any]] = []
         for path in trajectory_files:
-            for segment in load_trajectory_segments(path):
-                data = {
-                    "observations": segment["observations"][:, None],
-                    "actions": segment["actions"][:, None],
-                    "dones": (segment["terminateds"] | segment["truncateds"])[:, None],
-                    "next_observations": segment["next_observations"][:, None],
-                }
-                file_index = len(self.files)
-                self.files.append(data)
-                dones = data["dones"]
-                num_steps, num_envs = dones.shape[:2]
-                for step in range(num_steps - self.horizon + 1):
-                    done_window = dones[step : step + self.horizon]
-                    for env_index in range(num_envs):
-                        if not bool(done_window[:, env_index].any()):
-                            self.indices.append((file_index, step, env_index))
-        if not self.indices:
-            raise ValueError("No valid trajectory windows were found.")
+            self.rows.extend(load_trajectory_rows(path))
+        if not self.rows:
+            raise ValueError("No transitions were found.")
+        if any(bool(row["terminated"]) for row in self.rows):
+            raise ValueError("TransitionDataset expects stage1 data with terminated transitions already removed.")
 
     def __len__(self) -> int:
-        return len(self.indices)
+        return len(self.rows)
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
-        file_index, step, env_index = self.indices[index]
-        data = self.files[file_index]
-        observation = data["observations"][step, env_index]
-        actions = data["actions"][step : step + self.horizon, env_index]
-        targets = data["next_observations"][step : step + self.horizon, env_index]
+        row = self.rows[index]
         return {
-            "observation": self._to_image_tensor(observation),
-            "actions": torch.as_tensor(actions),
-            "targets": self._to_image_tensor(targets),
+            "observation": self._to_image_tensor(row["observation"]),
+            "action": torch.as_tensor(row["action"]),
+            "target": self._to_image_tensor(row["next_observation"]),
         }
 
     @staticmethod
@@ -603,7 +609,6 @@ class TrajectoryDataset(TorchDataset):
         if tensor.numel() > 0 and float(tensor.detach().max()) > 1.0:
             return tensor.float().div(255.0)
         return tensor.float()
-
 
 def count_trajectory_file(path: str | Path) -> dict[str, int]:
     path = Path(path)
@@ -621,23 +626,18 @@ def count_trajectory_file(path: str | Path) -> dict[str, int]:
                 "num_trajectories": 0,
             }
         step_indices = np.asarray(dataset["step_index"], dtype=np.int64)
-        if "trajectory_id" in dataset.column_names:
-            trajectory_ids = np.asarray(dataset["trajectory_id"], dtype=np.int64)
-            num_trajectories = int(np.unique(trajectory_ids).size)
-        else:
-            env_indices = np.asarray(dataset["env_index"], dtype=np.int64)
-            num_trajectories = int(metadata.get("num_envs", int(env_indices.max()) + 1))
+        trajectory_ids = np.asarray(dataset["trajectory_id"], dtype=np.int64) if "trajectory_id" in dataset.column_names else np.asarray(dataset["env_index"], dtype=np.int64)
         terminateds = np.asarray(dataset["terminated"], dtype=np.bool_)
         truncateds = np.asarray(dataset["truncated"], dtype=np.bool_)
         dones = np.asarray(dataset["done"], dtype=np.bool_)
         return {
             "num_steps": int(metadata.get("num_steps", int(step_indices.max()) + 1)),
-            "num_envs": int(metadata.get("num_envs", num_trajectories)),
+            "num_envs": int(metadata.get("num_envs", int(np.unique(trajectory_ids).size))),
             "num_transitions": int(len(dataset)),
             "num_terminated": int(terminateds.sum()),
             "num_truncated": int(truncateds.sum()),
             "num_done": int(dones.sum()),
-            "num_trajectories": num_trajectories,
+            "num_trajectories": int(np.unique(trajectory_ids).size),
         }
 
     arrays = load_npz_trajectory_arrays(path)
@@ -662,30 +662,26 @@ def write_trajectory_prefix(
     metadata: dict[str, Any] | None = None,
 ) -> None:
     input_path = Path(input_path)
-    output_path = Path(output_path)
-    source_segments = load_trajectory_segments(input_path)
+    rows = [row for row in load_trajectory_rows(input_path) if not bool(row["terminated"])]
     source_metadata = read_metadata(input_path)
-    max_source_steps = max(int(segment["rewards"].shape[0]) for segment in source_segments)
+    groups: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        groups.setdefault(int(row["trajectory_id"]), []).append(row)
+    max_source_steps = max(len(group_rows) for group_rows in groups.values())
     selected_steps = max_source_steps if num_steps is None or num_steps <= 0 else min(num_steps, max_source_steps)
-    selected_segments = []
-    for segment in source_segments:
-        segment_steps = min(selected_steps, int(segment["rewards"].shape[0]))
-        selected_segments.append(
-            {
-                "observations": segment["observations"][:segment_steps],
-                "actions": segment["actions"][:segment_steps],
-                "rewards": segment["rewards"][:segment_steps],
-                "terminateds": segment["terminateds"][:segment_steps],
-                "truncateds": segment["truncateds"][:segment_steps],
-                "next_observations": segment["next_observations"][:segment_steps],
-                "env_index": segment.get("env_index", np.asarray(0, dtype=np.int64)),
-            }
-        )
+
+    selected_rows: list[dict[str, Any]] = []
+    for trajectory_id in sorted(groups):
+        trajectory_rows = sorted(groups[trajectory_id], key=lambda item: int(item["step_index"]))
+        for step_index, row in enumerate(trajectory_rows[:selected_steps]):
+            selected_row = dict(row)
+            selected_row["step_index"] = int(step_index)
+            selected_rows.append(selected_row)
 
     merged_metadata = dict(source_metadata)
     if metadata:
         merged_metadata.update(metadata)
     merged_metadata["source_trajectory_file"] = str(input_path)
-    merged_metadata["selected_steps"] = selected_steps
-    merged_metadata["source_steps"] = max_source_steps
-    save_trajectory_segments(output_path, selected_segments, metadata=merged_metadata)
+    merged_metadata["selected_steps"] = int(selected_steps)
+    merged_metadata["source_steps"] = int(max_source_steps)
+    save_trajectory_rows(output_path, selected_rows, metadata=merged_metadata)
