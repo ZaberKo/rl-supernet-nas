@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
 from typing import Sequence
 
 import gymnasium as gym
@@ -20,12 +19,6 @@ class ProjectionHead(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
-
-
-class RepresentationLoss(nn.Module, ABC):
-    @abstractmethod
-    def forward(self, *args, **kwargs) -> torch.Tensor:
-        raise NotImplementedError
 
 
 class LatentDynamicsPredictor(nn.Module):
@@ -68,39 +61,29 @@ class LatentDynamicsPredictor(nn.Module):
         return torch.stack(predictions, dim=1)
 
 
-class LatentDynamicsLoss(RepresentationLoss):
-    def __init__(self, beta: Sequence[float] | None = None):
-        super().__init__()
-        if beta is None:
-            self.register_buffer("beta", torch.empty(0), persistent=False)
-        else:
-            self.register_buffer("beta", torch.as_tensor(beta, dtype=torch.float32), persistent=False)
-
-    def forward(
-        self,
-        predictions: torch.Tensor,
-        teacher_targets: torch.Tensor,
-    ) -> torch.Tensor:
-        predictions = F.normalize(predictions, dim=-1)
-        teacher_targets = F.normalize(teacher_targets.detach(), dim=-1)
-        distance = 2.0 - 2.0 * F.cosine_similarity(predictions, teacher_targets, dim=-1)
-        if self.beta.numel() == 0:
-            return distance.mean()
-        beta = self.beta.to(distance.device)
-        if beta.numel() != distance.size(1):
-            raise ValueError("beta length must match the prediction horizon.")
-        return (distance * beta.view(1, -1)).mean()
+def latent_dynamics_loss(
+    predictions: torch.Tensor,
+    teacher_targets: torch.Tensor,
+    beta: Sequence[float] | torch.Tensor | None = None,
+) -> torch.Tensor:
+    predictions = F.normalize(predictions, dim=-1)
+    teacher_targets = F.normalize(teacher_targets.detach(), dim=-1)
+    distance = 2.0 - 2.0 * F.cosine_similarity(predictions, teacher_targets, dim=-1)
+    if beta is None:
+        return distance.mean()
+    beta_tensor = torch.as_tensor(beta, dtype=distance.dtype, device=distance.device)
+    if beta_tensor.numel() != distance.size(1):
+        raise ValueError("beta length must match the prediction horizon.")
+    return (distance * beta_tensor.view(1, -1)).mean()
 
 
-class CosineKDLoss(RepresentationLoss):
-    def forward(
-        self,
-        student_latent: torch.Tensor,
-        teacher_latent: torch.Tensor,
-    ) -> torch.Tensor:
-        student_latent = F.normalize(student_latent, dim=-1)
-        teacher_latent = F.normalize(teacher_latent.detach(), dim=-1)
-        return (2.0 - 2.0 * F.cosine_similarity(student_latent, teacher_latent, dim=-1)).mean()
+def cosine_kd_loss(
+    student_latent: torch.Tensor,
+    teacher_latent: torch.Tensor,
+) -> torch.Tensor:
+    student_latent = F.normalize(student_latent, dim=-1)
+    teacher_latent = F.normalize(teacher_latent.detach(), dim=-1)
+    return (2.0 - 2.0 * F.cosine_similarity(student_latent, teacher_latent, dim=-1)).mean()
 
 
 def get_action_dim(action_space: gym.Space) -> int:

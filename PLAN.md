@@ -25,24 +25,25 @@ All listed implementation items are complete and smoke-tested.
 
 3. Stage 1: PPO sampling and random-data mixing
    - Use `stage1_train_max_ppo.py` to train PPO using the maximum supernet backbone with shared actor/critic feature extraction and YAML-loaded env/PPO settings.
-   - Record all trajectories generated during PPO training, without a separate trajectory cap, and save supernet backbone weights.
+   - Record all trajectories generated during PPO training, without a separate trajectory cap, save supernet backbone weights, and log metrics/artifacts to W&B.
    - Store trajectories through HuggingFace `datasets` as PyArrow-backed datasets, with `terminateds`, `truncateds`, and merged `dones` kept independently.
    - Use `stage1_mix_random_data.py` to collect or subset random-policy trajectories independently.
    - Control the random/PPO mixture ratio without rerunning the PPO training script.
-   - Emit a mixed-data manifest that stage 2 can consume directly.
+   - Emit one mixed Arrow dataset that stage 2 can consume directly and log counts/artifacts to W&B.
 
 4. Stage 2: representation learning
-   - Load stage 1 trajectories.
+   - Load the single mixed Arrow dataset produced by stage 1B.
    - Treat merged `dones` as sequence boundaries so latent dynamics windows do not cross terminated or truncated episodes.
    - Initialize the supernet from stage 1 weights when provided.
    - Train sampled subnets with sandwich sampling: max teacher, min subnet, and random subnets.
-   - Provide a general loss API with latent dynamics prediction and cosine latent KD.
-   - Save the trained supernet checkpoint.
+   - Use direct loss functions for latent dynamics prediction and cosine latent KD.
+   - Save the trained supernet checkpoint and record stage metrics/artifacts to W&B.
 
 5. Stage 3: EvoX NSGA-II subnet search
    - Wrap the RL subnet evaluation as an EvoX `Problem`.
-   - Use a discrete EvoX NSGA-II `Algorithm` over integer genes, and decode each gene to `ArchConfig` before PPO evaluation.
+   - Use a discrete EvoX NSGA-II `Algorithm` over integer genes with default crossover/mutation settings, and decode each gene to `ArchConfig` before PPO evaluation.
    - Optimize two objectives: maximize return via `negative_return` minimization and minimize active backbone parameter count.
+   - Print and write one generation-level search log line per iteration, write one JSONL row per individual with `gen`, `arch`, and `is_pareto` fields, and record metrics/artifacts to W&B.
    - Use torch multiprocessing inside `Problem.evaluate` when `--eval_workers > 1`.
    - For each subnet, inherit compatible supernet weights and initialize new actor/critic heads.
    - Support `--supernet_backbone_lr`: freeze the backbone when `<= 0`, otherwise train it with a separate learning rate.

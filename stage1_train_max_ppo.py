@@ -8,7 +8,8 @@ from config_utils import add_ppo_config_args, load_ppo_config
 from ppo_utils import build_ppo_model_from_args, learn_ppo, make_vec_env_from_args
 from sb3_nas_policy import save_policy_backbone
 from supernet_backbone import SearchSpace
-from trajectory_data import TrajectoryRecorderCallback
+from trajectory_data import TrajectoryRecorderCallback, count_trajectory_file
+from wandb_utils import finish_wandb_run, init_wandb_run, log_wandb, log_wandb_artifact
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,6 +28,7 @@ def parse_args() -> argparse.Namespace:
 def run(args: argparse.Namespace) -> dict:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    wandb_run = init_wandb_run("stage1_train_max_ppo", args, output_dir)
     search_space = SearchSpace()
     max_arch = search_space.max_arch()
     search_space_path = output_dir / "search_space.json"
@@ -40,7 +42,15 @@ def run(args: argparse.Namespace) -> dict:
             arch_config=max_arch,
         )
         ppo_trajectory_path = output_dir / "ppo_train_trajectories.arrow"
-        callback = TrajectoryRecorderCallback(save_path=ppo_trajectory_path)
+
+        def log_training_progress(values: dict[str, float | int], step: int) -> None:
+            log_wandb(wandb_run, {f"stage1/{key}": value for key, value in values.items()}, step=step)
+
+        callback = TrajectoryRecorderCallback(
+            save_path=ppo_trajectory_path,
+            log_fn=log_training_progress,
+            log_interval=max(1, int(args.n_steps)),
+        )
         learn_ppo(
             model,
             total_timesteps=args.total_timesteps,
@@ -72,16 +82,38 @@ def run(args: argparse.Namespace) -> dict:
     finally:
         train_env.close()
 
+    ppo_count = count_trajectory_file(ppo_trajectory_path)
     manifest = {
         "stage": "stage1_ppo_max_arch",
         "ppo_trajectories": str(ppo_trajectory_path),
         "backbone_checkpoint": str(backbone_path),
         "ppo_model": str(ppo_model_path.with_suffix(".zip")) if args.save_ppo_model else None,
         "search_space": str(search_space_path),
+        "trajectory_count": ppo_count,
         "max_arch": max_arch.to_dict(),
         "args": vars(args),
     }
-    (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    manifest_path = output_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+    log_wandb(
+        wandb_run,
+        {
+            "stage1/num_transitions": ppo_count["num_transitions"],
+            "stage1/num_steps": ppo_count["num_steps"],
+            "stage1/num_trajectories": ppo_count.get("num_trajectories", ppo_count["num_envs"]),
+        },
+        step=int(args.total_timesteps),
+    )
+    artifact_paths = [ppo_trajectory_path, backbone_path, search_space_path, manifest_path]
+    if args.save_ppo_model:
+        artifact_paths.append(ppo_model_path.with_suffix(".zip"))
+    log_wandb_artifact(
+        wandb_run,
+        name=f"stage1-ppo-{output_dir.name}",
+        artifact_type="stage1-output",
+        paths=artifact_paths,
+    )
+    finish_wandb_run(wandb_run)
     return manifest
 
 

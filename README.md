@@ -20,6 +20,16 @@ python stage1_train_max_ppo.py --ppo_config_override ppo.total_timesteps=10000 -
 
 当前 search space 不从 CLI 传入。默认搜索空间 hardcode 在 `supernet_backbone.py` 的 `SearchSpace` 中；如果要改候选宽度、深度、kernel 或 expand ratio，直接改这个类的默认值。
 
+## W&B 记录
+
+所有 stage 都会初始化 W&B run，project 固定为 `rl-supernet-nas`。默认 `WANDB_MODE=offline`，记录会落在各 stage 输出目录下的 `wandb/`；需要在线同步时先登录 W&B 并设置：
+
+```bash
+export WANDB_MODE=online
+```
+
+每个 stage 会记录 args/config、关键指标，并把主要输出文件或 Arrow dataset 作为 artifact：stage1A 记录 PPO 轨迹和 backbone，stage1B 记录 random/mixed dataset，stage2 记录 loss 曲线和 checkpoint，stage3 记录每代搜索日志、JSONL 个体记录和最终 manifest。
+
 ## Vector Env
 
 当前 PPO 代码不直接使用 Gymnasium `AsyncVectorEnv`。Stable-Baselines3 PPO 使用 SB3 自己的 `VecEnv` API，所以这里提供：
@@ -70,7 +80,7 @@ source .venv/bin/activate
 python stage1_mix_random_data.py
 ```
 
-这个阶段会读取 stage1A 的 PPO 轨迹，按脚本参数采样 random-policy 轨迹，并写出一个给 stage2 使用的 mixed-data manifest。
+这个阶段会读取 stage1A 的 PPO 轨迹，按脚本参数采样 random-policy 轨迹，并写出一个给 stage2 使用的 `mixed_trajectories.arrow`。
 
 随机数据规模可用三种方式控制，优先级从高到低：
 
@@ -85,7 +95,7 @@ source .venv/bin/activate
 python stage1_mix_random_data.py --random_to_ppo_ratio 0.5
 ```
 
-如果已经有 random 轨迹文件，可以只截取前缀并重新生成 manifest：
+如果已经有 random 轨迹文件，可以只截取前缀并重新生成 mixed dataset：
 
 ```bash
 source .venv/bin/activate
@@ -98,16 +108,16 @@ python stage1_mix_random_data.py --existing_random_trajectory_file runs/stage1_m
 
 ```bash
 source .venv/bin/activate
-python stage2_train_supernet.py --trajectory_manifest runs/stage1_mix/manifest.json
+python stage2_train_supernet.py --trajectory_data runs/stage1_mix/mixed_trajectories.arrow
 ```
 
 这个阶段会：
 
 - 从 stage1A backbone checkpoint 继承初始参数。
-- 从 mixed manifest 读取 PPO + random 轨迹。
+- 从 stage1B 生成的单个 mixed Arrow dataset 读取 PPO + random 轨迹。
 - 每个 batch 使用 sandwich 采样：最大网络作为 teacher，最小 subnet 与若干随机 subnet 作为 student。
 - 读取轨迹时使用合并后的 `dones` 作为序列边界，避免 latent dynamics window 跨过 episode terminated 或 time-limit truncated。
-- 使用 latent dynamics prediction 和 cosine latent KD 训练 supernet backbone。
+- 使用函数式 `latent_dynamics_loss` 和 `cosine_kd_loss` 训练 supernet backbone。
 - 保存 `supernet_backbone_stage2.pt`、`metrics.jsonl`、`manifest.json`。
 
 stage2 的 AdamW 使用 PyTorch 默认 beta/eps；DataLoader 的 shuffle/pin_memory/drop_last 也 hardcode 为常规训练默认值。
@@ -116,7 +126,7 @@ stage2 的 AdamW 使用 PyTorch 默认 beta/eps；DataLoader 的 shuffle/pin_mem
 
 ```bash
 source .venv/bin/activate
-python stage2_train_supernet.py --trajectory_manifest runs/stage1_mix/manifest.json --epochs 10 --random_subnets 4 --projection_dim 128
+python stage2_train_supernet.py --trajectory_data runs/stage1_mix/mixed_trajectories.arrow --epochs 10 --random_subnets 4 --projection_dim 128
 ```
 
 ## Stage 3: NSGA-II subnet 搜索
@@ -135,7 +145,9 @@ python stage3_ea_search.py
 - EA 层保留 gene；进入 PPO finetune 前先解码为 `ArchConfig`。
 - 每个 subnet 初始化新的 actor/critic head，然后做短程 PPO finetune。
 - 用两个目标评估：`negative_return` 和 active backbone `params`。
-- 写出 `nsga2_records.jsonl` 和 `manifest.json`，其中包含最终 Pareto front。
+- 每代都会 print 一行搜索日志并追加到 `search.log`。
+- 每代每个个体都会向 `nsga2_records.jsonl` 写一行，包含 `gen`、`arch`、`objectives`、`return`、`params`、`pareto_rank`、`is_pareto` 等字段。
+- 写出 `manifest.json`，其中包含最终 Pareto front。mutation/crossover 使用代码默认值，初始种群固定包含 max architecture。
 
 `--supernet_backbone_lr <= 0` 时冻结 backbone；大于 0 时，backbone 使用这个单独 learning rate，actor/critic head 使用 `ppo.head_lr`。
 
@@ -162,7 +174,7 @@ python stage1_mix_random_data.py --ppo_trajectory_file runs/smoke_stage1/ppo_tra
 
 ```bash
 source .venv/bin/activate
-python stage2_train_supernet.py --trajectory_manifest runs/smoke_mix/manifest.json --stage1_backbone runs/smoke_stage1/supernet_backbone_stage1.pt --output_dir runs/smoke_stage2 --epochs 1 --max_batches_per_epoch 1 --batch_size 2 --horizon 2 --random_subnets 1 --projection_dim 16 --predictor_hidden_dim 32 --ppo_config_override ppo.features_dim=32
+python stage2_train_supernet.py --trajectory_data runs/smoke_mix/mixed_trajectories.arrow --stage1_backbone runs/smoke_stage1/supernet_backbone_stage1.pt --output_dir runs/smoke_stage2 --epochs 1 --max_batches_per_epoch 1 --batch_size 2 --horizon 2 --random_subnets 1 --projection_dim 16 --predictor_hidden_dim 32 --ppo_config_override ppo.features_dim=32
 ```
 
 ```bash

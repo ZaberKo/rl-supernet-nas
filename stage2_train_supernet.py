@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import random
 from pathlib import Path
 
 import torch
@@ -14,15 +13,16 @@ from config_utils import add_ppo_config_args, load_ppo_config
 from env_utils import get_vision_spaces
 from ppo_utils import parse_optional_float, resolve_device, use_render_observation
 from representation_losses import (
-    CosineKDLoss,
-    LatentDynamicsLoss,
     LatentDynamicsPredictor,
     ProjectionHead,
+    cosine_kd_loss,
     encode_action_sequence,
     get_action_dim,
+    latent_dynamics_loss,
 )
 from supernet_backbone import SearchSpace, SupernetCNNBackbone, infer_input_channels, load_backbone_checkpoint
 from trajectory_data import TrajectoryDataset
+from wandb_utils import finish_wandb_run, init_wandb_run, log_wandb, log_wandb_artifact
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,16 +31,7 @@ def parse_args() -> argparse.Namespace:
         allow_abbrev=False,
     )
     add_ppo_config_args(parser)
-    parser.add_argument(
-        "--trajectory_files",
-        nargs="+",
-        default=[
-            "runs/stage1_ppo_max_arch/ppo_train_trajectories.arrow",
-            "runs/stage1_mix/random_trajectories.arrow",
-        ],
-        help="Trajectory dataset paths used for representation learning when no manifest is provided.",
-    )
-    parser.add_argument("--trajectory_manifest", default="", help="Stage1 mixed-data manifest; overrides trajectory_files when provided.")
+    parser.add_argument("--trajectory_data", default="runs/stage1_mix/mixed_trajectories.arrow", help="Stage1 mixed PPO+random Arrow dataset used for representation learning.")
     parser.add_argument("--output_dir", default="runs/stage2", help="Directory for stage2 checkpoints, metrics, and manifest.")
     parser.add_argument("--stage1_backbone", default="runs/stage1_ppo_max_arch/supernet_backbone_stage1.pt", help="Backbone checkpoint inherited from stage1 PPO training.")
     parser.add_argument("--epochs", type=int, default=3, help="Number of supervised representation-learning epochs.")
@@ -115,13 +106,10 @@ def save_checkpoint(
 def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
-    rng = random.Random(args.seed)
     device = resolve_device(args.device)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    if args.trajectory_manifest:
-        manifest = json.loads(Path(args.trajectory_manifest).read_text())
-        args.trajectory_files = manifest["trajectory_files"]
+    wandb_run = init_wandb_run("stage2_train_supernet", args, output_dir)
 
     search_space = SearchSpace()
     (output_dir / "search_space.json").write_text(json.dumps(search_space.to_dict(), indent=2))
@@ -149,14 +137,14 @@ def main() -> None:
         horizon=args.horizon,
         hidden_dim=args.predictor_hidden_dim,
     ).to(device)
-    dynamics_loss_fn = LatentDynamicsLoss(beta=parse_beta(args.beta, args.horizon)).to(device)
-    kd_loss_fn = CosineKDLoss().to(device)
+    beta = parse_beta(args.beta, args.horizon)
     optimizer = build_optimizer(
         args,
         list(backbone.parameters()) + list(projection.parameters()) + list(predictor.parameters()),
     )
 
-    dataset = TrajectoryDataset(args.trajectory_files, horizon=args.horizon)
+    dataset = TrajectoryDataset([args.trajectory_data], horizon=args.horizon)
+    log_wandb(wandb_run, {"stage2/num_windows": len(dataset)}, step=0)
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -191,7 +179,7 @@ def main() -> None:
 
                 sampled_arches = [search_space.min_arch()]
                 for _ in range(args.random_subnets):
-                    sampled_arches.append(search_space.sample_arch(rng))
+                    sampled_arches.append(search_space.sample_arch())
 
                 total_loss = torch.zeros((), device=device)
                 dyn_value = torch.zeros((), device=device)
@@ -200,14 +188,14 @@ def main() -> None:
                     backbone.set_active_arch(arch)
                     student_start = F.normalize(projection(backbone(observation)), dim=-1)
                     predictions = predictor(student_start, action_features)
-                    dyn_loss = dynamics_loss_fn(predictions, teacher_targets)
+                    dyn_loss = latent_dynamics_loss(predictions, teacher_targets, beta=beta)
 
                     student_targets = F.normalize(
                         projection(backbone(flat_targets)).reshape(batch_size, horizon, -1),
                         dim=-1,
                     )
-                    kd_loss = kd_loss_fn(student_start, teacher_start)
-                    kd_loss = kd_loss + kd_loss_fn(
+                    kd_loss = cosine_kd_loss(student_start, teacher_start)
+                    kd_loss = kd_loss + cosine_kd_loss(
                         student_targets.reshape(batch_size * horizon, -1),
                         teacher_targets.reshape(batch_size * horizon, -1),
                     )
@@ -240,6 +228,18 @@ def main() -> None:
                     "student_arches": [arch.to_dict() for arch in sampled_arches],
                 }
                 metrics_file.write(json.dumps(record) + "\n")
+                log_wandb(
+                    wandb_run,
+                    {
+                        "stage2/loss": record["loss"],
+                        "stage2/dynamics_loss": record["dynamics_loss"],
+                        "stage2/kd_loss": record["kd_loss"],
+                        "stage2/epoch": epoch,
+                        "stage2/batch_index": batch_index,
+                        "stage2/num_student_subnets": len(sampled_arches),
+                    },
+                    step=global_step,
+                )
                 global_step += 1
 
             if args.save_every_epochs > 0 and (epoch + 1) % args.save_every_epochs == 0:
@@ -269,10 +269,20 @@ def main() -> None:
         "checkpoint": str(checkpoint_path),
         "metrics": str(metrics_path),
         "search_space": str(output_dir / "search_space.json"),
+        "trajectory_data": args.trajectory_data,
         "num_windows": len(dataset),
         "args": vars(args),
     }
-    (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    manifest_path = output_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+    log_wandb(wandb_run, {"stage2/num_logged_steps": global_step, "stage2/num_windows": len(dataset)}, step=global_step)
+    log_wandb_artifact(
+        wandb_run,
+        name=f"stage2-{output_dir.name}",
+        artifact_type="stage2-output",
+        paths=[checkpoint_path, metrics_path, output_dir / "search_space.json", manifest_path],
+    )
+    finish_wandb_run(wandb_run)
     print(json.dumps(manifest, indent=2))
 
 

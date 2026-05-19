@@ -30,15 +30,14 @@ class GeneCodec:
         lower, upper = self.gene_bounds()
         return {"lower_bounds": lower, "upper_bounds": upper}
 
-    def sample_gene(self, rng: random.Random | None = None) -> list[int]:
-        rng = rng or random
+    def sample_gene(self) -> list[int]:
         gene: list[int] = []
         for candidates in self.search_space.stage_depth_candidates:
-            gene.append(rng.randrange(len(candidates)))
+            gene.append(random.randrange(len(candidates)))
         for depth in self.search_space.max_stage_depths:
             for _ in range(depth):
-                gene.append(rng.randrange(len(self.search_space.kernel_size_candidates)))
-                gene.append(rng.randrange(len(self.search_space.expand_ratio_candidates)))
+                gene.append(random.randrange(len(self.search_space.kernel_size_candidates)))
+                gene.append(random.randrange(len(self.search_space.expand_ratio_candidates)))
         return gene
 
     def min_gene(self) -> list[int]:
@@ -122,21 +121,19 @@ class GeneCodec:
         self,
         gene: Sequence[int],
         mutation_prob: float,
-        rng: random.Random | None = None,
     ) -> list[int]:
         self.validate_gene(gene)
-        rng = rng or random
         mutated = [int(value) for value in gene]
         offset = 0
         for candidates in self.search_space.stage_depth_candidates:
-            if rng.random() < mutation_prob:
-                mutated[offset] = rng.randrange(len(candidates))
+            if random.random() < mutation_prob:
+                mutated[offset] = random.randrange(len(candidates))
             offset += 1
         for _ in range(sum(self.search_space.max_stage_depths)):
-            if rng.random() < mutation_prob:
-                mutated[offset] = rng.randrange(len(self.search_space.kernel_size_candidates))
-            if rng.random() < mutation_prob:
-                mutated[offset + 1] = rng.randrange(len(self.search_space.expand_ratio_candidates))
+            if random.random() < mutation_prob:
+                mutated[offset] = random.randrange(len(self.search_space.kernel_size_candidates))
+            if random.random() < mutation_prob:
+                mutated[offset + 1] = random.randrange(len(self.search_space.expand_ratio_candidates))
             offset += 2
         return mutated
 
@@ -144,12 +141,10 @@ class GeneCodec:
         self,
         parent_a: Sequence[int],
         parent_b: Sequence[int],
-        rng: random.Random | None = None,
     ) -> list[int]:
         self.validate_gene(parent_a)
         self.validate_gene(parent_b)
-        rng = rng or random
         return [
-            int(value_a) if rng.random() < 0.5 else int(value_b)
+            int(value_a) if random.random() < 0.5 else int(value_b)
             for value_a, value_b in zip(parent_a, parent_b)
         ]

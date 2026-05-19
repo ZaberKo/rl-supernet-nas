@@ -11,18 +11,20 @@ from trajectory_data import (
     collect_random_trajectories,
     count_trajectory_file,
     read_metadata,
+    write_mixed_trajectory_dataset,
     write_trajectory_prefix,
 )
+from wandb_utils import finish_wandb_run, init_wandb_run, log_wandb, log_wandb_artifact
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Stage 1B: collect or subset random trajectories and emit a mixed-data manifest.",
+        description="Stage 1B: collect or subset random trajectories and write one mixed dataset.",
         allow_abbrev=False,
     )
     add_ppo_config_args(parser)
     parser.add_argument("--ppo_trajectory_file", default="runs/stage1_ppo_max_arch/ppo_train_trajectories.arrow", help="PPO trajectory dataset produced by stage1_train_max_ppo.py.")
-    parser.add_argument("--output_dir", default="runs/stage1_mix", help="Directory for random trajectories and mixed-data manifest.")
+    parser.add_argument("--output_dir", default="runs/stage1_mix", help="Directory for random trajectories, mixed trajectories, and manifest.")
     parser.add_argument("--existing_random_trajectory_file", default="", help="Reuse an existing random trajectory file instead of collecting new random data.")
     parser.add_argument("--random_steps", type=int, default=0, help="Random-policy environment steps to collect before multiplying by train_n_envs.")
     parser.add_argument("--random_transitions", type=int, default=0, help="Exact random transition budget; takes priority over ratio and fraction.")
@@ -30,7 +32,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--random_fraction", type=float, default=-1.0, help="Target random fraction in the mixed dataset; use a negative value to disable.")
     parser.add_argument("--random_seed_offset", type=int, default=10_000, help="Offset added to the base seed for random-policy collection.")
     parser.add_argument("--random_output_name", default="random_trajectories.arrow", help="Directory name for the random trajectory Arrow dataset inside output_dir.")
-    parser.add_argument("--manifest_name", default="manifest.json", help="File name for the mixed-data manifest inside output_dir.")
+    parser.add_argument("--mixed_output_name", default="mixed_trajectories.arrow", help="Directory name for the combined PPO+random Arrow dataset inside output_dir.")
+    parser.add_argument("--manifest_name", default="manifest.json", help="File name for the mixed-data summary manifest inside output_dir.")
     args = parser.parse_args()
     load_ppo_config(args)
     return args
@@ -56,6 +59,7 @@ def run(args: argparse.Namespace) -> dict:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    wandb_run = init_wandb_run("stage1_mix_random_data", args, output_dir)
     ppo_count = count_trajectory_file(ppo_path)
     ppo_metadata = read_metadata(ppo_path)
     random_transitions = resolve_random_transitions(args, ppo_count["num_transitions"])
@@ -101,13 +105,33 @@ def run(args: argparse.Namespace) -> dict:
             random_env.close()
 
     random_count = count_trajectory_file(random_path)
-    mixed_manifest = {
-        "stage": "stage1_mix_random",
-        "trajectory_files": [str(ppo_path), str(random_path)],
+    mixed_path = output_dir / args.mixed_output_name
+    mixed_metadata = {
+        "source": "ppo_random_mixed",
+        "env_id": args.env_id,
+        "seed": args.seed,
+        "train_n_envs": args.train_n_envs,
+        "image_size": args.image_size,
         "ppo_trajectory_file": str(ppo_path),
         "random_trajectory_file": str(random_path),
         "ppo_count": ppo_count,
         "random_count": random_count,
+        "args": vars(args),
+    }
+    write_mixed_trajectory_dataset(
+        input_paths=[ppo_path, random_path],
+        output_path=mixed_path,
+        metadata=mixed_metadata,
+    )
+    mixed_count = count_trajectory_file(mixed_path)
+    mixed_manifest = {
+        "stage": "stage1_mix_random",
+        "mixed_trajectory_file": str(mixed_path),
+        "ppo_trajectory_file": str(ppo_path),
+        "random_trajectory_file": str(random_path),
+        "ppo_count": ppo_count,
+        "random_count": random_count,
+        "mixed_count": mixed_count,
         "actual_random_to_ppo_ratio": random_count["num_transitions"] / max(1, ppo_count["num_transitions"]),
         "actual_random_fraction": random_count["num_transitions"] / max(1, ppo_count["num_transitions"] + random_count["num_transitions"]),
         "ppo_metadata": ppo_metadata,
@@ -116,6 +140,25 @@ def run(args: argparse.Namespace) -> dict:
     manifest_path = output_dir / args.manifest_name
     manifest_path.write_text(json.dumps(mixed_manifest, indent=2))
     mixed_manifest["manifest"] = str(manifest_path)
+    log_wandb(
+        wandb_run,
+        {
+            "stage1_mix/ppo_transitions": ppo_count["num_transitions"],
+            "stage1_mix/random_transitions": random_count["num_transitions"],
+            "stage1_mix/mixed_transitions": mixed_count["num_transitions"],
+            "stage1_mix/random_to_ppo_ratio": mixed_manifest["actual_random_to_ppo_ratio"],
+            "stage1_mix/random_fraction": mixed_manifest["actual_random_fraction"],
+            "stage1_mix/mixed_trajectories": mixed_count.get("num_trajectories", mixed_count["num_envs"]),
+        },
+        step=0,
+    )
+    log_wandb_artifact(
+        wandb_run,
+        name=f"stage1-mix-{output_dir.name}",
+        artifact_type="stage1-mix-output",
+        paths=[random_path, mixed_path, manifest_path],
+    )
+    finish_wandb_run(wandb_run)
     return mixed_manifest
 
 

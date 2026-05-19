@@ -97,20 +97,19 @@ class SearchSpace:
             expand_indices=[len(self.expand_ratio_candidates) - 1] * sum(self.max_stage_depths),
         )
 
-    def sample_arch(self, rng: random.Random | None = None) -> ArchConfig:
-        rng = rng or random
+    def sample_arch(self) -> ArchConfig:
         total_layers = sum(self.max_stage_depths)
         return self._build_arch(
             stage_depth_indices=[
-                rng.randrange(len(candidates))
+                random.randrange(len(candidates))
                 for candidates in self.stage_depth_candidates
             ],
             kernel_indices=[
-                rng.randrange(len(self.kernel_size_candidates))
+                random.randrange(len(self.kernel_size_candidates))
                 for _ in range(total_layers)
             ],
             expand_indices=[
-                rng.randrange(len(self.expand_ratio_candidates))
+                random.randrange(len(self.expand_ratio_candidates))
                 for _ in range(total_layers)
             ],
         )
