@@ -1,7 +1,9 @@
 torch
 stable-baselines3[extra]==2.8.0
 sb3-contrib
+rl_zoo3
 jupyterlab
 wandb
 omegaconf
-rl_zoo3
+datasets
+evox>=1.3.0
