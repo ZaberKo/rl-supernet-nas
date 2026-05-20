@@ -6,8 +6,10 @@
 
 `config.yaml` 只放跨阶段复用的运行配置：
 
-- `env`: 环境名、seed、图像尺寸、是否使用原生图像观测、SB3 vector env 类型、Atari wrapper 和 frame stack。
-- `ppo`: PPO 训练/finetune/eval 的共用参数，包括 `train_n_envs`、`eval_n_envs`、`total_timesteps`、`features_dim`、`n_steps`、`batch_size`、`head_lr`、`policy_net_arch`、`value_net_arch` 等。
+- `env`: 环境名、seed、图像尺寸、是否使用原生图像观测、SB3 vector env 类型、Atari wrapper、frame stack 和 `max_episode_steps`。
+- `ppo`: PPO 训练/finetune/eval 的共用参数，包括 `train_n_envs`、`eval_n_envs`、`eval_episodes`、`eval_freq`、`total_timesteps`、`features_dim`、`n_steps`、`batch_size`、`head_lr`、`policy_net_arch`、`value_net_arch` 等。
+
+`ppo.learning_rate`、`ppo.clip_range` 和 `ppo.clip_range_vf` 支持常数，也支持 RL-Zoo 风格的 `lin_<value>` 线性退火写法，例如 `lin_2.5e-4`。
 
 各 stage 自己的参数仍然定义在对应脚本 argparse 中，例如输出目录、random 数据量、stage2 epoch、NSGA-II population size 等。加载 `ppo_config` 时会先读取 YAML，再合并 `--ppo_config_override`，并返回独立的 OmegaConf config object；它不会把 env/PPO 字段写回 argparse 的 `args`。
 
@@ -20,18 +22,18 @@ python stage1_train_max_ppo.py --ppo_config_override ppo.total_timesteps=10000 -
 
 当前 search space 不从 CLI 传入。默认搜索空间 hardcode 在 `supernet_backbone.py` 的 `SearchSpace` 中；如果要改候选宽度、深度、kernel 或 expand ratio，直接改这个类的默认值。
 
-`policy_net_arch` 和 `value_net_arch` 会传给 SB3 `MlpExtractor` 的 `net_arch`，只控制 supernet backbone 输出之后、最终 action/value 线性层之前的 MLP。当前 ALE 默认值为 `[]`，即 CNN backbone 后直接接 actor/value 输出层；这与 SB3 Atari `CnnPolicy` 的常规结构一致。需要加 MLP head 时可用：
+`policy_net_arch` 和 `value_net_arch` 会传给 SB3 `MlpExtractor` 的 `net_arch`，只控制 supernet backbone 输出之后、最终 action/value 线性层之前的 MLP。当前 ALE 默认值为 `[256]`，给 actor/critic head 一个适度容量，避免线性 head 成为 PPO 收敛瓶颈；需要退回 Atari `NatureCNN` 风格的线性 head 时可用：
 
 ```bash
-python stage1_train_max_ppo.py --ppo_config_override 'ppo.policy_net_arch=[256]' --ppo_config_override 'ppo.value_net_arch=[256]'
+python stage1_train_max_ppo.py --ppo_config_override 'ppo.policy_net_arch=[]' --ppo_config_override 'ppo.value_net_arch=[]'
 ```
 
 ## W&B 记录
 
-所有 stage 都会初始化 W&B run，project 固定为 `rl-supernet-nas`。默认 `WANDB_MODE=offline`，记录会落在各 stage 输出目录下的 `wandb/`；需要在线同步时先登录 W&B 并设置：
+所有 stage 都会初始化 W&B run，project 固定为 `rl-supernet-nas`。默认 `WANDB_MODE=online`，需要提前登录 W&B；如果只想在本地记录，可以运行前设置：
 
 ```bash
-export WANDB_MODE=online
+export WANDB_MODE=offline
 ```
 
 每个 stage 会记录 args/config、关键指标，并把主要输出文件或 Arrow dataset 作为 artifact：stage1A 记录 PPO 轨迹和 backbone，stage1B 记录 random/mixed dataset，stage2 记录 loss 曲线和 checkpoint，stage3 记录每代搜索日志、JSONL 个体记录和最终 manifest。
@@ -42,6 +44,23 @@ export WANDB_MODE=online
 
 - `env.vector_env_type=dummy`: 默认，使用 SB3 `DummyVecEnv`。
 - `env.vector_env_type=subproc`: 使用 SB3 `SubprocVecEnv`，适合 `ppo.train_n_envs > 1` 时并行采样。
+
+`env.max_episode_steps` 会控制传给 `gym.make(..., max_episode_steps=...)` 的值。正整数启用 Gymnasium `TimeLimit`，`null` 表示使用环境注册时的默认值，`<=0` 会传 `-1` 来禁用 Gymnasium 自动 `TimeLimit`。ALE 默认使用 `108000` raw frames，这是 Atari 常见的 30 分钟上限；在 SB3 `AtariWrapper` 默认 `MaxAndSkipEnv(skip=4)` 下大约对应 `27000` 个 agent decision。
+
+## Box2D 视觉环境
+
+默认配置仍然面向 Atari；Box2D 通过 `--ppo_config_override` 临时切换。`CarRacing-v3` 本身就是 `96x96x3` RGB 图像观测，可以设置 `env.native_image_env=true`；`LunarLander-v3` 和 `BipedalWalker-v3` 默认是状态向量，如果要走视觉 backbone，需要设置 `env.native_image_env=false`，代码会用 `render_mode="rgb_array"` 把渲染帧作为 observation。
+
+Box2D 不需要 Atari 的 no-op、episodic-life、fire-reset 这类 wrapper。对 `CarRacing-v3`，更常见的是轻量视觉预处理：`env.frame_skip=2`、`env.image_size=64`、`env.grayscale_observation=true`、`env.frame_stack=2`。RL-Zoo 的 PPO CarRacing 配置还使用 reward normalization、`n_steps=512`、`batch_size=128`、`n_epochs=10`、`learning_rate=lin_1e-4`、`clip_range=0.2` 和连续动作的 gSDE。
+
+可以直接使用 `config_box2d.yaml`：
+
+```bash
+python stage1_train_max_ppo.py \
+  --ppo_config config_box2d.yaml \
+  --output_dir runs/box2d_car_racing/stage1_ppo_max \
+  --save_ppo_model runs/box2d_car_racing/stage1_ppo_max/ppo_max_supernet_model.zip
+```
 
 ## Stage 1A: 训练最大 subnet PPO
 
@@ -57,6 +76,7 @@ python stage1_train_max_ppo.py
 - 构造 hardcoded `SearchSpace`，用最大 `ArchConfig` 激活最大 subnet。
 - 用最大 subnet backbone + PPO actor/critic head 训练。
 - 记录 PPO 训练期间产生的全部轨迹到 `ppo_train_trajectories.arrow`。
+- 按 `ppo.eval_freq` 个 training timestep 定期评估 `ppo.eval_episodes` 个 episode，并写出 `eval_metrics.jsonl`；`ppo.eval_freq <= 0` 或 `ppo.eval_episodes <= 0` 时关闭定期评估。
 - 轨迹会通过 HuggingFace `datasets` 写成 PyArrow-backed dataset 目录，并独立保存 `terminateds`、`truncateds` 和合并后的 `dones`；SB3 VecEnv 的 `TimeLimit.truncated` 会被还原为 Gymnasium 的 truncated 标记。
 - 保存训练后的 backbone 到 `supernet_backbone_stage1.pt`。
 - 保存完整 SB3 PPO 模型 zip；`--save_ppo_model` 可指定保存路径，未指定时默认写入 `output_dir/ppo_max_supernet_model.zip`。
@@ -141,7 +161,7 @@ python stage3_ea_search.py
 - 用 EvoX NSGA-II 在整数 gene 空间中搜索 subnet。
 - EA 层保留 gene；进入 PPO finetune 前先解码为 `ArchConfig`。
 - 每个 subnet 初始化新的 actor/critic head，然后做短程 PPO finetune。
-- 用两个目标评估：`negative_return` 和 active backbone `params`。
+- 用两个目标评估：`negative_return` 和 active backbone `params`；return 基于 `ppo.eval_episodes` 个评估 episode 计算。
 - 每代都会 print 一行搜索日志并追加到 `search.log`。
 - 每代每个个体都会向 `nsga2_records.jsonl` 写一行，包含 `gen`、`arch`、`objectives`、`return`、`params`、`pareto_rank`、`is_pareto` 等字段。
 - 写出 `manifest.json`，其中包含最终 Pareto front。mutation/crossover 使用代码默认值，初始种群固定包含 max architecture。
@@ -157,7 +177,7 @@ python stage3_ea_search.py --eval_workers 2 --population_size 8 --generations 5
 
 ## Atari 示例脚本
 
-仓库提供了基于 `ALE/Pong-v5` 的分阶段脚本，默认启用 SB3 Atari wrapper，并直接使用 wrapper 默认参数：no-op reset、frame skip + max-pooling、episodic life、fire reset、84x84 grayscale、reward clipping，以及 `VecFrameStack(4)`。启用 wrapper 时，底层 ALE 会固定为 no-frame-skip/no-sticky-action，避免和 wrapper 默认预处理叠加；这些 Atari wrapper 细项不再作为脚本或 config 参数暴露。
+仓库提供了基于 `ALE/SpaceInvaders-v5` 的分阶段脚本，默认启用 SB3 Atari wrapper，并直接使用 wrapper 默认参数：no-op reset、frame skip + max-pooling、episodic life、fire reset、84x84 grayscale、reward clipping，以及 `VecFrameStack(4)`。启用 wrapper 时，底层 ALE 会固定为 no-frame-skip/no-sticky-action，避免和 wrapper 默认预处理叠加；这些 Atari wrapper 细项不再作为脚本或 config 参数暴露。
 
 ```bash
 source .venv/bin/activate
@@ -188,5 +208,5 @@ python stage2_train_supernet.py --trajectory_data runs/smoke_mix/representation_
 
 ```bash
 source .venv/bin/activate
-python stage3_ea_search.py --supernet_checkpoint runs/smoke_stage2/supernet_backbone_stage2.pt --output_dir runs/smoke_stage3 --population_size 2 --generations 1 --candidate_timesteps 0 --eval_episodes 1 --eval_workers 2 --ppo_config_override ppo.n_steps=8 --ppo_config_override ppo.batch_size=8 --ppo_config_override ppo.n_epochs=1 --ppo_config_override ppo.features_dim=32 --ppo_config_override ppo.quiet=true
+python stage3_ea_search.py --supernet_checkpoint runs/smoke_stage2/supernet_backbone_stage2.pt --output_dir runs/smoke_stage3 --population_size 2 --generations 1 --candidate_timesteps 0 --eval_workers 2 --ppo_config_override ppo.eval_episodes=1 --ppo_config_override ppo.n_steps=8 --ppo_config_override ppo.batch_size=8 --ppo_config_override ppo.n_epochs=1 --ppo_config_override ppo.features_dim=32 --ppo_config_override ppo.quiet=true
 ```

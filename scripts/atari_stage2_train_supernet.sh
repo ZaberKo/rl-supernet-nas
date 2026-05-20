@@ -4,9 +4,9 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 python stage2_train_supernet.py \
-  --trajectory_data runs/atari_pong/stage1_mix/representation_data.arrow \
-  --stage1_backbone runs/atari_pong/stage1_ppo_max/supernet_backbone_stage1.pt \
-  --output_dir runs/atari_pong/stage2 \
+  --trajectory_data runs/atari_space_invaders/stage1_mix/representation_data.arrow \
+  --stage1_backbone runs/atari_space_invaders/stage1_ppo_max/supernet_backbone_stage1.pt \
+  --output_dir runs/atari_space_invaders/stage2 \
   --train_steps 5000 \
   --batch_size 64 \
   --random_subnets 2 \

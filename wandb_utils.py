@@ -40,7 +40,7 @@ def init_wandb_run(stage: str, args: Any, output_dir: str | Path):
     output_dir = Path(output_dir)
     wandb_dir = output_dir / "wandb"
     wandb_dir.mkdir(parents=True, exist_ok=True)
-    mode = os.environ.get("WANDB_MODE", "offline")
+    mode = os.environ.get("WANDB_MODE", "online")
     config = sanitize_wandb_value(vars(args) if hasattr(args, "__dict__") else args)
     try:
         return wandb.init(

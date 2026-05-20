@@ -13,7 +13,7 @@ from omegaconf import DictConfig
 
 from config_utils import add_ppo_config_args, build_run_config, load_ppo_config, ppo_config_to_dict
 from env_utils import get_vision_spaces
-from ppo_utils import parse_optional_float, resolve_device, use_render_observation
+from ppo_utils import get_env_kwargs, get_max_episode_steps, parse_optional_float, resolve_device, use_render_observation
 from representation_losses import (
     LatentDynamicsPredictor,
     ProjectionHead,
@@ -187,6 +187,14 @@ def main() -> None:
         vector_env_type=getattr(ppo_config, "vector_env_type", "dummy"),
         frame_stack=int(getattr(ppo_config, "frame_stack", 1)),
         atari_wrapper=str(getattr(ppo_config, "atari_wrapper", "none")),
+        max_episode_steps=get_max_episode_steps(ppo_config),
+        env_kwargs=get_env_kwargs(ppo_config),
+        frame_skip=int(getattr(ppo_config, "frame_skip", 1)),
+        grayscale_observation=bool(getattr(ppo_config, "grayscale_observation", False)),
+        normalize_observation=bool(getattr(ppo_config, "normalize_observation", False)),
+        normalize_reward=bool(getattr(ppo_config, "normalize_reward", False)),
+        normalize_clip_obs=float(getattr(ppo_config, "normalize_clip_obs", 10.0)),
+        normalize_gamma=float(getattr(ppo_config, "normalize_gamma", getattr(ppo_config, "gamma", 0.99))),
     )
     input_channels = infer_input_channels(tuple(observation_space.shape))
     backbone = SupernetCNNBackbone(

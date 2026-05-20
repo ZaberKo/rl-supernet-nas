@@ -5,9 +5,11 @@ import json
 from pathlib import Path
 
 from omegaconf import DictConfig
+from stable_baselines3.common.callbacks import BaseCallback, CallbackList
+from stable_baselines3.common.vec_env import VecEnv
 
 from config_utils import add_ppo_config_args, build_run_config, load_ppo_config, ppo_config_to_dict
-from ppo_utils import build_ppo_model_from_config, learn_ppo, make_vec_env_from_ppo_config
+from ppo_utils import build_ppo_model_from_config, evaluate_ppo_model, learn_ppo, make_vec_env_from_ppo_config
 from sb3_nas_policy import save_policy_backbone
 from supernet_backbone import SearchSpace
 from trajectory_data import TrajectoryRecorderCallback, count_trajectory_file
@@ -32,6 +34,65 @@ def resolve_ppo_model_path(path: str | None, output_dir: Path) -> Path:
     return ppo_model_path
 
 
+class PeriodicEvalCallback(BaseCallback):
+    def __init__(
+        self,
+        eval_env: VecEnv,
+        eval_freq: int,
+        n_eval_episodes: int,
+        deterministic: bool,
+        metrics_path: Path,
+        log_fn,
+        verbose: int = 0,
+    ):
+        super().__init__(verbose=verbose)
+        self.eval_env = eval_env
+        self.eval_freq = int(eval_freq)
+        self.n_eval_episodes = int(n_eval_episodes)
+        self.deterministic = bool(deterministic)
+        self.metrics_path = metrics_path
+        self.log_fn = log_fn
+        self.next_eval_timestep = self.eval_freq
+
+    def _on_step(self) -> bool:
+        if self.eval_freq <= 0 or self.n_eval_episodes <= 0:
+            return True
+        if self.num_timesteps < self.next_eval_timestep:
+            return True
+
+        target_timestep = self.next_eval_timestep
+        while self.next_eval_timestep <= self.num_timesteps:
+            self.next_eval_timestep += self.eval_freq
+
+        mean_return, std_return = evaluate_ppo_model(
+            self.model,
+            self.eval_env,
+            n_eval_episodes=self.n_eval_episodes,
+            deterministic=self.deterministic,
+        )
+        record = {
+            "num_timesteps": int(self.num_timesteps),
+            "target_timestep": int(target_timestep),
+            "eval_mean_return": float(mean_return),
+            "eval_std_return": float(std_return),
+            "eval_episodes": int(self.n_eval_episodes),
+            "eval_deterministic": bool(self.deterministic),
+        }
+        with self.metrics_path.open("a") as metrics_file:
+            metrics_file.write(json.dumps(record) + "\n")
+        print(
+            (
+                f"stage1_eval step={record['num_timesteps']} "
+                f"mean_return={record['eval_mean_return']:.6g} "
+                f"std_return={record['eval_std_return']:.6g}"
+            ),
+            flush=True,
+        )
+        if self.log_fn is not None:
+            self.log_fn(record, int(self.num_timesteps))
+        return True
+
+
 def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -46,6 +107,10 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict:
     search_space_path.write_text(json.dumps(search_space.to_dict(), indent=2))
 
     train_env = make_vec_env_from_ppo_config(ppo_config, seed=ppo_config.seed)
+    eval_env = None
+    eval_metrics_path = output_dir / "eval_metrics.jsonl"
+    if eval_metrics_path.exists():
+        eval_metrics_path.unlink()
     try:
         model = build_ppo_model_from_config(
             ppo_config=ppo_config,
@@ -57,11 +122,34 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict:
         def log_training_progress(values: dict[str, float | int], step: int) -> None:
             log_wandb(wandb_run, {f"stage1/{key}": value for key, value in values.items()}, step=step)
 
-        callback = TrajectoryRecorderCallback(
+        def log_eval_progress(values: dict[str, float | int | bool], step: int) -> None:
+            log_wandb(wandb_run, {f"stage1/{key}": value for key, value in values.items()}, step=step)
+
+        trajectory_callback = TrajectoryRecorderCallback(
             save_path=ppo_trajectory_path,
             log_fn=log_training_progress,
             log_interval=max(1, int(ppo_config.n_steps)),
         )
+        callbacks: list[BaseCallback] = [trajectory_callback]
+        eval_freq = int(getattr(ppo_config, "eval_freq", 0) or 0)
+        eval_episodes = int(getattr(ppo_config, "eval_episodes", 0) or 0)
+        if eval_freq > 0 and eval_episodes > 0:
+            eval_env = make_vec_env_from_ppo_config(
+                ppo_config,
+                seed=ppo_config.seed + 50,
+                n_envs=int(ppo_config.eval_n_envs),
+            )
+            callbacks.append(
+                PeriodicEvalCallback(
+                    eval_env=eval_env,
+                    eval_freq=eval_freq,
+                    n_eval_episodes=eval_episodes,
+                    deterministic=bool(ppo_config.eval_deterministic),
+                    metrics_path=eval_metrics_path,
+                    log_fn=log_eval_progress,
+                )
+            )
+        callback = callbacks[0] if len(callbacks) == 1 else CallbackList(callbacks)
         learn_ppo(
             model,
             total_timesteps=ppo_config.total_timesteps,
@@ -79,7 +167,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict:
             "args": vars(args),
             "ppo_config": ppo_config_to_dict(ppo_config),
         }
-        callback.save(metadata=ppo_metadata)
+        trajectory_callback.save(metadata=ppo_metadata)
 
         backbone_path = output_dir / "supernet_backbone_stage1.pt"
         save_policy_backbone(
@@ -96,6 +184,8 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict:
         model.save(ppo_model_path)
     finally:
         train_env.close()
+        if eval_env is not None:
+            eval_env.close()
 
     ppo_count = count_trajectory_file(ppo_trajectory_path)
     manifest = {
@@ -104,6 +194,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict:
         "backbone_checkpoint": str(backbone_path),
         "ppo_model": str(ppo_model_path),
         "search_space": str(search_space_path),
+        "eval_metrics": str(eval_metrics_path) if eval_metrics_path.exists() else None,
         "trajectory_count": ppo_count,
         "max_arch": max_arch.to_dict(),
         "args": vars(args),
@@ -121,6 +212,8 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict:
         step=int(ppo_config.total_timesteps),
     )
     artifact_paths = [ppo_trajectory_path, backbone_path, search_space_path, manifest_path]
+    if eval_metrics_path.exists():
+        artifact_paths.append(eval_metrics_path)
     artifact_paths.append(ppo_model_path)
     log_wandb_artifact(
         wandb_run,

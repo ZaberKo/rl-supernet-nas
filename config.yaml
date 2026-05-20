@@ -1,26 +1,29 @@
 env:
-  env_id: ALE/Pong-v5
+  env_id: ALE/SpaceInvaders-v5
   seed: 0
   image_size: 84
   native_image_env: true
   vector_env_type: subproc
   frame_stack: 4
   atari_wrapper: sb3
+  max_episode_steps: 108000
 
 ppo:
-  train_n_envs: 4
-  eval_n_envs: 1
+  train_n_envs: 8
+  eval_n_envs: 8
+  eval_episodes: 8
+  eval_freq: 102400 # training timesteps between stage1 evaluations; use 0 to disable
   eval_deterministic: true
-  total_timesteps: 50000
+  total_timesteps: 10000000
   features_dim: 256
-  learning_rate: 0.00025
+  learning_rate: lin_2.5e-4
   head_lr: 0.00025
   n_steps: 128 # num rollout steps per env
   batch_size: 256 # minibatch for PPO update
   n_epochs: 4 # repeat rollout data for multiple epochs
   gamma: 0.99
   gae_lambda: 0.95
-  clip_range: 0.2
+  clip_range: lin_0.1
   clip_range_vf: null
   normalize_advantage: true
   ent_coef: 0.01
@@ -29,8 +32,8 @@ ppo:
   target_kl: null
   stats_window_size: 100
   tensorboard_log: null
-  policy_net_arch: [] # MLP header
-  value_net_arch: [] # MLP header
+  policy_net_arch: [256] # actor MLP head after the backbone
+  value_net_arch: [256] # critic MLP head after the backbone
   device: auto
   progress_bar: false
   quiet: false

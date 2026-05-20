@@ -27,7 +27,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--population_size", type=int, default=6, help="NSGA-II population size.")
     parser.add_argument("--generations", type=int, default=3, help="Number of NSGA-II generations to evaluate.")
     parser.add_argument("--candidate_timesteps", type=int, default=1024, help="PPO finetune timesteps for each subnet candidate.")
-    parser.add_argument("--eval_episodes", type=int, default=3, help="Evaluation episodes used to estimate candidate return.")
     parser.add_argument("--eval_workers", type=int, default=1, help="Torch multiprocessing workers for parallel subnet evaluation.")
     parser.add_argument("--supernet_backbone_lr", type=float, default=0.0, help="Backbone learning rate during candidate PPO finetune; <=0 freezes the backbone.")
     parser.add_argument("--save_full_history", action="store_true", help="Store full EvoX monitor history in memory for debugging.")

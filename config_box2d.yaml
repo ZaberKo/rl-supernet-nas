@@ -1,0 +1,52 @@
+env:
+  env_id: CarRacing-v3
+  seed: 0
+  image_size: 64
+  native_image_env: true
+  vector_env_type: subproc
+  frame_stack: 2
+  atari_wrapper: none
+  max_episode_steps: null
+  frame_skip: 2
+  grayscale_observation: true
+  normalize_observation: false
+  normalize_reward: true
+  normalize_clip_obs: 10.0
+  env_kwargs:
+    continuous: true
+    domain_randomize: false
+
+ppo:
+  train_n_envs: 8
+  eval_n_envs: 8
+  eval_episodes: 8
+  eval_freq: 102400 # training timesteps between stage1 evaluations; use 0 to disable
+  eval_deterministic: true
+  total_timesteps: 4000000
+  features_dim: 256
+  learning_rate: lin_1e-4
+  head_lr: lin_1e-4
+  n_steps: 512 # num rollout steps per env
+  batch_size: 128 # minibatch for PPO update
+  n_epochs: 10 # repeat rollout data for multiple epochs
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  clip_range_vf: null
+  normalize_advantage: true
+  ent_coef: 0.0
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  target_kl: null
+  stats_window_size: 100
+  tensorboard_log: null
+  policy_net_arch: [256] # actor MLP head after the backbone
+  value_net_arch: [256] # critic MLP head after the backbone
+  use_sde: true
+  sde_sample_freq: 4
+  log_std_init: -2
+  ortho_init: false
+  activation_fn: gelu
+  device: auto
+  progress_bar: false
+  quiet: false

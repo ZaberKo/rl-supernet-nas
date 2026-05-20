@@ -1,6 +1,7 @@
 torch
 stable-baselines3[extra]==2.8.0
-gymnasium[atari,accept-rom-license]
+swig
+gymnasium[atari,box2d]
 sb3-contrib
 rl_zoo3
 jupyterlab
