@@ -6,7 +6,7 @@
 
 `config.yaml` 只放跨阶段复用的运行配置：
 
-- `env`: 环境名、seed、图像尺寸、是否使用原生图像观测、SB3 vector env 类型。
+- `env`: 环境名、seed、图像尺寸、是否使用原生图像观测、SB3 vector env 类型、Atari wrapper 和 frame stack。
 - `ppo`: PPO 训练/finetune/eval 的共用参数，包括 `train_n_envs`、`eval_n_envs`、`total_timesteps`、`features_dim`、`n_steps`、`batch_size`、`head_lr` 等。
 
 各 stage 自己的参数仍然定义在对应脚本 argparse 中，例如输出目录、random 数据比例、stage2 epoch、NSGA-II population size 等。加载 `ppo_config` 时会先合并代码内置的 env/PPO 默认值，再合并 YAML 和 `--ppo_config_override`；最后只补充当前 args 中不存在的字段。如果名字冲突，stage argparse 的值优先。
@@ -80,7 +80,7 @@ source .venv/bin/activate
 python stage1_mix_random_data.py
 ```
 
-这个阶段会读取 stage1A 的 PPO 轨迹，按脚本参数采样 random-policy 轨迹，并写出一个给 stage2 使用的 `mixed_trajectories.arrow`。
+这个阶段会读取 stage1A 的 PPO 轨迹，按脚本参数采样 random-policy 轨迹，并写出 raw mixed 轨迹 `mixed_trajectories.arrow`，同时生成给 stage2 直接训练用的 supervised dataset `representation_data.arrow`。
 
 随机数据规模可用三种方式控制，优先级从高到低：
 
@@ -108,17 +108,17 @@ python stage1_mix_random_data.py --existing_random_trajectory_file runs/stage1_m
 
 ```bash
 source .venv/bin/activate
-python stage2_train_supernet.py --trajectory_data runs/stage1_mix/mixed_trajectories.arrow
+python stage2_train_supernet.py --trajectory_data runs/stage1_mix/representation_data.arrow
 ```
 
 这个阶段会：
 
 - 从 stage1A backbone checkpoint 继承初始参数。
-- 从 stage1B 生成的单个 mixed Arrow dataset 读取 PPO + random 轨迹。
-- stage1 数据写入时已过滤 `terminated=True` transition；`truncated=True, terminated=False` transition 会保留。
-- stage2 直接 shuffle one-step transition：`s_t, a_t -> s_{t+1}`，默认输入数据中的每一行都可用于表征学习。
+- 从 stage1B 生成的 `representation_data.arrow` 读取 PPO + random supervised samples。
+- stage1 会保留 `terminated`/`truncated` transition，并在 `representation_data.arrow` 中预先打包 one-step 或 k-step 滑窗样本。
+- k-step 样本不在 episode 边界 padding；窗口会直接跨到后续 episode，`done`/`terminated`/`truncated` 序列随样本保存，stage2 用 `done` mask 掉 episode 边界之后的 offset。
 - 每个 batch 使用 sandwich 采样：最大网络作为 teacher，最小 subnet 与若干随机 subnet 作为 student。
-- 使用函数式 `latent_dynamics_loss` 和 `cosine_kd_loss` 训练 supernet backbone。
+- 使用函数式 `latent_dynamics_loss` 和 `cosine_kd_loss` 训练 supernet backbone；`--dynamics_betas` 可设置每个 horizon step 的 beta 权重，mask 会排除 episode 边界之后的无效未来步。
 - 使用 backbone/head 两组 AdamW learning rate，并使用 warmup + cosine scheduler。
 - 保存 `supernet_backbone_stage2.pt`、`metrics.jsonl`、`manifest.json`。
 
@@ -128,7 +128,8 @@ stage2 的 AdamW 使用 PyTorch 默认 beta/eps；DataLoader 的 shuffle/pin_mem
 
 ```bash
 source .venv/bin/activate
-python stage2_train_supernet.py --trajectory_data runs/stage1_mix/mixed_trajectories.arrow --train_steps 5000 --random_subnets 4 --projection_dim 128
+python stage1_mix_random_data.py --representation_horizon 3
+python stage2_train_supernet.py --trajectory_data runs/stage1_mix/representation_data.arrow --train_steps 5000 --random_subnets 4 --projection_dim 128 --dynamics_horizon 3 --dynamics_betas 1.0,0.5,0.25
 ```
 
 ## Stage 3: NSGA-II subnet 搜索
@@ -160,6 +161,26 @@ source .venv/bin/activate
 python stage3_ea_search.py --eval_workers 2 --population_size 8 --generations 5
 ```
 
+## Atari 示例脚本
+
+仓库提供了基于 `ALE/Pong-v5` 的分阶段脚本，默认启用 SB3 Atari wrapper，并直接使用 wrapper 默认参数：no-op reset、frame skip + max-pooling、episodic life、fire reset、84x84 grayscale、reward clipping，以及 `VecFrameStack(4)`。启用 wrapper 时，底层 ALE 会固定为 no-frame-skip/no-sticky-action，避免和 wrapper 默认预处理叠加；这些 Atari wrapper 细项不再作为脚本或 config 参数暴露。
+
+```bash
+source .venv/bin/activate
+scripts/atari_stage1_train_max_ppo.sh
+scripts/atari_stage1_mix_random_data.sh
+scripts/atari_stage2_train_supernet.sh
+scripts/atari_stage3_ea_search.sh
+```
+
+常用环境变量覆盖：
+
+```bash
+ENV_ID=ALE/Breakout-v5 RUN_ROOT=runs/atari_breakout TOTAL_TIMESTEPS=200000 scripts/atari_stage1_train_max_ppo.sh
+RUN_ROOT=runs/atari_breakout TRAIN_STEPS=20000 DYNAMICS_HORIZON=3 scripts/atari_stage2_train_supernet.sh
+RUN_ROOT=runs/atari_breakout POPULATION_SIZE=8 GENERATIONS=5 CANDIDATE_TIMESTEPS=50000 scripts/atari_stage3_ea_search.sh
+```
+
 ## Smoke Test
 
 下面命令用于快速验证每个阶段代码路径可运行，不代表有效训练配置：
@@ -176,7 +197,7 @@ python stage1_mix_random_data.py --ppo_trajectory_file runs/smoke_stage1/ppo_tra
 
 ```bash
 source .venv/bin/activate
-python stage2_train_supernet.py --trajectory_data runs/smoke_mix/mixed_trajectories.arrow --stage1_backbone runs/smoke_stage1/supernet_backbone_stage1.pt --output_dir runs/smoke_stage2 --train_steps 1 --batch_size 2 --random_subnets 1 --projection_dim 16 --predictor_hidden_dim 32 --ppo_config_override ppo.features_dim=32
+python stage2_train_supernet.py --trajectory_data runs/smoke_mix/representation_data.arrow --stage1_backbone runs/smoke_stage1/supernet_backbone_stage1.pt --output_dir runs/smoke_stage2 --train_steps 1 --batch_size 2 --random_subnets 1 --projection_dim 16 --predictor_hidden_dim 32 --ppo_config_override ppo.features_dim=32
 ```
 
 ```bash

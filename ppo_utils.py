@@ -38,6 +38,8 @@ def resolve_device(device: str) -> torch.device:
 
 
 def use_render_observation(args: argparse.Namespace) -> bool:
+    if str(getattr(args, "atari_wrapper", "none")).lower() != "none":
+        return False
     return not bool(args.native_image_env)
 
 
@@ -61,6 +63,8 @@ def make_vec_env_from_args(
         image_size=args.image_size,
         use_render_observation=use_render_observation(args),
         vector_env_type=getattr(args, "vector_env_type", "dummy"),
+        frame_stack=int(getattr(args, "frame_stack", 1)),
+        atari_wrapper=str(getattr(args, "atari_wrapper", "none")),
     )
 
 

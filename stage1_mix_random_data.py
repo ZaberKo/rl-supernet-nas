@@ -12,6 +12,7 @@ from trajectory_data import (
     count_trajectory_file,
     read_metadata,
     write_mixed_trajectory_dataset,
+    write_supervised_transition_dataset,
     write_trajectory_prefix,
 )
 from wandb_utils import finish_wandb_run, init_wandb_run, log_wandb, log_wandb_artifact
@@ -32,7 +33,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--random_fraction", type=float, default=-1.0, help="Target random fraction in the mixed dataset; use a negative value to disable.")
     parser.add_argument("--random_seed_offset", type=int, default=10_000, help="Offset added to the base seed for random-policy collection.")
     parser.add_argument("--random_output_name", default="random_trajectories.arrow", help="Directory name for the random trajectory Arrow dataset inside output_dir.")
-    parser.add_argument("--mixed_output_name", default="mixed_trajectories.arrow", help="Directory name for the combined PPO+random Arrow dataset inside output_dir.")
+    parser.add_argument("--mixed_output_name", default="mixed_trajectories.arrow", help="Directory name for the combined PPO+random raw trajectory Arrow dataset inside output_dir.")
+    parser.add_argument("--representation_horizon", type=int, default=1, help="Number of future steps packed into each stage2 supervised sample.")
+    parser.add_argument("--representation_output_name", default="representation_data.arrow", help="Directory name for the stage2 supervised transition dataset inside output_dir.")
     parser.add_argument("--manifest_name", default="manifest.json", help="File name for the mixed-data summary manifest inside output_dir.")
     args = parser.parse_args()
     load_ppo_config(args)
@@ -124,14 +127,34 @@ def run(args: argparse.Namespace) -> dict:
         metadata=mixed_metadata,
     )
     mixed_count = count_trajectory_file(mixed_path)
+    representation_path = output_dir / args.representation_output_name
+    representation_metadata = {
+        "source": "stage1_supervised_transition_samples",
+        "env_id": args.env_id,
+        "seed": args.seed,
+        "image_size": args.image_size,
+        "horizon": int(args.representation_horizon),
+        "raw_mixed_trajectory_file": str(mixed_path),
+        "args": vars(args),
+    }
+    write_supervised_transition_dataset(
+        input_paths=[mixed_path],
+        output_path=representation_path,
+        horizon=args.representation_horizon,
+        metadata=representation_metadata,
+    )
+    representation_count = count_trajectory_file(representation_path)
     mixed_manifest = {
         "stage": "stage1_mix_random",
         "mixed_trajectory_file": str(mixed_path),
+        "representation_data": str(representation_path),
+        "representation_horizon": int(args.representation_horizon),
         "ppo_trajectory_file": str(ppo_path),
         "random_trajectory_file": str(random_path),
         "ppo_count": ppo_count,
         "random_count": random_count,
         "mixed_count": mixed_count,
+        "representation_count": representation_count,
         "actual_random_to_ppo_ratio": random_count["num_transitions"] / max(1, ppo_count["num_transitions"]),
         "actual_random_fraction": random_count["num_transitions"] / max(1, ppo_count["num_transitions"] + random_count["num_transitions"]),
         "ppo_metadata": ppo_metadata,
@@ -146,6 +169,8 @@ def run(args: argparse.Namespace) -> dict:
             "stage1_mix/ppo_transitions": ppo_count["num_transitions"],
             "stage1_mix/random_transitions": random_count["num_transitions"],
             "stage1_mix/mixed_transitions": mixed_count["num_transitions"],
+            "stage1_mix/representation_samples": representation_count["num_transitions"],
+            "stage1_mix/representation_horizon": int(args.representation_horizon),
             "stage1_mix/random_to_ppo_ratio": mixed_manifest["actual_random_to_ppo_ratio"],
             "stage1_mix/random_fraction": mixed_manifest["actual_random_fraction"],
             "stage1_mix/mixed_trajectories": mixed_count.get("num_trajectories", mixed_count["num_envs"]),
@@ -156,7 +181,7 @@ def run(args: argparse.Namespace) -> dict:
         wandb_run,
         name=f"stage1-mix-{output_dir.name}",
         artifact_type="stage1-mix-output",
-        paths=[random_path, mixed_path, manifest_path],
+        paths=[random_path, mixed_path, representation_path, manifest_path],
     )
     finish_wandb_run(wandb_run)
     return mixed_manifest

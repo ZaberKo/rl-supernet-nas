@@ -16,6 +16,7 @@ from torch.utils.data import Dataset as TorchDataset
 
 TRAJECTORY_METADATA_FILE = "metadata.json"
 TRAJECTORY_STORAGE_FORMAT = "datasets_arrow"
+SUPERVISED_DATASET_TYPE = "supervised_transition_samples"
 
 
 def split_done_flags(
@@ -176,20 +177,26 @@ def load_npz_trajectory_arrays(path: str | Path) -> dict[str, np.ndarray]:
 def iter_rows_from_arrays(
     arrays: dict[str, np.ndarray],
     trajectory_offset: int = 0,
-    skip_terminated: bool = True,
+    skip_terminated: bool = False,
 ) -> Iterable[dict[str, Any]]:
     data = normalize_trajectory_arrays(arrays)
     num_steps, num_envs = data["rewards"].shape
+    next_trajectory_id = int(trajectory_offset)
     for env_index in range(num_envs):
-        trajectory_id = int(trajectory_offset + env_index)
+        trajectory_id = next_trajectory_id
+        next_trajectory_id += 1
         saved_step_index = 0
         for source_step_index in range(num_steps):
             terminated = bool(data["terminateds"][source_step_index, env_index])
-            if skip_terminated and terminated:
-                continue
             truncated = bool(data["truncateds"][source_step_index, env_index])
+            done = bool(terminated or truncated)
+            if skip_terminated and terminated:
+                trajectory_id = next_trajectory_id
+                next_trajectory_id += 1
+                saved_step_index = 0
+                continue
             yield {
-                "trajectory_id": trajectory_id,
+                "trajectory_id": int(trajectory_id),
                 "step_index": int(saved_step_index),
                 "env_index": int(env_index),
                 "observation": data["observations"][source_step_index, env_index],
@@ -197,10 +204,14 @@ def iter_rows_from_arrays(
                 "reward": float(data["rewards"][source_step_index, env_index]),
                 "terminated": terminated,
                 "truncated": truncated,
-                "done": bool(terminated or truncated),
+                "done": done,
                 "next_observation": data["next_observations"][source_step_index, env_index],
             }
             saved_step_index += 1
+            if done:
+                trajectory_id = next_trajectory_id
+                next_trajectory_id += 1
+                saved_step_index = 0
 
 
 def load_arrow_rows(path: str | Path) -> list[dict[str, Any]]:
@@ -241,7 +252,7 @@ def load_trajectory_rows(path: str | Path) -> list[dict[str, Any]]:
     path = Path(path)
     if is_arrow_trajectory(path):
         return load_arrow_rows(path)
-    return list(iter_rows_from_arrays(load_npz_trajectory_arrays(path)))
+    return list(iter_rows_from_arrays(load_npz_trajectory_arrays(path), skip_terminated=False))
 
 
 def trajectory_metadata_from_rows(rows: Sequence[dict[str, Any]], metadata: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -341,7 +352,7 @@ def save_trajectory_dataset(
         "truncateds": np.asarray(truncateds, dtype=np.bool_),
         "next_observations": np.asarray(next_observations),
     }
-    save_trajectory_rows(path, list(iter_rows_from_arrays(arrays)), metadata=metadata)
+    save_trajectory_rows(path, list(iter_rows_from_arrays(arrays, skip_terminated=False)), metadata=metadata)
 
 
 def load_arrow_trajectory_arrays(path: str | Path) -> dict[str, np.ndarray]:
@@ -409,8 +420,6 @@ def remap_trajectory_ids(rows: Sequence[dict[str, Any]], trajectory_offset: int)
     next_step_index: dict[int, int] = {}
     remapped = []
     for row in sorted(rows, key=lambda item: (int(item["trajectory_id"]), int(item["step_index"]))):
-        if bool(row["terminated"]):
-            continue
         old_id = int(row["trajectory_id"])
         if old_id not in id_map:
             id_map[old_id] = trajectory_offset + len(id_map)
@@ -434,6 +443,186 @@ def write_mixed_trajectory_dataset(
         input_rows, trajectory_offset = remap_trajectory_ids(load_trajectory_rows(input_path), trajectory_offset)
         rows.extend(input_rows)
     save_trajectory_rows(output_path, rows, metadata=metadata)
+
+
+def is_supervised_transition_dataset(path: str | Path) -> bool:
+    path = Path(path)
+    if not is_arrow_trajectory(path):
+        return False
+    return read_metadata(path).get("dataset_type") == SUPERVISED_DATASET_TYPE
+
+
+def order_rows_for_supervised_windows(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(rows, key=lambda item: (int(item["trajectory_id"]), int(item["step_index"])))
+
+
+def row_has_synthetic_truncation_boundary(
+    ordered_rows: Sequence[dict[str, Any]],
+    index: int,
+) -> bool:
+    row = ordered_rows[index]
+    if bool(row["done"]):
+        return False
+    if index + 1 >= len(ordered_rows):
+        return True
+    next_row = ordered_rows[index + 1]
+    return int(next_row["trajectory_id"]) != int(row["trajectory_id"])
+
+
+def build_supervised_transition_features(
+    observation_shape: Sequence[int],
+    observation_dtype: np.dtype,
+    action_shape: Sequence[int],
+    action_dtype: np.dtype,
+    horizon: int,
+) -> Features:
+    return Features(
+        {
+            "sample_id": Value("int64"),
+            "source_trajectory_id": Value("int64"),
+            "step_index": Value("int64"),
+            "env_index": Value("int64"),
+            "observation": fixed_shape_feature(observation_shape, observation_dtype),
+            "actions": fixed_shape_feature((horizon, *tuple(action_shape)), action_dtype),
+            "targets": fixed_shape_feature((horizon, *tuple(observation_shape)), observation_dtype),
+            "dones": fixed_shape_feature((horizon,), np.dtype(np.bool_)),
+            "terminateds": fixed_shape_feature((horizon,), np.dtype(np.bool_)),
+            "truncateds": fixed_shape_feature((horizon,), np.dtype(np.bool_)),
+        }
+    )
+
+
+def build_supervised_transition_rows(
+    rows: Sequence[dict[str, Any]],
+    horizon: int,
+) -> list[dict[str, Any]]:
+    if horizon <= 0:
+        raise ValueError("horizon must be positive.")
+
+    ordered_rows = order_rows_for_supervised_windows(rows)
+    window_count = len(ordered_rows) - horizon + 1
+    if window_count <= 0:
+        return []
+
+    samples: list[dict[str, Any]] = []
+    for sample_id, start_index in enumerate(range(window_count)):
+        window = ordered_rows[start_index : start_index + horizon]
+        first_row = window[0]
+        actions = []
+        targets = []
+        dones = []
+        terminateds = []
+        truncateds = []
+        for offset, row in enumerate(window):
+            row_index = start_index + offset
+            synthetic_truncated = row_has_synthetic_truncation_boundary(ordered_rows, row_index)
+            actions.append(scalar_or_array_value(row["action"]))
+            targets.append(np.asarray(row["next_observation"]))
+            dones.append(bool(row["done"]) or synthetic_truncated)
+            terminateds.append(bool(row["terminated"]))
+            truncateds.append(bool(row["truncated"]) or synthetic_truncated)
+        samples.append(
+            {
+                "sample_id": int(sample_id),
+                "source_trajectory_id": int(first_row["trajectory_id"]),
+                "step_index": int(first_row["step_index"]),
+                "env_index": int(first_row["env_index"]),
+                "observation": np.asarray(first_row["observation"]),
+                "actions": np.asarray(actions),
+                "targets": np.asarray(targets),
+                "dones": np.asarray(dones, dtype=np.bool_),
+                "terminateds": np.asarray(terminateds, dtype=np.bool_),
+                "truncateds": np.asarray(truncateds, dtype=np.bool_),
+            }
+        )
+    return samples
+
+
+def write_supervised_transition_dataset(
+    input_paths: Sequence[str | Path],
+    output_path: str | Path,
+    horizon: int = 1,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    rows: list[dict[str, Any]] = []
+    trajectory_offset = 0
+    for input_path in input_paths:
+        input_rows, trajectory_offset = remap_trajectory_ids(load_trajectory_rows(input_path), trajectory_offset)
+        rows.extend(input_rows)
+    if not rows:
+        raise ValueError("At least one raw transition row is required.")
+
+    samples = build_supervised_transition_rows(rows, horizon=horizon)
+    if not samples:
+        raise ValueError("At least one supervised transition sample is required.")
+
+    first = samples[0]
+    observation_shape = tuple(int(value) for value in np.asarray(first["observation"]).shape)
+    action_shape = tuple(int(value) for value in np.asarray(first["actions"]).shape[1:])
+    observation_dtype = np.asarray(first["observation"]).dtype
+    action_dtype = np.asarray(first["actions"]).dtype
+    payload_metadata = dict(metadata or {})
+    payload_metadata.update(
+        {
+            "dataset_type": SUPERVISED_DATASET_TYPE,
+            "supervised_schema_version": 1,
+            "horizon": int(horizon),
+            "num_samples": int(len(samples)),
+            "num_raw_transitions": int(len(rows)),
+            "observation_shape": list(observation_shape),
+            "observation_dtype": str(observation_dtype),
+            "action_shape": list(action_shape),
+            "action_dtype": str(action_dtype),
+        }
+    )
+    features = build_supervised_transition_features(
+        observation_shape=observation_shape,
+        observation_dtype=observation_dtype,
+        action_shape=action_shape,
+        action_dtype=action_dtype,
+        horizon=horizon,
+    )
+
+    output_path = Path(output_path)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    def row_generator():
+        for sample in samples:
+            yield {
+                "sample_id": int(sample["sample_id"]),
+                "source_trajectory_id": int(sample["source_trajectory_id"]),
+                "step_index": int(sample["step_index"]),
+                "env_index": int(sample["env_index"]),
+                "observation": np.asarray(sample["observation"]),
+                "actions": np.asarray(sample["actions"]),
+                "targets": np.asarray(sample["targets"]),
+                "dones": np.asarray(sample["dones"], dtype=np.bool_),
+                "terminateds": np.asarray(sample["terminateds"], dtype=np.bool_),
+                "truncateds": np.asarray(sample["truncateds"], dtype=np.bool_),
+            }
+
+    dataset = ArrowDataset.from_generator(row_generator, features=features)
+    dataset.save_to_disk(str(output_path))
+    write_metadata(output_path, payload_metadata)
+
+
+def load_supervised_transition_rows(path: str | Path) -> list[dict[str, Any]]:
+    dataset = ArrowDataset.load_from_disk(str(path)).with_format("numpy")
+    if len(dataset) == 0:
+        raise ValueError(f"Supervised transition dataset is empty: {path}")
+    rows = []
+    for row in dataset:
+        rows.append(
+            {
+                "observation": np.asarray(row["observation"]),
+                "actions": np.asarray(row["actions"]),
+                "targets": np.asarray(row["targets"]),
+                "dones": np.asarray(row["dones"], dtype=np.bool_),
+                "terminateds": np.asarray(row["terminateds"], dtype=np.bool_),
+                "truncateds": np.asarray(row["truncateds"], dtype=np.bool_),
+            }
+        )
+    return rows
 
 
 class TrajectoryBuffer:
@@ -581,23 +770,60 @@ def collect_random_trajectories(
 class TransitionDataset(TorchDataset):
     def __init__(self, trajectory_files: Sequence[str | Path]):
         self.rows: list[dict[str, Any]] = []
+        self.horizon = 1
         for path in trajectory_files:
-            self.rows.extend(load_trajectory_rows(path))
+            if is_supervised_transition_dataset(path):
+                supervised_rows = load_supervised_transition_rows(path)
+                self.rows.extend(supervised_rows)
+                self.horizon = int(np.asarray(supervised_rows[0]["actions"]).shape[0])
+            else:
+                raw_rows = load_trajectory_rows(path)
+                self.rows.extend(self._one_step_rows(raw_rows))
+                self.horizon = 1
         if not self.rows:
             raise ValueError("No transitions were found.")
-        if any(bool(row["terminated"]) for row in self.rows):
-            raise ValueError("TransitionDataset expects stage1 data with terminated transitions already removed.")
+
+    @staticmethod
+    def _one_step_rows(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+        one_step_rows = []
+        for row in rows:
+            one_step_rows.append(
+                {
+                    "observation": row["observation"],
+                    "actions": np.expand_dims(np.asarray(row["action"]), axis=0),
+                    "targets": np.expand_dims(np.asarray(row["next_observation"]), axis=0),
+                    "dones": np.asarray([bool(row["done"])]),
+                    "terminateds": np.asarray([bool(row["terminated"])]),
+                    "truncateds": np.asarray([bool(row["truncated"])]),
+                }
+            )
+        return one_step_rows
 
     def __len__(self) -> int:
         return len(self.rows)
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         row = self.rows[index]
-        return {
+        actions = torch.as_tensor(row["actions"])
+        targets = torch.stack([self._to_image_tensor(target) for target in np.asarray(row["targets"])], dim=0)
+        dones = torch.as_tensor(np.asarray(row["dones"], dtype=np.bool_), dtype=torch.bool)
+        terminateds = torch.as_tensor(np.asarray(row["terminateds"], dtype=np.bool_), dtype=torch.bool)
+        truncateds = torch.as_tensor(np.asarray(row["truncateds"], dtype=np.bool_), dtype=torch.bool)
+        item = {
             "observation": self._to_image_tensor(row["observation"]),
-            "action": torch.as_tensor(row["action"]),
-            "target": self._to_image_tensor(row["next_observation"]),
+            "actions": actions,
+            "targets": targets,
+            "dones": dones,
+            "terminateds": terminateds,
+            "truncateds": truncateds,
         }
+        if actions.shape[0] == 1:
+            item["action"] = actions[0]
+            item["target"] = targets[0]
+            item["done"] = dones[0]
+            item["terminated"] = terminateds[0]
+            item["truncated"] = truncateds[0]
+        return item
 
     @staticmethod
     def _to_image_tensor(array: np.ndarray) -> torch.Tensor:
@@ -610,8 +836,38 @@ class TransitionDataset(TorchDataset):
             return tensor.float().div(255.0)
         return tensor.float()
 
+
 def count_trajectory_file(path: str | Path) -> dict[str, int]:
     path = Path(path)
+    if is_supervised_transition_dataset(path):
+        dataset = ArrowDataset.load_from_disk(str(path))
+        metadata = read_metadata(path)
+        if len(dataset) == 0:
+            return {
+                "num_steps": 0,
+                "num_envs": 0,
+                "num_transitions": 0,
+                "num_samples": 0,
+                "num_terminated": 0,
+                "num_truncated": 0,
+                "num_done": 0,
+                "num_trajectories": 0,
+            }
+        env_indices = np.asarray(dataset["env_index"], dtype=np.int64)
+        terminateds = np.asarray(dataset["terminateds"], dtype=np.bool_)
+        truncateds = np.asarray(dataset["truncateds"], dtype=np.bool_)
+        dones = np.asarray(dataset["dones"], dtype=np.bool_)
+        return {
+            "num_steps": int(metadata.get("horizon", int(dones.shape[-1]))),
+            "num_envs": int(np.unique(env_indices).size),
+            "num_transitions": int(len(dataset)),
+            "num_samples": int(len(dataset)),
+            "num_terminated": int(terminateds.sum()),
+            "num_truncated": int(truncateds.sum()),
+            "num_done": int(dones.sum()),
+            "num_trajectories": int(np.unique(env_indices).size),
+        }
+
     if is_arrow_trajectory(path):
         dataset = ArrowDataset.load_from_disk(str(path))
         metadata = read_metadata(path)
@@ -662,7 +918,7 @@ def write_trajectory_prefix(
     metadata: dict[str, Any] | None = None,
 ) -> None:
     input_path = Path(input_path)
-    rows = [row for row in load_trajectory_rows(input_path) if not bool(row["terminated"])]
+    rows = load_trajectory_rows(input_path)
     source_metadata = read_metadata(input_path)
     groups: dict[int, list[dict[str, Any]]] = {}
     for row in rows:

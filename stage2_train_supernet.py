@@ -32,24 +32,26 @@ def parse_args() -> argparse.Namespace:
         allow_abbrev=False,
     )
     add_ppo_config_args(parser)
-    parser.add_argument("--trajectory_data", default="runs/stage1_mix/mixed_trajectories.arrow", help="Stage1 mixed PPO+random Arrow dataset used for one-step representation learning.")
+    parser.add_argument("--trajectory_data", default="runs/stage1_mix/representation_data.arrow", help="Stage1 supervised transition dataset used for representation learning; raw one-step trajectory files are also accepted.")
     parser.add_argument("--output_dir", default="runs/stage2", help="Directory for stage2 checkpoints, metrics, and manifest.")
     parser.add_argument("--stage1_backbone", default="runs/stage1_ppo_max_arch/supernet_backbone_stage1.pt", help="Backbone checkpoint inherited from stage1 PPO training; use an empty string to train from scratch.")
     parser.add_argument("--train_steps", type=int, default=1000, help="Number of optimizer updates. When <= 0, the budget is epochs multiplied by DataLoader length.")
     parser.add_argument("--epochs", type=int, default=0, help="Fallback epoch budget used only when train_steps <= 0.")
-    parser.add_argument("--batch_size", type=int, default=64, help="One-step transition batch size for stage2 DataLoader.")
+    parser.add_argument("--batch_size", type=int, default=64, help="Transition sequence batch size for stage2 DataLoader.")
     parser.add_argument("--random_subnets", type=int, default=2, help="Number of random student subnets sampled per batch, in addition to the min arch.")
     parser.add_argument("--projection_dim", type=int, default=128, help="Latent projection dimension used by KD and dynamics losses.")
-    parser.add_argument("--predictor_hidden_dim", type=int, default=512, help="Hidden dimension for the action-conditioned one-step latent dynamics predictor.")
+    parser.add_argument("--predictor_hidden_dim", type=int, default=512, help="Hidden dimension for the action-conditioned latent dynamics predictor.")
+    parser.add_argument("--dynamics_horizon", type=int, default=0, help="Optional expected horizon check; 0 infers horizon from the dataset.")
+    parser.add_argument("--dynamics_betas", default="", help="Comma-separated beta weights for each dynamics horizon step; empty uses all ones.")
     parser.add_argument("--backbone_learning_rate", type=float, default=3e-5, help="AdamW learning rate for inherited backbone parameters.")
     parser.add_argument("--head_learning_rate", type=float, default=1e-4, help="AdamW learning rate for the projection head and dynamics predictor.")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="AdamW weight decay for stage2 representation learning.")
     parser.add_argument("--warmup_ratio", type=float, default=0.05, help="Fraction of optimizer steps used for linear warmup before cosine decay.")
     parser.add_argument("--min_lr_ratio", type=float, default=0.1, help="Final learning-rate multiplier at the end of cosine decay.")
     parser.add_argument("--gradient_clip_norm", type=parse_optional_float, default=None, help="Optional gradient clipping norm; use none/null/off to disable.")
-    parser.add_argument("--dyn_weight", type=float, default=1.0, help="Weight for one-step latent dynamics prediction loss.")
+    parser.add_argument("--dyn_weight", type=float, default=1.0, help="Weight for latent dynamics prediction loss.")
     parser.add_argument("--kd_weight", type=float, default=1.0, help="Weight for cosine latent distillation loss.")
-    parser.add_argument("--num_workers", type=int, default=0, help="DataLoader worker count for shuffled one-step transitions.")
+    parser.add_argument("--num_workers", type=int, default=0, help="DataLoader worker count for shuffled transition sequences.")
     parser.add_argument("--save_every_steps", type=int, default=0, help="Save an extra checkpoint every N optimizer steps; 0 disables periodic checkpoints.")
     args = parser.parse_args()
     load_ppo_config(args)
@@ -103,6 +105,27 @@ def resolve_total_steps(args: argparse.Namespace, steps_per_epoch: int) -> int:
     if args.epochs <= 0:
         raise ValueError("Either train_steps must be positive or epochs must be positive.")
     return int(args.epochs * steps_per_epoch)
+
+
+def resolve_dynamics_betas(text: str, horizon: int, device: torch.device) -> torch.Tensor:
+    if horizon <= 0:
+        raise ValueError("dynamics_horizon must be positive.")
+    if not text:
+        return torch.ones(horizon, dtype=torch.float32, device=device)
+    values = [float(value.strip()) for value in text.split(",") if value.strip()]
+    if len(values) != horizon:
+        raise ValueError("dynamics_betas must contain exactly dynamics_horizon values.")
+    return torch.tensor(values, dtype=torch.float32, device=device)
+
+
+def valid_steps_from_done_signals(dones: torch.Tensor, terminateds: torch.Tensor) -> torch.Tensor:
+    if dones.dim() != 2 or terminateds.dim() != 2:
+        raise ValueError("dones and terminateds must have shape [batch, horizon].")
+    if dones.shape != terminateds.shape:
+        raise ValueError("dones and terminateds must have the same shape.")
+    done_values = dones.to(torch.int64)
+    previous_done_count = torch.cumsum(done_values, dim=1) - done_values
+    return ((previous_done_count == 0) & ~terminateds).to(torch.float32)
 
 
 def iterate_batches(loader: DataLoader) -> Iterator[tuple[int, dict[str, torch.Tensor]]]:
@@ -159,6 +182,8 @@ def main() -> None:
         image_size=args.image_size,
         use_render_observation=use_render_observation(args),
         vector_env_type=getattr(args, "vector_env_type", "dummy"),
+        frame_stack=int(getattr(args, "frame_stack", 1)),
+        atari_wrapper=str(getattr(args, "atari_wrapper", "none")),
     )
     input_channels = infer_input_channels(tuple(observation_space.shape))
     backbone = SupernetCNNBackbone(
@@ -181,6 +206,8 @@ def main() -> None:
     optimizer = build_optimizer(args, backbone, projection, predictor)
 
     dataset = TransitionDataset([args.trajectory_data])
+    if args.dynamics_horizon > 0 and args.dynamics_horizon != dataset.horizon:
+        raise ValueError("dynamics_horizon does not match the dataset horizon.")
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -192,10 +219,12 @@ def main() -> None:
     steps_per_epoch = len(loader)
     total_steps = resolve_total_steps(args, steps_per_epoch)
     scheduler = build_scheduler(args, optimizer, total_steps)
+    beta_weights = resolve_dynamics_betas(args.dynamics_betas, dataset.horizon, device)
     log_wandb(
         wandb_run,
         {
-            "stage2/num_transitions": len(dataset),
+            "stage2/num_samples": len(dataset),
+            "stage2/dataset_horizon": dataset.horizon,
             "stage2/total_steps": total_steps,
         },
         step=0,
@@ -211,14 +240,23 @@ def main() -> None:
             epoch = step_index // steps_per_epoch
 
             observation = batch["observation"].to(device)
-            actions = batch["action"].to(device)
-            target = batch["target"].to(device)
-            action_features = encode_action_batch(actions, action_space).to(device)
+            actions = batch["actions"].to(device)
+            targets = batch["targets"].to(device)
+            dones = batch["dones"].to(device)
+            terminateds = batch["terminateds"].to(device)
+            batch_size, horizon = actions.shape[:2]
+            flat_actions = actions.reshape(batch_size * horizon, *actions.shape[2:])
+            action_features = encode_action_batch(flat_actions, action_space).to(device)
+            action_features = action_features.view(batch_size, horizon, -1)
+            flat_targets = targets.reshape(batch_size * horizon, *targets.shape[2:])
+            valid_steps = valid_steps_from_done_signals(dones, terminateds).to(device)
+            flat_valid_steps = valid_steps.reshape(batch_size * horizon)
 
             backbone.set_max_arch()
             with torch.no_grad():
                 teacher_start = F.normalize(projection(backbone(observation)), dim=-1)
-                teacher_target = F.normalize(projection(backbone(target)), dim=-1)
+                teacher_targets = F.normalize(projection(backbone(flat_targets)), dim=-1)
+                teacher_targets = teacher_targets.view(batch_size, horizon, -1)
 
             sampled_arches = [search_space.min_arch()]
             for _ in range(args.random_subnets):
@@ -231,11 +269,16 @@ def main() -> None:
                 backbone.set_active_arch(arch)
                 student_start = F.normalize(projection(backbone(observation)), dim=-1)
                 predictions = predictor(student_start, action_features)
-                dyn_loss = latent_dynamics_loss(predictions, teacher_target)
+                dyn_loss = latent_dynamics_loss(predictions, teacher_targets, beta_weights, sample_weights=valid_steps)
 
-                student_target = F.normalize(projection(backbone(target)), dim=-1)
+                student_targets = F.normalize(projection(backbone(flat_targets)), dim=-1)
+                student_targets = student_targets.view(batch_size, horizon, -1)
                 kd_loss = cosine_kd_loss(student_start, teacher_start)
-                kd_loss = kd_loss + cosine_kd_loss(student_target, teacher_target)
+                kd_loss = kd_loss + cosine_kd_loss(
+                    student_targets.flatten(0, 1),
+                    teacher_targets.flatten(0, 1),
+                    sample_weights=flat_valid_steps,
+                )
                 total_loss = total_loss + args.dyn_weight * dyn_loss + args.kd_weight * kd_loss
                 dyn_value = dyn_value + dyn_loss.detach()
                 kd_value = kd_value + kd_loss.detach()
@@ -262,6 +305,9 @@ def main() -> None:
                 "backbone_lr": backbone_lr,
                 "head_lr": head_lr,
                 "num_student_subnets": len(sampled_arches),
+                "dynamics_horizon": int(dataset.horizon),
+                "dynamics_betas": [float(value) for value in beta_weights.detach().cpu().tolist()],
+                "valid_horizon_fraction": float(valid_steps.detach().mean().cpu()),
                 "student_arches": [arch.to_dict() for arch in sampled_arches],
             }
             metrics_file.write(json.dumps(record) + "\n")
@@ -276,6 +322,8 @@ def main() -> None:
                     "stage2/backbone_lr": backbone_lr,
                     "stage2/head_lr": head_lr,
                     "stage2/num_student_subnets": len(sampled_arches),
+                    "stage2/dynamics_horizon": int(dataset.horizon),
+                    "stage2/valid_horizon_fraction": record["valid_horizon_fraction"],
                 },
                 step=train_step,
             )
@@ -312,7 +360,8 @@ def main() -> None:
         "metrics": str(metrics_path),
         "search_space": str(output_dir / "search_space.json"),
         "trajectory_data": args.trajectory_data,
-        "num_transitions": len(dataset),
+        "num_samples": len(dataset),
+        "dataset_horizon": dataset.horizon,
         "total_steps": total_steps,
         "args": vars(args),
     }
@@ -322,7 +371,7 @@ def main() -> None:
         wandb_run,
         {
             "stage2/num_logged_steps": total_steps,
-            "stage2/num_transitions": len(dataset),
+            "stage2/num_samples": len(dataset),
         },
         step=total_steps,
     )

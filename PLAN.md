@@ -32,12 +32,12 @@ All listed implementation items are complete and smoke-tested.
    - Emit one mixed Arrow dataset that stage 2 can consume directly and log counts/artifacts to W&B.
 
 4. Stage 2: representation learning
-   - Load the single mixed Arrow dataset produced by stage 1B.
-   - Stage 1 writes only learnable rows by dropping `terminated=True` transitions while keeping time-limit truncated transitions.
-   - Train on shuffled one-step transitions and treat every input row as usable.
+   - Load the supervised representation Arrow dataset produced by stage 1B.
+   - Stage 1B preserves terminal flags and done boundaries, then pre-packs one-step or k-step supervised sliding-window samples without episode-boundary padding.
+   - Train on shuffled samples directly; stage2 does not build k-step windows itself and masks offsets after the first done signal.
    - Initialize the supernet from stage 1 weights when provided.
    - Train sampled subnets with sandwich sampling: max teacher, min subnet, and random subnets.
-   - Use direct loss functions for one-step latent dynamics prediction and cosine latent KD.
+   - Use direct loss functions for action-conditioned k-step latent dynamics prediction and cosine latent KD.
    - Use AdamW with separate backbone/head learning rates and warmup + cosine scheduling.
    - Save the trained supernet checkpoint and record stage metrics/artifacts to W&B.
 
@@ -60,7 +60,7 @@ All listed implementation items are complete and smoke-tested.
 
 ## Default Smoke-Test Environment
 
-Use `CartPole-v1` with `rgb_array` rendering converted into image observations. This avoids requiring Atari or Box2D packages while still testing the visual-observation CNN path. CLI flags allow using native visual environments as well.
+Use `CartPole-v1` with `rgb_array` rendering converted into image observations. This avoids requiring Atari or Box2D packages while still testing the visual-observation CNN path. CLI/config overrides also support ALE Atari environments with SB3 Atari preprocessing and frame stacking.
 
 ## Expected Artifacts
 

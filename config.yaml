@@ -4,6 +4,8 @@ env:
   image_size: 64
   native_image_env: false
   vector_env_type: dummy
+  frame_stack: 1
+  atari_wrapper: none
 
 ppo:
   train_n_envs: 1

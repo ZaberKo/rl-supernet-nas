@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import gymnasium as gym
 import torch
 import torch.nn as nn
@@ -42,26 +44,62 @@ class LatentDynamicsPredictor(nn.Module):
         start_latent: torch.Tensor,
         action_features: torch.Tensor,
     ) -> torch.Tensor:
-        return self.net(torch.cat([start_latent, action_features], dim=-1))
+        if action_features.dim() == 2:
+            return self.net(torch.cat([start_latent, action_features], dim=-1))
+        if action_features.dim() != 3:
+            raise ValueError("action_features must have shape [batch, action_dim] or [batch, horizon, action_dim].")
+
+        latent = start_latent
+        predictions = []
+        for step_index in range(action_features.size(1)):
+            latent = self.net(torch.cat([latent, action_features[:, step_index]], dim=-1))
+            predictions.append(latent)
+        return torch.stack(predictions, dim=1)
 
 
 def latent_dynamics_loss(
     predictions: torch.Tensor,
     teacher_targets: torch.Tensor,
+    beta_weights: torch.Tensor | Sequence[float] | None = None,
+    sample_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     predictions = F.normalize(predictions, dim=-1)
     teacher_targets = F.normalize(teacher_targets.detach(), dim=-1)
     distance = 2.0 - 2.0 * F.cosine_similarity(predictions, teacher_targets, dim=-1)
-    return distance.mean()
+    if distance.dim() == 1:
+        if sample_weights is None:
+            return distance.mean()
+        weights = sample_weights.to(dtype=distance.dtype, device=distance.device).view_as(distance)
+        return (distance * weights).sum() / weights.sum().clamp_min(1.0)
+    if distance.dim() != 2:
+        raise ValueError("latent dynamics distance must have shape [batch] or [batch, horizon].")
+
+    weights = torch.ones(distance.size(1), dtype=distance.dtype, device=distance.device)
+    if beta_weights is not None:
+        weights = torch.as_tensor(beta_weights, dtype=distance.dtype, device=distance.device)
+        if weights.numel() != distance.size(1):
+            raise ValueError("beta_weights length must match the dynamics horizon.")
+    weighted_distance = distance * weights.view(1, -1)
+    if sample_weights is not None:
+        weights = sample_weights.to(dtype=distance.dtype, device=distance.device)
+        if weights.shape != distance.shape:
+            raise ValueError("sample_weights shape must match the latent dynamics distance shape.")
+        weighted_distance = weighted_distance * weights
+    return weighted_distance.sum(dim=1).mean()
 
 
 def cosine_kd_loss(
     student_latent: torch.Tensor,
     teacher_latent: torch.Tensor,
+    sample_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     student_latent = F.normalize(student_latent, dim=-1)
     teacher_latent = F.normalize(teacher_latent.detach(), dim=-1)
-    return (2.0 - 2.0 * F.cosine_similarity(student_latent, teacher_latent, dim=-1)).mean()
+    distance = 2.0 - 2.0 * F.cosine_similarity(student_latent, teacher_latent, dim=-1)
+    if sample_weights is None:
+        return distance.mean()
+    weights = sample_weights.to(dtype=distance.dtype, device=distance.device).view_as(distance)
+    return (distance * weights).sum() / weights.sum().clamp_min(1.0)
 
 
 def get_action_dim(action_space: gym.Space) -> int:

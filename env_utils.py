@@ -5,9 +5,15 @@ from typing import Any
 
 import gymnasium as gym
 import numpy as np
+
+try:
+    import ale_py  # noqa: F401
+except ImportError:
+    ale_py = None
 from gymnasium import spaces
+from stable_baselines3.common.atari_wrappers import AtariWrapper
 from stable_baselines3.common.preprocessing import is_image_space_channels_first
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecEnv, VecMonitor, VecTransposeImage
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecEnv, VecFrameStack, VecMonitor, VecTransposeImage
 
 
 class RenderObservationWrapper(gym.Wrapper):
@@ -78,20 +84,46 @@ class ResizeImageObservation(gym.ObservationWrapper):
         return resized.astype(np.uint8, copy=False)
 
 
+def is_atari_env(env_id: str) -> bool:
+    return env_id.startswith("ALE/") or env_id.endswith("NoFrameskip-v4")
+
+
+def build_gym_make_kwargs(
+    env_id: str,
+    use_render_observation: bool,
+    atari_wrapper: str,
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {}
+    if use_render_observation:
+        kwargs["render_mode"] = "rgb_array"
+    if is_atari_env(env_id) and atari_wrapper == "sb3":
+        kwargs["frameskip"] = 1
+        kwargs["repeat_action_probability"] = 0.0
+    return kwargs
+
+
 def make_single_vision_env(
     env_id: str,
     seed: int,
     image_size: int = 64,
     use_render_observation: bool = True,
+    atari_wrapper: str = "none",
 ) -> Callable[[], gym.Env]:
     def _init() -> gym.Env:
-        kwargs: dict[str, Any] = {}
-        if use_render_observation:
-            kwargs["render_mode"] = "rgb_array"
+        wrapper_name = atari_wrapper.lower()
+        kwargs = build_gym_make_kwargs(
+            env_id=env_id,
+            use_render_observation=use_render_observation and wrapper_name == "none",
+            atari_wrapper=wrapper_name,
+        )
         env = gym.make(env_id, **kwargs)
-        if use_render_observation:
+        if wrapper_name == "sb3":
+            env = AtariWrapper(env)
+        elif wrapper_name != "none":
+            raise ValueError(f"Unsupported atari_wrapper: {atari_wrapper}")
+        elif use_render_observation:
             env = RenderObservationWrapper(env)
-        if image_size > 0:
+        if image_size > 0 and env.observation_space.shape[:2] != (image_size, image_size):
             env = ResizeImageObservation(env, image_size=image_size)
         env.reset(seed=seed)
         return env
@@ -106,6 +138,8 @@ def make_vision_vec_env(
     image_size: int = 64,
     use_render_observation: bool = True,
     vector_env_type: str = "dummy",
+    frame_stack: int = 1,
+    atari_wrapper: str = "none",
 ) -> VecEnv:
     env_fns = [
         make_single_vision_env(
@@ -113,6 +147,7 @@ def make_vision_vec_env(
             seed=seed + rank,
             image_size=image_size,
             use_render_observation=use_render_observation,
+            atari_wrapper=atari_wrapper,
         )
         for rank in range(n_envs)
     ]
@@ -129,6 +164,8 @@ def make_vision_vec_env(
         and not is_image_space_channels_first(observation_space)
     ):
         env = VecTransposeImage(env)
+    if frame_stack > 1:
+        env = VecFrameStack(env, n_stack=frame_stack)
     return env
 
 
@@ -138,6 +175,8 @@ def get_vision_spaces(
     image_size: int = 64,
     use_render_observation: bool = True,
     vector_env_type: str = "dummy",
+    frame_stack: int = 1,
+    atari_wrapper: str = "none",
 ) -> tuple[spaces.Space, spaces.Space]:
     env = make_vision_vec_env(
         env_id=env_id,
@@ -146,6 +185,8 @@ def get_vision_spaces(
         image_size=image_size,
         use_render_observation=use_render_observation,
         vector_env_type=vector_env_type,
+        frame_stack=frame_stack,
+        atari_wrapper=atari_wrapper,
     )
     try:
         return env.observation_space, env.action_space
