@@ -9,8 +9,9 @@ from typing import Iterator
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from omegaconf import DictConfig
 
-from config_utils import add_ppo_config_args, load_ppo_config
+from config_utils import add_ppo_config_args, build_run_config, load_ppo_config, ppo_config_to_dict
 from env_utils import get_vision_spaces
 from ppo_utils import parse_optional_float, resolve_device, use_render_observation
 from representation_losses import (
@@ -32,7 +33,7 @@ def parse_args() -> argparse.Namespace:
         allow_abbrev=False,
     )
     add_ppo_config_args(parser)
-    parser.add_argument("--trajectory_data", default="runs/stage1_mix/representation_data.arrow", help="Stage1 supervised transition dataset used for representation learning; raw one-step trajectory files are also accepted.")
+    parser.add_argument("--trajectory_data", default="runs/stage1_mix/representation_data.arrow", help="Stage1 supervised transition dataset used for representation learning.")
     parser.add_argument("--output_dir", default="runs/stage2", help="Directory for stage2 checkpoints, metrics, and manifest.")
     parser.add_argument("--stage1_backbone", default="runs/stage1_ppo_max_arch/supernet_backbone_stage1.pt", help="Backbone checkpoint inherited from stage1 PPO training; use an empty string to train from scratch.")
     parser.add_argument("--train_steps", type=int, default=1000, help="Number of optimizer updates. When <= 0, the budget is epochs multiplied by DataLoader length.")
@@ -53,9 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kd_weight", type=float, default=1.0, help="Weight for cosine latent distillation loss.")
     parser.add_argument("--num_workers", type=int, default=0, help="DataLoader worker count for shuffled transition sequences.")
     parser.add_argument("--save_every_steps", type=int, default=0, help="Save an extra checkpoint every N optimizer steps; 0 disables periodic checkpoints.")
-    args = parser.parse_args()
-    load_ppo_config(args)
-    return args
+    return parser.parse_args()
 
 
 def build_optimizer(
@@ -137,6 +136,7 @@ def iterate_batches(loader: DataLoader) -> Iterator[tuple[int, dict[str, torch.T
 def save_checkpoint(
     path: Path,
     args: argparse.Namespace,
+    ppo_config: DictConfig,
     backbone: SupernetCNNBackbone,
     projection: ProjectionHead,
     predictor: LatentDynamicsPredictor,
@@ -157,9 +157,10 @@ def save_checkpoint(
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "search_space": search_space.to_dict(),
-            "features_dim": args.features_dim,
+            "features_dim": ppo_config.features_dim,
             "projection_dim": args.projection_dim,
             "args": vars(args),
+            "ppo_config": ppo_config_to_dict(ppo_config),
         },
         path,
     )
@@ -167,29 +168,31 @@ def save_checkpoint(
 
 def main() -> None:
     args = parse_args()
-    torch.manual_seed(args.seed)
-    device = resolve_device(args.device)
+    ppo_config = load_ppo_config(args)
+    torch.manual_seed(ppo_config.seed)
+    device = resolve_device(ppo_config.device)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    wandb_run = init_wandb_run("stage2_train_supernet", args, output_dir)
+    run_config = build_run_config(args, ppo_config)
+    wandb_run = init_wandb_run("stage2_train_supernet", run_config, output_dir)
 
     search_space = SearchSpace()
     (output_dir / "search_space.json").write_text(json.dumps(search_space.to_dict(), indent=2))
 
     observation_space, action_space = get_vision_spaces(
-        env_id=args.env_id,
-        seed=args.seed,
-        image_size=args.image_size,
-        use_render_observation=use_render_observation(args),
-        vector_env_type=getattr(args, "vector_env_type", "dummy"),
-        frame_stack=int(getattr(args, "frame_stack", 1)),
-        atari_wrapper=str(getattr(args, "atari_wrapper", "none")),
+        env_id=ppo_config.env_id,
+        seed=ppo_config.seed,
+        image_size=ppo_config.image_size,
+        use_render_observation=use_render_observation(ppo_config),
+        vector_env_type=getattr(ppo_config, "vector_env_type", "dummy"),
+        frame_stack=int(getattr(ppo_config, "frame_stack", 1)),
+        atari_wrapper=str(getattr(ppo_config, "atari_wrapper", "none")),
     )
     input_channels = infer_input_channels(tuple(observation_space.shape))
     backbone = SupernetCNNBackbone(
         input_channels=input_channels,
         search_space=search_space,
-        feature_dim=args.features_dim,
+        feature_dim=ppo_config.features_dim,
     ).to(device)
     if args.stage1_backbone:
         stage1_backbone_path = Path(args.stage1_backbone)
@@ -197,7 +200,7 @@ def main() -> None:
             raise FileNotFoundError(f"Stage1 backbone checkpoint does not exist: {stage1_backbone_path}")
         load_backbone_checkpoint(backbone, stage1_backbone_path, map_location=device)
 
-    projection = ProjectionHead(args.features_dim, args.projection_dim).to(device)
+    projection = ProjectionHead(ppo_config.features_dim, args.projection_dim).to(device)
     predictor = LatentDynamicsPredictor(
         latent_dim=args.projection_dim,
         action_dim=get_action_dim(action_space),
@@ -266,7 +269,7 @@ def main() -> None:
             dyn_value = torch.zeros((), device=device)
             kd_value = torch.zeros((), device=device)
             for arch in sampled_arches:
-                backbone.set_active_arch(arch)
+                backbone.set_sample_config(arch)
                 student_start = F.normalize(projection(backbone(observation)), dim=-1)
                 predictions = predictor(student_start, action_features)
                 dyn_loss = latent_dynamics_loss(predictions, teacher_targets, beta_weights, sample_weights=valid_steps)
@@ -332,6 +335,7 @@ def main() -> None:
                 save_checkpoint(
                     output_dir / f"supernet_backbone_stage2_step{train_step:06d}.pt",
                     args,
+                    ppo_config,
                     backbone,
                     projection,
                     predictor,
@@ -346,6 +350,7 @@ def main() -> None:
     save_checkpoint(
         checkpoint_path,
         args,
+        ppo_config,
         backbone,
         projection,
         predictor,
@@ -364,6 +369,7 @@ def main() -> None:
         "dataset_horizon": dataset.horizon,
         "total_steps": total_steps,
         "args": vars(args),
+        "ppo_config": ppo_config_to_dict(ppo_config),
     }
     manifest_path = output_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2))

@@ -30,7 +30,7 @@ class SupernetFeaturesExtractor(BaseFeaturesExtractor):
             search_space=search_space,
             feature_dim=features_dim,
         )
-        self.backbone.set_active_arch(arch)
+        self.backbone.set_sample_config(arch)
         if backbone_checkpoint_path is not None:
             payload = torch.load(Path(backbone_checkpoint_path), map_location=map_location)
             self.backbone.load_state_dict(payload.get("backbone_state_dict", payload), strict=False)
@@ -70,7 +70,8 @@ def build_ppo_model(
     target_kl: float | None = None,
     stats_window_size: int = 100,
     tensorboard_log: str | None = None,
-    policy_hidden_sizes: Sequence[int] = (),
+    policy_net_arch: Sequence[int] = (),
+    value_net_arch: Sequence[int] = (),
     seed: int | None = None,
     device: str = "auto",
     verbose: int = 1,
@@ -83,7 +84,7 @@ def build_ppo_model(
             "backbone_checkpoint_path": backbone_checkpoint_path,
         },
         "share_features_extractor": True,
-        "net_arch": {"pi": list(policy_hidden_sizes), "vf": list(policy_hidden_sizes)},
+        "net_arch": {"pi": list(policy_net_arch), "vf": list(value_net_arch)},
     }
     return PPO(
         "CnnPolicy",

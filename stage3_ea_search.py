@@ -9,7 +9,7 @@ import torch
 from evox.operators.selection import non_dominate_rank
 from evox.workflows import EvalMonitor, StdWorkflow
 
-from config_utils import add_ppo_config_args, load_ppo_config
+from config_utils import add_ppo_config_args, build_run_config, load_ppo_config, ppo_config_to_dict
 from ea_codec import GeneCodec
 from nsga2_search import DiscreteNSGA2, RLSubnetProblem
 from supernet_backbone import SearchSpace
@@ -32,13 +32,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--supernet_backbone_lr", type=float, default=0.0, help="Backbone learning rate during candidate PPO finetune; <=0 freezes the backbone.")
     parser.add_argument("--save_full_history", action="store_true", help="Store full EvoX monitor history in memory for debugging.")
     args = parser.parse_args()
-    load_ppo_config(args)
     args.eval_call_seed_stride = 10_000
     args.candidate_seed_stride = 100
     args.eval_seed_offset = 50
     args.mp_start_method = "spawn"
     args.worker_torch_threads = 1
     return args
+
 
 def build_initial_population(args: argparse.Namespace, codec: GeneCodec) -> list[list[int]]:
     if args.population_size <= 0:
@@ -148,9 +148,11 @@ def log_generation(
 
 def main() -> None:
     args = parse_args()
+    ppo_config = load_ppo_config(args)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    wandb_run = init_wandb_run("stage3_ea_search", args, output_dir)
+    run_config = build_run_config(args, ppo_config)
+    wandb_run = init_wandb_run("stage3_ea_search", run_config, output_dir)
     search_space = SearchSpace()
     codec = GeneCodec(search_space)
     (output_dir / "search_space.json").write_text(json.dumps(search_space.to_dict(), indent=2))
@@ -165,7 +167,7 @@ def main() -> None:
         device=torch.device("cpu"),
         initial_population=torch.tensor(initial_population, dtype=torch.float32),
     )
-    problem = RLSubnetProblem(args=args, codec=codec)
+    problem = RLSubnetProblem(args=args, ppo_config=ppo_config, codec=codec)
     monitor = EvalMonitor(
         multi_obj=True,
         full_fit_history=args.save_full_history,
@@ -217,6 +219,7 @@ def main() -> None:
         "num_logged_records": len(all_records),
         "cache_size": len(problem.cache),
         "args": vars(args),
+        "ppo_config": ppo_config_to_dict(ppo_config),
     }
     manifest_path = output_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2))

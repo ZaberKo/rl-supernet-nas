@@ -9,7 +9,7 @@ import numpy as np
 try:
     import ale_py  # noqa: F401
 except ImportError:
-    ale_py = None
+    pass
 from gymnasium import spaces
 from stable_baselines3.common.atari_wrappers import AtariWrapper
 from stable_baselines3.common.preprocessing import is_image_space_channels_first
@@ -88,20 +88,6 @@ def is_atari_env(env_id: str) -> bool:
     return env_id.startswith("ALE/") or env_id.endswith("NoFrameskip-v4")
 
 
-def build_gym_make_kwargs(
-    env_id: str,
-    use_render_observation: bool,
-    atari_wrapper: str,
-) -> dict[str, Any]:
-    kwargs: dict[str, Any] = {}
-    if use_render_observation:
-        kwargs["render_mode"] = "rgb_array"
-    if is_atari_env(env_id) and atari_wrapper == "sb3":
-        kwargs["frameskip"] = 1
-        kwargs["repeat_action_probability"] = 0.0
-    return kwargs
-
-
 def make_single_vision_env(
     env_id: str,
     seed: int,
@@ -111,11 +97,14 @@ def make_single_vision_env(
 ) -> Callable[[], gym.Env]:
     def _init() -> gym.Env:
         wrapper_name = atari_wrapper.lower()
-        kwargs = build_gym_make_kwargs(
-            env_id=env_id,
-            use_render_observation=use_render_observation and wrapper_name == "none",
-            atari_wrapper=wrapper_name,
-        )
+        kwargs: dict[str, Any] = {}
+        if wrapper_name == "sb3":
+            if not is_atari_env(env_id):
+                raise ValueError("The sb3 Atari wrapper requires an Atari environment.")
+            kwargs["frameskip"] = 1
+            kwargs["repeat_action_probability"] = 0.0
+        elif use_render_observation:
+            kwargs["render_mode"] = "rgb_array"
         env = gym.make(env_id, **kwargs)
         if wrapper_name == "sb3":
             env = AtariWrapper(env)

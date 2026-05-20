@@ -9,7 +9,9 @@ import torch
 import torch.multiprocessing as mp
 from evox.algorithms.mo import NSGA2
 from evox.core import Mutable, Problem
+from omegaconf import DictConfig, OmegaConf
 
+from config_utils import ppo_config_to_dict
 from ea_codec import GeneCodec
 from ppo_utils import finetune_and_evaluate_arch
 from supernet_backbone import ArchConfig
@@ -100,6 +102,7 @@ class DiscreteNSGA2(NSGA2):
 @dataclass(frozen=True)
 class SubnetEvalConfig:
     args: dict[str, Any]
+    ppo_config: dict[str, Any]
     arch_config: dict[str, Any]
     gene: list[int]
     train_seed: int
@@ -111,9 +114,11 @@ def _evaluate_subnet_worker(config: SubnetEvalConfig) -> dict[str, Any]:
     if worker_threads > 0:
         torch.set_num_threads(worker_threads)
     args = argparse.Namespace(**config.args)
+    ppo_config = OmegaConf.create(config.ppo_config)
     arch_config = ArchConfig.from_dict(config.arch_config)
     model, mean_return, std_return = finetune_and_evaluate_arch(
         args=args,
+        ppo_config=ppo_config,
         arch_config=arch_config,
         train_seed=config.train_seed,
         eval_seed=config.eval_seed,
@@ -124,7 +129,7 @@ def _evaluate_subnet_worker(config: SubnetEvalConfig) -> dict[str, Any]:
         "arch_config": config.arch_config,
         "return": float(mean_return),
         "return_std": float(std_return),
-        "params": int(backbone.active_num_params()),
+        "params": int(backbone.elastic_num_params),
         "policy_params": int(sum(parameter.numel() for parameter in model.policy.parameters())),
         "train_seed": config.train_seed,
         "eval_seed": config.eval_seed,
@@ -141,10 +146,12 @@ class RLSubnetProblem(Problem):
     def __init__(
         self,
         args: argparse.Namespace,
+        ppo_config: DictConfig,
         codec: GeneCodec,
     ) -> None:
         super().__init__()
         self.args_dict = vars(args).copy()
+        self.ppo_config_dict = ppo_config_to_dict(ppo_config)
         self.codec = codec
         self.eval_workers = max(1, int(args.eval_workers))
         self.mp_start_method = args.mp_start_method
@@ -156,13 +163,14 @@ class RLSubnetProblem(Problem):
 
     def _make_eval_config(self, gene: list[int], candidate_index: int) -> SubnetEvalConfig:
         train_seed = (
-            int(self.args_dict["seed"])
+            int(self.ppo_config_dict["seed"])
             + self.eval_call_index * int(self.args_dict["eval_call_seed_stride"])
             + candidate_index * int(self.args_dict["candidate_seed_stride"])
         )
         eval_seed = train_seed + int(self.args_dict["eval_seed_offset"])
         return SubnetEvalConfig(
             args=self.args_dict,
+            ppo_config=self.ppo_config_dict,
             arch_config=self.codec.gene_to_arch(gene).to_dict(),
             gene=gene,
             train_seed=train_seed,

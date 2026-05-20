@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import asdict, dataclass
 import random
 from pathlib import Path
@@ -168,6 +169,64 @@ class ConvLNAct(nn.Module):
         return self.net(x)
 
 
+class FixedMBConvBlock(nn.Module):
+    def __init__(
+        self,
+        expand: nn.Module,
+        expand_norm: nn.Module,
+        depthwise: nn.Module,
+        depthwise_norm: nn.Module,
+        project: nn.Module,
+        project_norm: nn.Module,
+    ):
+        super().__init__()
+        self.expand = expand
+        self.expand_norm = expand_norm
+        self.depthwise = depthwise
+        self.depthwise_norm = depthwise_norm
+        self.project = project
+        self.project_norm = project_norm
+        self.activation = nn.SiLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = self.activation(self.expand_norm(self.expand(x)))
+        x = self.activation(self.depthwise_norm(self.depthwise(x)))
+        x = self.project_norm(self.project(x))
+        return self.activation(x + residual)
+
+
+class FixedCNNBackbone(nn.Module):
+    def __init__(
+        self,
+        stem: nn.Module,
+        transitions: list[nn.Module],
+        stages: list[list[nn.Module]],
+        pool: nn.Module,
+        project: nn.Module,
+        output_activation: nn.Module,
+    ):
+        super().__init__()
+        self.stem = stem
+        self.transitions = nn.ModuleList(transitions)
+        self.stages = nn.ModuleList([nn.ModuleList(stage_blocks) for stage_blocks in stages])
+        self.pool = pool
+        self.project = project
+        self.output_activation = output_activation
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dtype == torch.uint8:
+            x = x.float().div(255.0)
+        x = self.stem(x)
+        for stage_index, blocks in enumerate(self.stages):
+            x = self.transitions[stage_index](x)
+            for block in blocks:
+                x = block(x)
+        x = self.pool(x).flatten(1)
+        x = self.project(x)
+        return self.output_activation(x)
+
+
 class ElasticMBConvBlock(nn.Module):
     def __init__(
         self,
@@ -211,16 +270,30 @@ class ElasticMBConvBlock(nn.Module):
         )
         self.project_norm = ElasticLayerNorm2d(super_num_channels=channels)
         self.activation = nn.SiLU(inplace=True)
-        self.active_config = LayerConfig(kernel_size=max_kernel, expand_ratio=max_expand_ratio)
-        self.set_sample_config(self.active_config)
+        self.active_config = LayerConfig(
+            kernel_size=max_kernel,
+            expand_ratio=max_expand_ratio,
+        )
+        self.set_sample_config(
+            sample_kernel_size=self.active_config.kernel_size,
+            sample_expand_ratio=self.active_config.expand_ratio,
+        )
 
-    def set_sample_config(self, config: LayerConfig) -> None:
-        if config.expand_ratio > self.max_expand_ratio:
-            raise ValueError("expand_ratio exceeds the block maximum.")
-        if config.kernel_size not in self.kernel_size_candidates:
-            raise ValueError("kernel_size is not in the candidate set.")
-        mid_channels = self.channels * config.expand_ratio
-        self.active_config = config
+    def set_sample_config(
+        self,
+        *,
+        sample_kernel_size: int,
+        sample_expand_ratio: int,
+    ) -> None:
+        if sample_expand_ratio > self.max_expand_ratio:
+            raise ValueError("sample_expand_ratio exceeds the block maximum.")
+        if sample_kernel_size not in self.kernel_size_candidates:
+            raise ValueError("sample_kernel_size is not in the candidate set.")
+        mid_channels = self.channels * sample_expand_ratio
+        self.active_config = LayerConfig(
+            kernel_size=sample_kernel_size,
+            expand_ratio=sample_expand_ratio,
+        )
         self.expand.set_sample_config(
             sample_in_channels=self.channels,
             sample_out_channels=mid_channels,
@@ -231,7 +304,7 @@ class ElasticMBConvBlock(nn.Module):
             sample_in_channels=mid_channels,
             sample_out_channels=mid_channels,
             sample_groups=mid_channels,
-            sample_kernel_size=config.kernel_size,
+            sample_kernel_size=sample_kernel_size,
         )
         self.depthwise_norm.set_sample_config(sample_num_channels=mid_channels)
         self.project.set_sample_config(
@@ -247,6 +320,16 @@ class ElasticMBConvBlock(nn.Module):
         x = self.activation(self.depthwise_norm(self.depthwise(x)))
         x = self.project_norm(self.project(x))
         return self.activation(x + residual)
+
+    def get_active_subnet(self) -> nn.Module:
+        return FixedMBConvBlock(
+            expand=self.expand.get_active_subnet(),
+            expand_norm=self.expand_norm.get_active_subnet(),
+            depthwise=self.depthwise.get_active_subnet(),
+            depthwise_norm=self.depthwise_norm.get_active_subnet(),
+            project=self.project.get_active_subnet(),
+            project_norm=self.project_norm.get_active_subnet(),
+        )
 
     @property
     def elastic_num_params(self) -> int:
@@ -297,23 +380,29 @@ class SupernetCNNBackbone(nn.Module):
         self.project.set_sample_config(sample_in_dim=widths[-1], sample_out_dim=feature_dim)
         self.output_activation = nn.SiLU(inplace=True)
         self.active_arch = self.search_space.max_arch()
-        self.set_active_arch(self.active_arch)
+        self.set_sample_config(self.active_arch)
 
-    def set_active_arch(self, arch: ArchConfig) -> None:
-        if len(arch.stage_depths) != len(self.stages):
+    def set_sample_config(self, arch_config: ArchConfig) -> None:
+        if len(arch_config.stage_depths) != len(self.stages):
             raise ValueError("Architecture stage count does not match the backbone.")
-        self.active_arch = arch
-        for blocks, stage_layers in zip(self.stages, arch.layer_configs):
+        self.active_arch = arch_config
+        for blocks, stage_layers in zip(self.stages, arch_config.layer_configs):
             if len(stage_layers) != len(blocks):
                 raise ValueError("Architecture layer count does not match the backbone.")
             for block, layer_config in zip(blocks, stage_layers):
-                block.set_sample_config(layer_config)
+                block.set_sample_config(
+                    sample_kernel_size=layer_config.kernel_size,
+                    sample_expand_ratio=layer_config.expand_ratio,
+                )
+
+    def set_active_arch(self, arch: ArchConfig) -> None:
+        self.set_sample_config(arch)
 
     def set_max_arch(self) -> None:
-        self.set_active_arch(self.search_space.max_arch())
+        self.set_sample_config(self.search_space.max_arch())
 
     def set_min_arch(self) -> None:
-        self.set_active_arch(self.search_space.min_arch())
+        self.set_sample_config(self.search_space.min_arch())
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dtype == torch.uint8:
@@ -328,7 +417,22 @@ class SupernetCNNBackbone(nn.Module):
         x = self.project(x)
         return self.output_activation(x)
 
-    def active_num_params(self) -> int:
+    def get_active_subnet(self) -> nn.Module:
+        stages: list[list[nn.Module]] = []
+        for stage_index, blocks in enumerate(self.stages):
+            active_depth = self.active_arch.stage_depths[stage_index]
+            stages.append([block.get_active_subnet() for block in blocks[:active_depth]])
+        return FixedCNNBackbone(
+            stem=copy.deepcopy(self.stem),
+            transitions=[copy.deepcopy(transition) for transition in self.transitions],
+            stages=stages,
+            pool=copy.deepcopy(self.pool),
+            project=self.project.get_active_subnet(),
+            output_activation=copy.deepcopy(self.output_activation),
+        )
+
+    @property
+    def elastic_num_params(self) -> int:
         total = sum(parameter.numel() for parameter in self.stem.parameters())
         for transition in self.transitions:
             total += sum(parameter.numel() for parameter in transition.parameters())
