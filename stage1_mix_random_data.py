@@ -158,14 +158,14 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict:
     log_wandb(
         wandb_run,
         {
-            "stage1_mix/ppo_samples": ppo_count["num_samples"],
-            "stage1_mix/ppo_raw_transitions": ppo_num_raw_transitions,
-            "stage1_mix/random_samples": random_count["num_samples"],
-            "stage1_mix/random_raw_transitions": random_num_raw_transitions,
-            "stage1_mix/representation_samples": representation_count["num_samples"],
-            "stage1_mix/horizon": hdf5_horizon,
-            "stage1_mix/random_to_ppo_ratio": mixed_manifest["actual_random_to_ppo_ratio"],
-            "stage1_mix/random_fraction": mixed_manifest["actual_random_fraction"],
+            "ppo_samples": ppo_count["num_samples"],
+            "ppo_raw_transitions": ppo_num_raw_transitions,
+            "random_samples": random_count["num_samples"],
+            "random_raw_transitions": random_num_raw_transitions,
+            "representation_samples": representation_count["num_samples"],
+            "horizon": hdf5_horizon,
+            "random_to_ppo_ratio": mixed_manifest["actual_random_to_ppo_ratio"],
+            "random_fraction": mixed_manifest["actual_random_fraction"],
         },
         step=0,
     )

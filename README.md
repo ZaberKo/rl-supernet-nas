@@ -75,9 +75,9 @@ python stage1_train_max_ppo.py
 - 构造 hardcoded `SearchSpace`，用最大 `ArchConfig` 激活最大 subnet。
 - 用最大 subnet backbone + PPO actor/critic head 训练。
 - 按 `--sample_ratio` 抽样保存 PPO rollout 生成的 supervised samples 到 `ppo_representation_samples.h5`。
-- 按 `ppo.eval_freq` 个 training timestep 定期评估 `ppo.eval_episodes` 个 episode，并写出 `eval_metrics.jsonl`；`ppo.eval_freq <= 0` 或 `ppo.eval_episodes <= 0` 时关闭定期评估。
+- 按 `ppo.eval_freq` 个 training timestep 定期评估 `ppo.eval_episodes` 个 episode，并和 PPO training log 一起写入 `metrics.jsonl`；每行用 `type` 和 `total_timesteps` 区分 train/eval 记录。
 - HDF5 样本会保存 `observation`、`actions`、`targets`、`terminateds`、`truncateds` 和合并后的 `dones`；SB3 VecEnv 的 `TimeLimit.truncated` 会被还原为 Gymnasium 的 truncated 标记。
-- 保存训练后的 PPO supernet checkpoint 到 `ppo_supernet_stage1.pt`；文件只保留一份完整 `policy_state_dict`，stage2 会从其中的 `features_extractor.backbone.*` 参数展开 backbone。
+- 保存训练后的 PPO supernet checkpoint 到 `ppo_supernet_stage1.pt`；每次 eval 和训练结束都会覆盖保存 `ppo_supernet_stage1_last.pt`，并按 `eval/mean_reward` 保存 `ppo_supernet_stage1_best.pt`。
 - 写出 `search_space.json` 和 `manifest.json`。
 
 PPO 训练产生的候选样本数量由 `ppo.total_timesteps`、`ppo.train_n_envs`、SB3 rollout 设置和 `--horizon` 共同决定；实际保存数量由 `--sample_ratio` 和可选 `--max_samples` 控制。
@@ -138,6 +138,37 @@ source .venv/bin/activate
 python stage1_train_max_ppo.py --horizon 3
 python stage1_mix_random_data.py --horizon 3
 python stage2_train_supernet.py --trajectory_data runs/stage1_mix/representation_data.arrow --train_steps 5000 --random_subnets 4 --projection_dim 128 --dynamics_horizon 3 --dynamics_betas 1.0,0.5,0.25
+```
+
+## Stage 2B: 单架构 PPO 诊断
+
+运行：
+
+```bash
+source .venv/bin/activate
+python stage2_train_arch_ppo.py
+```
+
+这个阶段用于在进入 stage3 搜索前，先拿一个 JSON 中指定的单个 `ArchConfig` 做 PPO finetune 诊断。默认 `--arch_config arch_configs/max_arch.json` 表示当前 search space 的最大架构；脚本会从 `--supernet_checkpoint runs/stage2/supernet_backbone_stage2.pt` 继承 stage2 学到的 backbone 参数，重新初始化 PPO actor/critic head，并按 `--candidate_timesteps` 做一次单架构 PPO 学习。
+
+输出包括：
+
+- `metrics.jsonl`：SB3 PPO 的 rollout/train 指标和初始、周期性、最终 eval reward；每行用 `type` 和 `total_timesteps` 区分 train/eval 记录。
+- `ppo_supernet_stage2_arch.pt`：可选保存最终 PPO policy checkpoint，包含当前激活架构。
+- `manifest.json`：记录 arch、checkpoint、参数量、seed、train/eval metrics 路径。
+
+`--supernet_backbone_lr <= 0` 时冻结继承的 stage2 backbone，只训练 PPO head；大于 0 时会给 backbone 单独设置 learning rate，PPO head 使用 `ppo.head_lr`。
+
+示例：
+
+```bash
+source .venv/bin/activate
+python stage2_train_arch_ppo.py \
+  --supernet_checkpoint runs/stage2/supernet_backbone_stage2.pt \
+  --arch_config arch_configs/max_arch.json \
+  --output_dir runs/stage2_arch_ppo_max \
+  --candidate_timesteps 10000 \
+  --ppo_config_override ppo.eval_episodes=3
 ```
 
 ## Stage 3: NSGA-II subnet 搜索

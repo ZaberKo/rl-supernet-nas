@@ -140,7 +140,7 @@ def log_generation(
     summary = generation_summary(generation, records, cache_hits)
     log_wandb(
         wandb_run,
-        {f"stage3/{key}": value for key, value in summary.items()},
+        summary,
         step=generation,
     )
 
@@ -225,9 +225,9 @@ def main() -> None:
     log_wandb(
         wandb_run,
         {
-            "stage3/num_logged_records": len(all_records),
-            "stage3/cache_size": len(problem.cache),
-            "stage3/final_pareto_count": len(pareto_records),
+            "num_logged_records": len(all_records),
+            "cache_size": len(problem.cache),
+            "final_pareto_count": len(pareto_records),
         },
         step=max(0, args.generations - 1),
     )

@@ -891,10 +891,8 @@ class TrajectoryRecorderCallback(BaseCallback):
         if self.log_fn is not None and self.log_interval > 0 and self.n_calls % self.log_interval == 0:
             self.log_fn(
                 {
-                    "num_timesteps": int(self.num_timesteps),
+                    "total_timesteps": int(self.num_timesteps),
                     "representation_samples": int(self.num_samples),
-                    "representation_eligible_windows": int(self.eligible_samples),
-                    "representation_sample_ratio": float(self.sample_ratio),
                 },
                 int(self.num_timesteps),
             )

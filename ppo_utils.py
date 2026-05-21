@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
+import json
 import math
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -10,6 +12,7 @@ import torch.nn as nn
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.evaluation import evaluate_policy
+from stable_baselines3.common.logger import KVWriter, filter_excluded_keys
 from stable_baselines3.common.vec_env import VecEnv, sync_envs_normalization, unwrap_vec_normalize
 
 from env_utils import make_atari_vec_env, make_box2d_vec_env
@@ -17,6 +20,7 @@ from sb3_nas_policy import build_ppo_model, configure_policy_optimizer
 from supernet_backbone import ArchConfig
 
 ScheduleValue = float | Callable[[float], float]
+MetricLogFn = Callable[[dict[str, Any], int], None]
 
 
 class LinearSchedule:
@@ -61,6 +65,87 @@ def parse_optional_schedule_value(value: Any) -> ScheduleValue | None:
     if isinstance(value, str) and value.strip().lower() in {"none", "null", "off"}:
         return None
     return parse_schedule_value(value)
+
+
+def jsonable_metric_value(value: Any) -> Any:
+    if hasattr(value, "detach"):
+        value = value.detach().cpu()
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except (TypeError, ValueError):
+            pass
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    if isinstance(value, Mapping):
+        return {str(key): jsonable_metric_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [jsonable_metric_value(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def normalize_metric_key(key: str) -> str:
+    if key.startswith("time/"):
+        return key.removeprefix("time/")
+    return key
+
+
+def append_jsonl_record(path: Path, record: Mapping[str, Any]) -> None:
+    with path.open("a") as metrics_file:
+        metrics_file.write(json.dumps(jsonable_metric_value(record)) + "\n")
+
+
+def metric_log_step(metrics: Mapping[str, Any], fallback_step: int) -> int:
+    value = metrics.get("total_timesteps", fallback_step)
+    if isinstance(value, (int, float)):
+        return int(value)
+    return int(fallback_step)
+
+
+class JsonlTrainingMetricsWriter(KVWriter):
+    def __init__(self, path: Path, log_fn: MetricLogFn | None = None):
+        self.path = path
+        self.file = path.open("a")
+        self.log_fn = log_fn
+
+    def write(self, key_values: dict[str, Any], key_excluded: dict[str, tuple[str, ...]], step: int = 0) -> None:
+        values = filter_excluded_keys(key_values, key_excluded, "json")
+        metrics = {normalize_metric_key(key): jsonable_metric_value(value) for key, value in values.items()}
+        if not metrics:
+            return
+        metrics.setdefault("total_timesteps", int(step))
+        record = {"type": "train", **metrics}
+        self.file.write(json.dumps(record) + "\n")
+        self.file.flush()
+        if self.log_fn is not None:
+            self.log_fn(metrics, metric_log_step(metrics, int(step)))
+
+    def close(self) -> None:
+        if not self.file.closed:
+            self.file.close()
+
+
+class TrainingMetricsCallback(BaseCallback):
+    def __init__(self, metrics_path: Path, log_fn: MetricLogFn | None = None):
+        super().__init__()
+        self.metrics_path = metrics_path
+        self.log_fn = log_fn
+        self.writer: JsonlTrainingMetricsWriter | None = None
+
+    def _on_training_start(self) -> None:
+        self.writer = JsonlTrainingMetricsWriter(self.metrics_path, self.log_fn)
+        self.model.logger.output_formats.append(self.writer)
+
+    def _on_step(self) -> bool:
+        return True
+
+    def _on_training_end(self) -> None:
+        if self.model.logger.name_to_value:
+            self.model.logger.dump(self.num_timesteps)
+        if self.writer is not None:
+            self.writer.close()
 
 
 def resolve_device(device: str) -> torch.device:

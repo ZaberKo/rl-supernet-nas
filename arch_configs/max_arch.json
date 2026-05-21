@@ -1,0 +1,39 @@
+{
+  "stage_depths": [
+    2,
+    2,
+    2
+  ],
+  "layer_configs": [
+    [
+      {
+        "kernel_size": 5,
+        "expand_ratio": 4
+      },
+      {
+        "kernel_size": 5,
+        "expand_ratio": 4
+      }
+    ],
+    [
+      {
+        "kernel_size": 5,
+        "expand_ratio": 4
+      },
+      {
+        "kernel_size": 5,
+        "expand_ratio": 4
+      }
+    ],
+    [
+      {
+        "kernel_size": 5,
+        "expand_ratio": 4
+      },
+      {
+        "kernel_size": 5,
+        "expand_ratio": 4
+      }
+    ]
+  ]
+}

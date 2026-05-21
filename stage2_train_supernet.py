@@ -217,9 +217,9 @@ def main() -> None:
     log_wandb(
         wandb_run,
         {
-            "stage2/num_samples": len(dataset),
-            "stage2/dataset_horizon": dataset.horizon,
-            "stage2/total_steps": total_steps,
+            "num_samples": len(dataset),
+            "dataset_horizon": dataset.horizon,
+            "total_steps": total_steps,
         },
         step=0,
     )
@@ -290,34 +290,34 @@ def main() -> None:
             backbone_lr = float(optimizer.param_groups[0]["lr"])
             head_lr = float(optimizer.param_groups[1]["lr"])
             record = {
-                "step": train_step,
-                "epoch": epoch,
-                "batch_index": batch_index,
-                "loss": float(total_loss.detach().cpu()),
-                "dynamics_loss": float(dyn_value.cpu()),
-                "kd_loss": float(kd_value.cpu()),
-                "backbone_lr": backbone_lr,
-                "head_lr": head_lr,
-                "num_student_subnets": len(sampled_arches),
-                "dynamics_horizon": int(dataset.horizon),
+                "train/step": train_step,
+                "train/epoch": epoch,
+                "train/batch_index": batch_index,
+                "train/loss": float(total_loss.detach().cpu()),
+                "train/dynamics_loss": float(dyn_value.cpu()),
+                "train/kd_loss": float(kd_value.cpu()),
+                "train/backbone_lr": backbone_lr,
+                "train/head_lr": head_lr,
+                "train/num_student_subnets": len(sampled_arches),
+                "train/dynamics_horizon": int(dataset.horizon),
                 "dynamics_betas": [float(value) for value in beta_weights.detach().cpu().tolist()],
-                "valid_horizon_fraction": float(valid_steps.detach().mean().cpu()),
+                "train/valid_horizon_fraction": float(valid_steps.detach().mean().cpu()),
                 "student_arches": [arch.to_dict() for arch in sampled_arches],
             }
             metrics_file.write(json.dumps(record) + "\n")
             log_wandb(
                 wandb_run,
                 {
-                    "stage2/loss": record["loss"],
-                    "stage2/dynamics_loss": record["dynamics_loss"],
-                    "stage2/kd_loss": record["kd_loss"],
-                    "stage2/epoch": epoch,
-                    "stage2/batch_index": batch_index,
-                    "stage2/backbone_lr": backbone_lr,
-                    "stage2/head_lr": head_lr,
-                    "stage2/num_student_subnets": len(sampled_arches),
-                    "stage2/dynamics_horizon": int(dataset.horizon),
-                    "stage2/valid_horizon_fraction": record["valid_horizon_fraction"],
+                    "train/loss": record["train/loss"],
+                    "train/dynamics_loss": record["train/dynamics_loss"],
+                    "train/kd_loss": record["train/kd_loss"],
+                    "train/epoch": epoch,
+                    "train/batch_index": batch_index,
+                    "train/backbone_lr": backbone_lr,
+                    "train/head_lr": head_lr,
+                    "train/num_student_subnets": len(sampled_arches),
+                    "train/dynamics_horizon": int(dataset.horizon),
+                    "train/valid_horizon_fraction": record["train/valid_horizon_fraction"],
                 },
                 step=train_step,
             )
@@ -367,8 +367,8 @@ def main() -> None:
     log_wandb(
         wandb_run,
         {
-            "stage2/num_logged_steps": total_steps,
-            "stage2/num_samples": len(dataset),
+            "num_logged_steps": total_steps,
+            "num_samples": len(dataset),
         },
         step=total_steps,
     )
