@@ -12,7 +12,7 @@ from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.vec_env import VecEnv
 
-from supernet_backbone import ArchConfig, SearchSpace, SupernetCNNBackbone, infer_input_channels
+from supernet_backbone import ArchConfig, SearchSpace, SupernetCNNBackbone, infer_input_channels, load_backbone_from_backbone_checkpoint
 
 ScheduleValue = float | Callable[[float], float]
 
@@ -36,8 +36,7 @@ class SupernetFeaturesExtractor(BaseFeaturesExtractor):
         )
         self.backbone.set_sample_config(arch)
         if backbone_checkpoint_path is not None:
-            payload = torch.load(Path(backbone_checkpoint_path), map_location=map_location)
-            self.backbone.load_state_dict(payload.get("backbone_state_dict", payload), strict=False)
+            load_backbone_from_backbone_checkpoint(self.backbone, backbone_checkpoint_path, map_location=map_location)
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         return self.backbone(observations)
@@ -190,6 +189,26 @@ def save_policy_backbone(
         "backbone_state_dict": policy.features_extractor.backbone.state_dict(),
         "search_space": search_space.to_dict(),
         "active_arch": policy.features_extractor.backbone.active_arch.to_dict(),
+    }
+    if extra:
+        payload.update(extra)
+    torch.save(payload, Path(path))
+
+
+def save_ppo_supernet_checkpoint(
+    model: PPO,
+    path: str | Path,
+    search_space: SearchSpace,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    policy = model.policy
+    payload: dict[str, Any] = {
+        "policy_state_dict": policy.state_dict(),
+        "search_space": search_space.to_dict(),
+        "active_arch": policy.features_extractor.backbone.active_arch.to_dict(),
+        "policy_class": policy.__class__.__name__,
+        "features_extractor_class": policy.features_extractor.__class__.__name__,
+        "num_timesteps": int(model.num_timesteps),
     }
     if extra:
         payload.update(extra)

@@ -12,8 +12,7 @@ from torch.utils.data import DataLoader
 from omegaconf import DictConfig
 
 from config_utils import add_ppo_config_args, build_run_config, load_ppo_config, ppo_config_to_dict
-from env_utils import get_vision_spaces
-from ppo_utils import get_env_kwargs, get_max_episode_steps, parse_optional_float, resolve_device, use_render_observation
+from ppo_utils import get_vision_spaces_from_ppo_config, parse_optional_float, resolve_device
 from representation_losses import (
     LatentDynamicsPredictor,
     ProjectionHead,
@@ -22,7 +21,7 @@ from representation_losses import (
     get_action_dim,
     latent_dynamics_loss,
 )
-from supernet_backbone import SearchSpace, SupernetCNNBackbone, infer_input_channels, load_backbone_checkpoint
+from supernet_backbone import SearchSpace, SupernetCNNBackbone, infer_input_channels, load_backbone_from_policy_checkpoint
 from trajectory_data import TransitionDataset
 from wandb_utils import finish_wandb_run, init_wandb_run, log_wandb, log_wandb_artifact
 
@@ -35,7 +34,7 @@ def parse_args() -> argparse.Namespace:
     add_ppo_config_args(parser)
     parser.add_argument("--trajectory_data", default="runs/stage1_mix/representation_data.arrow", help="Stage1 supervised transition dataset used for representation learning.")
     parser.add_argument("--output_dir", default="runs/stage2", help="Directory for stage2 checkpoints, metrics, and manifest.")
-    parser.add_argument("--stage1_backbone", default="runs/stage1_ppo_max_arch/supernet_backbone_stage1.pt", help="Backbone checkpoint inherited from stage1 PPO training; use an empty string to train from scratch.")
+    parser.add_argument("--stage1_backbone", default="runs/stage1_ppo_max_arch/ppo_supernet_stage1.pt", help="Stage1 PPO policy checkpoint; use an empty string to train from scratch.")
     parser.add_argument("--train_steps", type=int, default=1000, help="Number of optimizer updates. When <= 0, the budget is epochs multiplied by DataLoader length.")
     parser.add_argument("--epochs", type=int, default=0, help="Fallback epoch budget used only when train_steps <= 0.")
     parser.add_argument("--batch_size", type=int, default=64, help="Transition sequence batch size for stage2 DataLoader.")
@@ -179,23 +178,7 @@ def main() -> None:
     search_space = SearchSpace()
     (output_dir / "search_space.json").write_text(json.dumps(search_space.to_dict(), indent=2))
 
-    observation_space, action_space = get_vision_spaces(
-        env_id=ppo_config.env_id,
-        seed=ppo_config.seed,
-        image_size=ppo_config.image_size,
-        use_render_observation=use_render_observation(ppo_config),
-        vector_env_type=getattr(ppo_config, "vector_env_type", "dummy"),
-        frame_stack=int(getattr(ppo_config, "frame_stack", 1)),
-        atari_wrapper=str(getattr(ppo_config, "atari_wrapper", "none")),
-        max_episode_steps=get_max_episode_steps(ppo_config),
-        env_kwargs=get_env_kwargs(ppo_config),
-        frame_skip=int(getattr(ppo_config, "frame_skip", 1)),
-        grayscale_observation=bool(getattr(ppo_config, "grayscale_observation", False)),
-        normalize_observation=bool(getattr(ppo_config, "normalize_observation", False)),
-        normalize_reward=bool(getattr(ppo_config, "normalize_reward", False)),
-        normalize_clip_obs=float(getattr(ppo_config, "normalize_clip_obs", 10.0)),
-        normalize_gamma=float(getattr(ppo_config, "normalize_gamma", getattr(ppo_config, "gamma", 0.99))),
-    )
+    observation_space, action_space = get_vision_spaces_from_ppo_config(ppo_config, seed=ppo_config.seed)
     input_channels = infer_input_channels(tuple(observation_space.shape))
     backbone = SupernetCNNBackbone(
         input_channels=input_channels,
@@ -205,8 +188,8 @@ def main() -> None:
     if args.stage1_backbone:
         stage1_backbone_path = Path(args.stage1_backbone)
         if not stage1_backbone_path.exists():
-            raise FileNotFoundError(f"Stage1 backbone checkpoint does not exist: {stage1_backbone_path}")
-        load_backbone_checkpoint(backbone, stage1_backbone_path, map_location=device)
+            raise FileNotFoundError(f"Stage1 checkpoint does not exist: {stage1_backbone_path}")
+        load_backbone_from_policy_checkpoint(backbone, stage1_backbone_path, map_location=device)
 
     projection = ProjectionHead(ppo_config.features_dim, args.projection_dim).to(device)
     predictor = LatentDynamicsPredictor(

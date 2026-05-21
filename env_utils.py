@@ -37,36 +37,6 @@ class FrameSkipWrapper(gym.Wrapper):
         return observation, total_reward, terminated, truncated, info
 
 
-class RenderObservationWrapper(gym.Wrapper):
-    def __init__(self, env: gym.Env):
-        super().__init__(env)
-        env.reset()
-        frame = env.render()
-        if frame is None:
-            raise ValueError("The environment did not return an rgb_array frame.")
-        frame = np.asarray(frame, dtype=np.uint8)
-        self.observation_space = spaces.Box(
-            low=0,
-            high=255,
-            shape=frame.shape,
-            dtype=np.uint8,
-        )
-
-    def reset(self, **kwargs: Any):
-        _, info = self.env.reset(**kwargs)
-        return self._get_frame(), info
-
-    def step(self, action: Any):
-        _, reward, terminated, truncated, info = self.env.step(action)
-        return self._get_frame(), reward, terminated, truncated, info
-
-    def _get_frame(self) -> np.ndarray:
-        frame = self.env.render()
-        if frame is None:
-            raise ValueError("The environment did not return an rgb_array frame.")
-        return np.asarray(frame, dtype=np.uint8)
-
-
 class ResizeImageObservation(gym.ObservationWrapper):
     def __init__(self, env: gym.Env, image_size: int):
         super().__init__(env)
@@ -135,41 +105,50 @@ def is_atari_env(env_id: str) -> bool:
     return env_id.startswith("ALE/") or env_id.endswith("NoFrameskip-v4")
 
 
-def make_single_vision_env(
+def make_single_atari_env(
+    env_id: str,
+    seed: int,
+    image_size: int = 84,
+    max_episode_steps: int | None = None,
+    env_kwargs: dict[str, Any] | None = None,
+) -> Callable[[], gym.Env]:
+    def _init() -> gym.Env:
+        if not is_atari_env(env_id):
+            raise ValueError("The Atari wrapper requires an Atari environment.")
+        kwargs: dict[str, Any] = dict(env_kwargs or {})
+        if max_episode_steps is not None:
+            max_steps = int(max_episode_steps)
+            kwargs["max_episode_steps"] = max_steps if max_steps > 0 else -1
+        kwargs["frameskip"] = 1
+        kwargs["repeat_action_probability"] = 0.0
+        env = gym.make(env_id, **kwargs)
+        screen_size = int(image_size)
+        if screen_size <= 0:
+            raise ValueError("image_size must be positive for Atari environments.")
+        env = AtariWrapper(env, screen_size=screen_size)
+        env.reset(seed=seed)
+        return env
+
+    return _init
+
+
+def make_single_box2d_env(
     env_id: str,
     seed: int,
     image_size: int = 64,
-    use_render_observation: bool = True,
-    atari_wrapper: str = "none",
     max_episode_steps: int | None = None,
     env_kwargs: dict[str, Any] | None = None,
     frame_skip: int = 1,
     grayscale_observation: bool = False,
 ) -> Callable[[], gym.Env]:
     def _init() -> gym.Env:
-        wrapper_name = atari_wrapper.lower()
         kwargs: dict[str, Any] = dict(env_kwargs or {})
         if max_episode_steps is not None:
             max_steps = int(max_episode_steps)
             kwargs["max_episode_steps"] = max_steps if max_steps > 0 else -1
-        if wrapper_name == "sb3":
-            if not is_atari_env(env_id):
-                raise ValueError("The sb3 Atari wrapper requires an Atari environment.")
-            kwargs["frameskip"] = 1
-            kwargs["repeat_action_probability"] = 0.0
-        elif use_render_observation:
-            kwargs["render_mode"] = "rgb_array"
         env = gym.make(env_id, **kwargs)
-        if wrapper_name == "sb3":
-            env = AtariWrapper(env)
-        elif wrapper_name != "none":
-            raise ValueError(f"Unsupported atari_wrapper: {atari_wrapper}")
-        if frame_skip > 1 and wrapper_name == "sb3":
-            raise ValueError("Use the SB3 Atari wrapper frame skip instead of generic frame_skip for Atari.")
         if frame_skip > 1:
             env = FrameSkipWrapper(env, skip=frame_skip)
-        if use_render_observation:
-            env = RenderObservationWrapper(env)
         if grayscale_observation:
             env = GrayscaleImageObservation(env)
         if image_size > 0 and env.observation_space.shape[:2] != (image_size, image_size):
@@ -180,38 +159,20 @@ def make_single_vision_env(
     return _init
 
 
-def make_vision_vec_env(
-    env_id: str,
-    n_envs: int,
-    seed: int,
-    image_size: int = 64,
-    use_render_observation: bool = True,
+def make_vec_env_from_factories(
+    env_fns: list[Callable[[], gym.Env]],
     vector_env_type: str = "dummy",
     frame_stack: int = 1,
-    atari_wrapper: str = "none",
-    max_episode_steps: int | None = None,
-    env_kwargs: dict[str, Any] | None = None,
-    frame_skip: int = 1,
-    grayscale_observation: bool = False,
     normalize_observation: bool = False,
     normalize_reward: bool = False,
     normalize_clip_obs: float = 10.0,
     normalize_gamma: float = 0.99,
 ) -> VecEnv:
-    env_fns = [
-        make_single_vision_env(
-            env_id=env_id,
-            seed=seed + rank,
-            image_size=image_size,
-            use_render_observation=use_render_observation,
-            atari_wrapper=atari_wrapper,
-            max_episode_steps=max_episode_steps,
-            env_kwargs=env_kwargs,
-            frame_skip=frame_skip,
-            grayscale_observation=grayscale_observation,
-        )
-        for rank in range(n_envs)
-    ]
+    n_envs = len(env_fns)
+    if n_envs <= 0:
+        raise ValueError("At least one environment factory is required.")
+    if frame_stack <= 0:
+        raise ValueError("frame_stack must be positive.")
     if vector_env_type == "dummy" or n_envs <= 1:
         env = DummyVecEnv(env_fns)
     elif vector_env_type == "subproc":
@@ -238,14 +199,48 @@ def make_vision_vec_env(
     return env
 
 
-def get_vision_spaces(
+def make_atari_vec_env(
     env_id: str,
+    n_envs: int,
     seed: int,
-    image_size: int = 64,
-    use_render_observation: bool = True,
+    image_size: int = 84,
     vector_env_type: str = "dummy",
     frame_stack: int = 1,
-    atari_wrapper: str = "none",
+    max_episode_steps: int | None = None,
+    env_kwargs: dict[str, Any] | None = None,
+    normalize_observation: bool = False,
+    normalize_reward: bool = False,
+    normalize_clip_obs: float = 10.0,
+    normalize_gamma: float = 0.99,
+) -> VecEnv:
+    env_fns = [
+        make_single_atari_env(
+            env_id=env_id,
+            seed=seed + rank,
+            image_size=image_size,
+            max_episode_steps=max_episode_steps,
+            env_kwargs=env_kwargs,
+        )
+        for rank in range(n_envs)
+    ]
+    return make_vec_env_from_factories(
+        env_fns=env_fns,
+        vector_env_type=vector_env_type,
+        frame_stack=frame_stack,
+        normalize_observation=normalize_observation,
+        normalize_reward=normalize_reward,
+        normalize_clip_obs=normalize_clip_obs,
+        normalize_gamma=normalize_gamma,
+    )
+
+
+def make_box2d_vec_env(
+    env_id: str,
+    n_envs: int,
+    seed: int,
+    image_size: int = 64,
+    vector_env_type: str = "dummy",
+    frame_stack: int = 1,
     max_episode_steps: int | None = None,
     env_kwargs: dict[str, Any] | None = None,
     frame_skip: int = 1,
@@ -254,26 +249,25 @@ def get_vision_spaces(
     normalize_reward: bool = False,
     normalize_clip_obs: float = 10.0,
     normalize_gamma: float = 0.99,
-) -> tuple[spaces.Space, spaces.Space]:
-    env = make_vision_vec_env(
-        env_id=env_id,
-        n_envs=1,
-        seed=seed,
-        image_size=image_size,
-        use_render_observation=use_render_observation,
+) -> VecEnv:
+    env_fns = [
+        make_single_box2d_env(
+            env_id=env_id,
+            seed=seed + rank,
+            image_size=image_size,
+            max_episode_steps=max_episode_steps,
+            env_kwargs=env_kwargs,
+            frame_skip=frame_skip,
+            grayscale_observation=grayscale_observation,
+        )
+        for rank in range(n_envs)
+    ]
+    return make_vec_env_from_factories(
+        env_fns=env_fns,
         vector_env_type=vector_env_type,
         frame_stack=frame_stack,
-        atari_wrapper=atari_wrapper,
-        max_episode_steps=max_episode_steps,
-        env_kwargs=env_kwargs,
-        frame_skip=frame_skip,
-        grayscale_observation=grayscale_observation,
         normalize_observation=normalize_observation,
         normalize_reward=normalize_reward,
         normalize_clip_obs=normalize_clip_obs,
         normalize_gamma=normalize_gamma,
     )
-    try:
-        return env.observation_space, env.action_space
-    finally:
-        env.close()

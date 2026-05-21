@@ -4,12 +4,12 @@ import copy
 from dataclasses import asdict, dataclass
 import random
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import torch
 import torch.nn as nn
 
-from primitive_blocks import ElasticConv2d, ElasticLayerNorm2d, ElasticLinear, LayerNorm2d
+from primitive_blocks import ElasticConv2d, ElasticGroupNorm2d, ElasticLinear, GroupNorm2d
 
 
 @dataclass(frozen=True)
@@ -161,7 +161,7 @@ class ConvLNAct(nn.Module):
                 padding=1,
                 bias=False,
             ),
-            LayerNorm2d(out_channels),
+            GroupNorm2d(out_channels),
             nn.SiLU(inplace=True),
         )
 
@@ -249,7 +249,7 @@ class ElasticMBConvBlock(nn.Module):
             bias=False,
             candidate_kernel_sizes=(1,),
         )
-        self.expand_norm = ElasticLayerNorm2d(super_num_channels=self.max_mid_channels)
+        self.expand_norm = ElasticGroupNorm2d(super_num_channels=self.max_mid_channels)
         self.depthwise = ElasticConv2d(
             super_in_channels=self.max_mid_channels,
             super_out_channels=self.max_mid_channels,
@@ -259,7 +259,7 @@ class ElasticMBConvBlock(nn.Module):
             bias=False,
             candidate_kernel_sizes=kernel_size_candidates,
         )
-        self.depthwise_norm = ElasticLayerNorm2d(super_num_channels=self.max_mid_channels)
+        self.depthwise_norm = ElasticGroupNorm2d(super_num_channels=self.max_mid_channels)
         self.project = ElasticConv2d(
             super_in_channels=self.max_mid_channels,
             super_out_channels=channels,
@@ -268,7 +268,7 @@ class ElasticMBConvBlock(nn.Module):
             bias=False,
             candidate_kernel_sizes=(1,),
         )
-        self.project_norm = ElasticLayerNorm2d(super_num_channels=channels)
+        self.project_norm = ElasticGroupNorm2d(super_num_channels=channels)
         self.activation = nn.SiLU(inplace=True)
         self.active_config = LayerConfig(
             kernel_size=max_kernel,
@@ -452,14 +452,52 @@ def infer_input_channels(observation_shape: tuple[int, ...]) -> int:
     return int(observation_shape[-1])
 
 
-def load_backbone_checkpoint(
+POLICY_BACKBONE_PREFIX = "features_extractor.backbone."
+
+
+def extract_backbone_state_dict_from_policy_state_dict(policy_state_dict: Mapping[str, Any]) -> dict[str, Any]:
+    backbone_state_dict = {
+        key.removeprefix(POLICY_BACKBONE_PREFIX): value
+        for key, value in policy_state_dict.items()
+        if key.startswith(POLICY_BACKBONE_PREFIX)
+    }
+    if not backbone_state_dict:
+        raise KeyError(f"No keys found with prefix {POLICY_BACKBONE_PREFIX!r} in policy_state_dict.")
+    return backbone_state_dict
+
+
+def load_backbone_from_policy_checkpoint(
     backbone: SupernetCNNBackbone,
     checkpoint_path: str | Path | None,
     map_location: str | torch.device = "cpu",
 ) -> dict[str, Any] | None:
     if checkpoint_path is None:
         return None
+
     payload = torch.load(Path(checkpoint_path), map_location=map_location)
-    state_dict = payload.get("backbone_state_dict", payload)
+    if not isinstance(payload, Mapping):
+        raise TypeError("Checkpoint payload must be a mapping.")
+    policy_state_dict = payload.get("policy_state_dict")
+    if not isinstance(policy_state_dict, Mapping):
+        raise KeyError("Stage1 PPO checkpoint must contain policy_state_dict.")
+    state_dict = extract_backbone_state_dict_from_policy_state_dict(policy_state_dict)
     backbone.load_state_dict(state_dict, strict=False)
-    return payload if isinstance(payload, dict) else None
+    return dict(payload)
+
+
+def load_backbone_from_backbone_checkpoint(
+    backbone: SupernetCNNBackbone,
+    checkpoint_path: str | Path | None,
+    map_location: str | torch.device = "cpu",
+) -> dict[str, Any] | None:
+    if checkpoint_path is None:
+        return None
+
+    payload = torch.load(Path(checkpoint_path), map_location=map_location)
+    if not isinstance(payload, Mapping):
+        raise TypeError("Checkpoint payload must be a mapping.")
+    backbone_state_dict = payload.get("backbone_state_dict")
+    if not isinstance(backbone_state_dict, Mapping):
+        raise KeyError("Stage2 checkpoint must contain backbone_state_dict.")
+    backbone.load_state_dict(backbone_state_dict, strict=False)
+    return dict(payload)

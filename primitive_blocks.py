@@ -482,6 +482,126 @@ class ElasticLayerNorm2d(nn.Module):
         return self.sample_num_channels + bias_params
 
 
+class GroupNorm2d(nn.Module):
+    """GroupNorm for NCHW feature maps with a LayerNorm2d-compatible API."""
+
+    def __init__(
+        self,
+        num_channels: int,
+        eps: float = 1e-6,
+        elementwise_affine: bool = True,
+        bias: bool = True,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+        self.num_channels = num_channels
+        self.norm = nn.GroupNorm(
+            1,
+            num_channels,
+            eps=eps,
+            affine=elementwise_affine,
+            device=device,
+            dtype=dtype,
+        )
+        if elementwise_affine and not bias:
+            self.norm.bias = None
+
+    def forward(self, x):
+        if x.dim() != 4:
+            raise ValueError("GroupNorm2d expects an NCHW tensor.")
+        if x.size(1) != self.num_channels:
+            raise ValueError(
+                f"Expected {self.num_channels} channels, but got {x.size(1)}."
+            )
+        return self.norm(x)
+
+
+class ElasticGroupNorm2d(nn.Module):
+    """Elastic GroupNorm2d supporting dynamic channel width for NCHW tensors."""
+
+    def __init__(
+        self,
+        *,
+        super_num_channels: int,
+        eps: float = 1e-6,
+        elementwise_affine: bool = True,
+        bias: bool = True,
+    ):
+        super().__init__()
+        self.super_num_channels = super_num_channels
+        self.sample_num_channels = super_num_channels
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+
+        if elementwise_affine:
+            self.weight = nn.Parameter(torch.ones(super_num_channels))
+            if bias:
+                self.bias = nn.Parameter(torch.zeros(super_num_channels))
+            else:
+                self.register_parameter("bias", None)
+        else:
+            self.register_parameter("weight", None)
+            self.register_parameter("bias", None)
+
+    def set_sample_config(self, *, sample_num_channels: int):
+        if sample_num_channels > self.super_num_channels:
+            raise ValueError("sample_num_channels cannot exceed super_num_channels.")
+        self.sample_num_channels = sample_num_channels
+
+    def forward(self, x):
+        if x.dim() != 4:
+            raise ValueError("ElasticGroupNorm2d expects an NCHW tensor.")
+        feature_dim = x.size(1)
+        if feature_dim > self.super_num_channels:
+            raise ValueError("Input channels cannot exceed super_num_channels.")
+
+        if self.elementwise_affine:
+            weight = self.weight[:feature_dim]
+            bias = self.bias[:feature_dim] if self.bias is not None else None
+        else:
+            weight = bias = None
+
+        return F.group_norm(x, 1, weight=weight, bias=bias, eps=self.eps)
+
+    def get_active_subnet(self):
+        if self.elementwise_affine:
+            slice_weight = self.weight[: self.sample_num_channels]
+            slice_bias = (
+                self.bias[: self.sample_num_channels]
+                if self.bias is not None
+                else None
+            )
+            device, dtype = slice_weight.device, slice_weight.dtype
+        else:
+            slice_weight = slice_bias = None
+            device, dtype = torch.device("cpu"), torch.float32
+
+        sub = GroupNorm2d(
+            self.sample_num_channels,
+            eps=self.eps,
+            elementwise_affine=self.elementwise_affine,
+            bias=self.bias is not None,
+            device=device,
+            dtype=dtype,
+        )
+
+        if self.elementwise_affine:
+            with torch.no_grad():
+                sub.norm.weight.copy_(slice_weight)
+                if slice_bias is not None:
+                    sub.norm.bias.copy_(slice_bias)
+
+        return sub
+
+    @property
+    def elastic_num_params(self):
+        if not self.elementwise_affine:
+            return 0
+        bias_params = self.sample_num_channels if self.bias is not None else 0
+        return self.sample_num_channels + bias_params
+
+
 class ElasticConv1d(nn.Conv1d):
     """Elastic Conv1d supporting dynamic input/output channels and groups."""
 

@@ -2,19 +2,18 @@ env:
   env_id: CarRacing-v3
   seed: 0
   image_size: 64
-  native_image_env: true
   vector_env_type: subproc
-  frame_stack: 2
-  atari_wrapper: none
-  max_episode_steps: null
-  frame_skip: 2
-  grayscale_observation: true
-  normalize_observation: false
-  normalize_reward: true
-  normalize_clip_obs: 10.0
-  env_kwargs:
-    continuous: true
-    domain_randomize: false
+  box2d_wrapper:
+    frame_stack: 2
+    max_episode_steps: null
+    frame_skip: 2
+    grayscale_observation: true
+    normalize_observation: false
+    normalize_reward: true
+    normalize_clip_obs: 10.0
+    env_kwargs:
+      continuous: true
+      domain_randomize: false
 
 ppo:
   train_n_envs: 8

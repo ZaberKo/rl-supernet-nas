@@ -6,7 +6,7 @@
 
 `config.yaml` 只放跨阶段复用的运行配置：
 
-- `env`: 环境名、seed、图像尺寸、是否使用原生图像观测、SB3 vector env 类型、Atari wrapper、frame stack 和 `max_episode_steps`。
+- `env`: 环境名、seed、统一图像尺寸、SB3 vector env 类型，以及互斥的 `atari_wrapper` 或 `box2d_wrapper` 参数块。
 - `ppo`: PPO 训练/finetune/eval 的共用参数，包括 `train_n_envs`、`eval_n_envs`、`eval_episodes`、`eval_freq`、`total_timesteps`、`features_dim`、`n_steps`、`batch_size`、`head_lr`、`policy_net_arch`、`value_net_arch` 等。
 
 `ppo.learning_rate`、`ppo.clip_range` 和 `ppo.clip_range_vf` 支持常数，也支持 RL-Zoo 风格的 `lin_<value>` 线性退火写法，例如 `lin_2.5e-4`。
@@ -36,7 +36,7 @@ python stage1_train_max_ppo.py --ppo_config_override 'ppo.policy_net_arch=[]' --
 export WANDB_MODE=offline
 ```
 
-每个 stage 会记录 args/config、关键指标，并把主要输出文件或 Arrow dataset 作为 artifact：stage1A 记录 PPO 轨迹和 backbone，stage1B 记录 random/mixed dataset，stage2 记录 loss 曲线和 checkpoint，stage3 记录每代搜索日志、JSONL 个体记录和最终 manifest。
+每个 stage 会记录 args/config 和关键指标。W&B artifact 只上传轻量输出，例如 manifest、模型 checkpoint、search space 和日志；trajectory / representation 这类大体量数据集只保留在本地路径，不上传到 W&B。
 
 ## Vector Env
 
@@ -45,21 +45,20 @@ export WANDB_MODE=offline
 - `env.vector_env_type=dummy`: 默认，使用 SB3 `DummyVecEnv`。
 - `env.vector_env_type=subproc`: 使用 SB3 `SubprocVecEnv`，适合 `ppo.train_n_envs > 1` 时并行采样。
 
-`env.max_episode_steps` 会控制传给 `gym.make(..., max_episode_steps=...)` 的值。正整数启用 Gymnasium `TimeLimit`，`null` 表示使用环境注册时的默认值，`<=0` 会传 `-1` 来禁用 Gymnasium 自动 `TimeLimit`。ALE 默认使用 `108000` raw frames，这是 Atari 常见的 30 分钟上限；在 SB3 `AtariWrapper` 默认 `MaxAndSkipEnv(skip=4)` 下大约对应 `27000` 个 agent decision。
+`env.atari_wrapper` 和 `env.box2d_wrapper` 只能配置其中一个。wrapper 参数块里的 `max_episode_steps` 会控制传给 `gym.make(..., max_episode_steps=...)` 的值：正整数启用 Gymnasium `TimeLimit`，`null` 表示使用环境注册时的默认值，`<=0` 会传 `-1` 来禁用 Gymnasium 自动 `TimeLimit`。ALE 默认使用 `108000` raw frames，这是 Atari 常见的 30 分钟上限；在 SB3 `AtariWrapper` 默认 `MaxAndSkipEnv(skip=4)` 下大约对应 `27000` 个 agent decision。
 
 ## Box2D 视觉环境
 
-默认配置仍然面向 Atari；Box2D 通过 `--ppo_config_override` 临时切换。`CarRacing-v3` 本身就是 `96x96x3` RGB 图像观测，可以设置 `env.native_image_env=true`；`LunarLander-v3` 和 `BipedalWalker-v3` 默认是状态向量，如果要走视觉 backbone，需要设置 `env.native_image_env=false`，代码会用 `render_mode="rgb_array"` 把渲染帧作为 observation。
+默认配置仍然面向 Atari；Box2D 可以直接使用 `config_box2d.yaml`。当前 env pipeline 假设环境本身提供图像 observation；`CarRacing-v3` 本身就是 `96x96x3` RGB 图像观测，适合这条路径。`LunarLander-v3` 和 `BipedalWalker-v3` 默认是状态向量，不再通过 `render_mode="rgb_array"` 自动转换成 observation。
 
-Box2D 不需要 Atari 的 no-op、episodic-life、fire-reset 这类 wrapper。对 `CarRacing-v3`，更常见的是轻量视觉预处理：`env.frame_skip=2`、`env.image_size=64`、`env.grayscale_observation=true`、`env.frame_stack=2`。RL-Zoo 的 PPO CarRacing 配置还使用 reward normalization、`n_steps=512`、`batch_size=128`、`n_epochs=10`、`learning_rate=lin_1e-4`、`clip_range=0.2` 和连续动作的 gSDE。
+Box2D 不需要 Atari 的 no-op、episodic-life、fire-reset 这类 wrapper。对 `CarRacing-v3`，更常见的是轻量视觉预处理：`env.box2d_wrapper.frame_skip=2`、`env.image_size=64`、`env.box2d_wrapper.grayscale_observation=true`、`env.box2d_wrapper.frame_stack=2`。RL-Zoo 的 PPO CarRacing 配置还使用 reward normalization、`n_steps=512`、`batch_size=128`、`n_epochs=10`、`learning_rate=lin_1e-4`、`clip_range=0.2` 和连续动作的 gSDE。
 
 可以直接使用 `config_box2d.yaml`：
 
 ```bash
 python stage1_train_max_ppo.py \
   --ppo_config config_box2d.yaml \
-  --output_dir runs/box2d_car_racing/stage1_ppo_max \
-  --save_ppo_model runs/box2d_car_racing/stage1_ppo_max/ppo_max_supernet_model.zip
+  --output_dir runs/box2d_car_racing/stage1_ppo_max
 ```
 
 ## Stage 1A: 训练最大 subnet PPO
@@ -75,27 +74,19 @@ python stage1_train_max_ppo.py
 
 - 构造 hardcoded `SearchSpace`，用最大 `ArchConfig` 激活最大 subnet。
 - 用最大 subnet backbone + PPO actor/critic head 训练。
-- 记录 PPO 训练期间产生的全部轨迹到 `ppo_train_trajectories.arrow`。
+- 按 `--sample_ratio` 抽样保存 PPO rollout 生成的 supervised samples 到 `ppo_representation_samples.h5`。
 - 按 `ppo.eval_freq` 个 training timestep 定期评估 `ppo.eval_episodes` 个 episode，并写出 `eval_metrics.jsonl`；`ppo.eval_freq <= 0` 或 `ppo.eval_episodes <= 0` 时关闭定期评估。
-- 轨迹会通过 HuggingFace `datasets` 写成 PyArrow-backed dataset 目录，并独立保存 `terminateds`、`truncateds` 和合并后的 `dones`；SB3 VecEnv 的 `TimeLimit.truncated` 会被还原为 Gymnasium 的 truncated 标记。
-- 保存训练后的 backbone 到 `supernet_backbone_stage1.pt`。
-- 保存完整 SB3 PPO 模型 zip；`--save_ppo_model` 可指定保存路径，未指定时默认写入 `output_dir/ppo_max_supernet_model.zip`。
+- HDF5 样本会保存 `observation`、`actions`、`targets`、`terminateds`、`truncateds` 和合并后的 `dones`；SB3 VecEnv 的 `TimeLimit.truncated` 会被还原为 Gymnasium 的 truncated 标记。
+- 保存训练后的 PPO supernet checkpoint 到 `ppo_supernet_stage1.pt`；文件只保留一份完整 `policy_state_dict`，stage2 会从其中的 `features_extractor.backbone.*` 参数展开 backbone。
 - 写出 `search_space.json` 和 `manifest.json`。
 
-没有单独的 `ppo_trajectory_transitions` 参数。PPO 训练轨迹数量由 `ppo.total_timesteps`、`ppo.train_n_envs` 和 SB3 rollout 设置共同决定；callback 不再做额外截断，训练期间实际产生的环境 transition 都会记录下来。
+PPO 训练产生的候选样本数量由 `ppo.total_timesteps`、`ppo.train_n_envs`、SB3 rollout 设置和 `--horizon` 共同决定；实际保存数量由 `--sample_ratio` 和可选 `--max_samples` 控制。
 
 常用参数：
 
 ```bash
 source .venv/bin/activate
 python stage1_train_max_ppo.py --output_dir runs/stage1_ppo_cartpole --ppo_config_override ppo.total_timesteps=20000
-```
-
-指定完整 PPO 模型保存路径：
-
-```bash
-source .venv/bin/activate
-python stage1_train_max_ppo.py --save_ppo_model runs/stage1_ppo_cartpole/ppo_max_supernet_model.zip
 ```
 
 ## Stage 1B: 采样或混合 random 数据
@@ -107,13 +98,15 @@ source .venv/bin/activate
 python stage1_mix_random_data.py
 ```
 
-这个阶段会读取 stage1A 的 PPO 轨迹，按 `--random_transitions` 采样 random-policy 轨迹，并写出 raw mixed 轨迹 `mixed_trajectories.arrow`，同时生成给 stage2 直接训练用的 supervised dataset `representation_data.arrow`。`--random_transitions 0` 会跳过 random 采样，只基于 PPO 轨迹生成 mixed 与 representation dataset。
+这个阶段会读取 stage1A 的 HDF5 PPO samples，按 `--random_samples` 可选采样 random-policy horizon samples，并生成给 stage2 直接训练用的 datasets Arrow supervised dataset `representation_data.arrow`。random 数据不再写 raw Arrow 中间文件，而是按 `ppo.n_steps` 分块 rollout、切片，并流式写入 `random_representation_samples.h5` 后参与混合。
+
+`--horizon` 必须和 stage1A 写入 HDF5 PPO samples 时使用的 horizon 一致；PPO samples 和 random samples 会先分别切好，再混合保存。
 
 示例：
 
 ```bash
 source .venv/bin/activate
-python stage1_mix_random_data.py --random_transitions 50000
+python stage1_mix_random_data.py --random_samples 50000
 ```
 
 ## Stage 2: supernet 表征学习
@@ -142,7 +135,8 @@ stage2 的 AdamW 使用 PyTorch 默认 beta/eps；DataLoader 的 shuffle/pin_mem
 
 ```bash
 source .venv/bin/activate
-python stage1_mix_random_data.py --representation_horizon 3
+python stage1_train_max_ppo.py --horizon 3
+python stage1_mix_random_data.py --horizon 3
 python stage2_train_supernet.py --trajectory_data runs/stage1_mix/representation_data.arrow --train_steps 5000 --random_subnets 4 --projection_dim 128 --dynamics_horizon 3 --dynamics_betas 1.0,0.5,0.25
 ```
 
@@ -193,17 +187,17 @@ scripts/atari_stage3_ea_search.sh
 
 ```bash
 source .venv/bin/activate
-python stage1_train_max_ppo.py --output_dir runs/smoke_stage1 --save_ppo_model runs/smoke_stage1/ppo_model.zip --ppo_config_override ppo.total_timesteps=8 --ppo_config_override ppo.n_steps=8 --ppo_config_override ppo.batch_size=8 --ppo_config_override ppo.n_epochs=1 --ppo_config_override ppo.features_dim=32 --ppo_config_override ppo.quiet=true
+python stage1_train_max_ppo.py --output_dir runs/smoke_stage1 --ppo_config_override ppo.total_timesteps=8 --ppo_config_override ppo.n_steps=8 --ppo_config_override ppo.batch_size=8 --ppo_config_override ppo.n_epochs=1 --ppo_config_override ppo.features_dim=32 --ppo_config_override ppo.quiet=true
 ```
 
 ```bash
 source .venv/bin/activate
-python stage1_mix_random_data.py --ppo_trajectory_file runs/smoke_stage1/ppo_train_trajectories.arrow --output_dir runs/smoke_mix --random_transitions 4
+python stage1_mix_random_data.py --ppo_data_file runs/smoke_stage1/ppo_representation_samples.h5 --output_dir runs/smoke_mix --random_samples 4
 ```
 
 ```bash
 source .venv/bin/activate
-python stage2_train_supernet.py --trajectory_data runs/smoke_mix/representation_data.arrow --stage1_backbone runs/smoke_stage1/supernet_backbone_stage1.pt --output_dir runs/smoke_stage2 --train_steps 1 --batch_size 2 --random_subnets 1 --projection_dim 16 --predictor_hidden_dim 32 --ppo_config_override ppo.features_dim=32
+python stage2_train_supernet.py --trajectory_data runs/smoke_mix/representation_data.arrow --stage1_backbone runs/smoke_stage1/ppo_supernet_stage1.pt --output_dir runs/smoke_stage2 --train_steps 1 --batch_size 2 --random_subnets 1 --projection_dim 16 --predictor_hidden_dim 32 --ppo_config_override ppo.features_dim=32
 ```
 
 ```bash

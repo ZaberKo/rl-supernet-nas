@@ -10,10 +10,13 @@ from stable_baselines3.common.vec_env import VecEnv
 
 from config_utils import add_ppo_config_args, build_run_config, load_ppo_config, ppo_config_to_dict
 from ppo_utils import build_ppo_model_from_config, evaluate_ppo_model, learn_ppo, make_vec_env_from_ppo_config
-from sb3_nas_policy import save_policy_backbone
+from sb3_nas_policy import save_ppo_supernet_checkpoint
 from supernet_backbone import SearchSpace
 from trajectory_data import TrajectoryRecorderCallback, count_trajectory_file
 from wandb_utils import finish_wandb_run, init_wandb_run, log_wandb, log_wandb_artifact
+
+
+PPO_REPRESENTATION_FILE = "ppo_representation_samples.h5"
 
 
 def parse_args() -> argparse.Namespace:
@@ -22,16 +25,12 @@ def parse_args() -> argparse.Namespace:
         allow_abbrev=False,
     )
     add_ppo_config_args(parser)
-    parser.add_argument("--output_dir", default="runs/stage1_ppo_max_arch", help="Directory for PPO trajectories, backbone checkpoint, and manifest.")
-    parser.add_argument("--save_ppo_model", default=None, help="Path for saving the complete SB3 PPO model zip. Defaults to output_dir/ppo_max_supernet_model.zip.")
+    parser.add_argument("--output_dir", default="runs/stage1_ppo_max_arch", help="Directory for PPO trajectories, PPO checkpoint, and manifest.")
+    parser.add_argument("--horizon", type=int, default=1, help="Number of future steps packed into each sampled representation record.")
+    parser.add_argument("--sample_ratio", type=float, default=0.01, help="Sampling probability for eligible representation windows.")
+    parser.add_argument("--sample_seed", type=int, default=0, help="Seed used for PPO representation sample selection.")
+    parser.add_argument("--max_samples", type=int, default=0, help="Hard cap for saved representation samples; 0 disables the cap.")
     return parser.parse_args()
-
-
-def resolve_ppo_model_path(path: str | None, output_dir: Path) -> Path:
-    ppo_model_path = output_dir / "ppo_max_supernet_model.zip" if path is None else Path(path)
-    if ppo_model_path.suffix != ".zip":
-        ppo_model_path = ppo_model_path.with_name(f"{ppo_model_path.name}.zip")
-    return ppo_model_path
 
 
 class PeriodicEvalCallback(BaseCallback):
@@ -96,9 +95,6 @@ class PeriodicEvalCallback(BaseCallback):
 def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    ppo_model_path = resolve_ppo_model_path(args.save_ppo_model, output_dir)
-    args.save_ppo_model = str(ppo_model_path)
-    ppo_model_path.parent.mkdir(parents=True, exist_ok=True)
     run_config = build_run_config(args, ppo_config)
     wandb_run = init_wandb_run("stage1_train_max_ppo", run_config, output_dir)
     search_space = SearchSpace()
@@ -117,7 +113,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict:
             env=train_env,
             arch_config=max_arch,
         )
-        ppo_trajectory_path = output_dir / "ppo_train_trajectories.arrow"
+        representation_path = output_dir / PPO_REPRESENTATION_FILE
 
         def log_training_progress(values: dict[str, float | int], step: int) -> None:
             log_wandb(wandb_run, {f"stage1/{key}": value for key, value in values.items()}, step=step)
@@ -126,7 +122,11 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict:
             log_wandb(wandb_run, {f"stage1/{key}": value for key, value in values.items()}, step=step)
 
         trajectory_callback = TrajectoryRecorderCallback(
-            save_path=ppo_trajectory_path,
+            save_path=representation_path,
+            horizon=int(args.horizon),
+            sample_ratio=float(args.sample_ratio),
+            sample_seed=int(args.sample_seed),
+            max_samples=int(args.max_samples) if int(args.max_samples) > 0 else None,
             log_fn=log_training_progress,
             log_interval=max(1, int(ppo_config.n_steps)),
         )
@@ -161,18 +161,28 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict:
             "env_id": ppo_config.env_id,
             "seed": ppo_config.seed,
             "train_n_envs": ppo_config.train_n_envs,
-            "image_size": ppo_config.image_size,
+            "image_size": int(ppo_config.image_size),
             "arch_config": max_arch.to_dict(),
             "search_space": search_space.to_dict(),
             "args": vars(args),
             "ppo_config": ppo_config_to_dict(ppo_config),
         }
-        trajectory_callback.save(metadata=ppo_metadata)
+        representation_metadata = dict(ppo_metadata)
+        representation_metadata.update(
+            {
+                "source": "ppo_rollout_representation_samples",
+                "horizon": int(args.horizon),
+                "sample_ratio": float(args.sample_ratio),
+                "sample_seed": int(args.sample_seed),
+                "max_samples": int(args.max_samples),
+            }
+        )
+        trajectory_callback.save(metadata=representation_metadata)
 
-        backbone_path = output_dir / "supernet_backbone_stage1.pt"
-        save_policy_backbone(
-            model.policy,
-            backbone_path,
+        checkpoint_path = output_dir / "ppo_supernet_stage1.pt"
+        save_ppo_supernet_checkpoint(
+            model,
+            checkpoint_path,
             search_space=search_space,
             extra={
                 "stage": "stage1_ppo_max_arch",
@@ -181,21 +191,29 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict:
                 "ppo_config": ppo_config_to_dict(ppo_config),
             },
         )
-        model.save(ppo_model_path)
     finally:
         train_env.close()
         if eval_env is not None:
             eval_env.close()
 
-    ppo_count = count_trajectory_file(ppo_trajectory_path)
+    representation_count = count_trajectory_file(representation_path)
     manifest = {
         "stage": "stage1_ppo_max_arch",
-        "ppo_trajectories": str(ppo_trajectory_path),
-        "backbone_checkpoint": str(backbone_path),
-        "ppo_model": str(ppo_model_path),
+        "representation_data": str(representation_path),
+        "horizon": int(args.horizon),
+        "sample_ratio": float(args.sample_ratio),
+        "sample_seed": int(args.sample_seed),
+        "max_samples": int(args.max_samples),
+        "representation_count": representation_count,
+        "ppo_supernet_checkpoint": str(checkpoint_path),
+        "checkpoint_fields": [
+            "policy_state_dict",
+            "search_space",
+            "active_arch",
+        ],
         "search_space": str(search_space_path),
         "eval_metrics": str(eval_metrics_path) if eval_metrics_path.exists() else None,
-        "trajectory_count": ppo_count,
+        "trajectory_count": representation_count,
         "max_arch": max_arch.to_dict(),
         "args": vars(args),
         "ppo_config": ppo_config_to_dict(ppo_config),
@@ -205,16 +223,18 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict:
     log_wandb(
         wandb_run,
         {
-            "stage1/num_transitions": ppo_count["num_transitions"],
-            "stage1/num_steps": ppo_count["num_steps"],
-            "stage1/num_trajectories": ppo_count.get("num_trajectories", ppo_count["num_envs"]),
+            "stage1/representation_samples": representation_count["num_samples"],
+            "stage1/horizon": int(args.horizon),
+            "stage1/sample_ratio": float(args.sample_ratio),
+            "stage1/num_transitions": representation_count["num_transitions"],
+            "stage1/num_steps": representation_count["num_steps"],
+            "stage1/num_trajectories": representation_count.get("num_trajectories", representation_count["num_envs"]),
         },
         step=int(ppo_config.total_timesteps),
     )
-    artifact_paths = [ppo_trajectory_path, backbone_path, search_space_path, manifest_path]
+    artifact_paths = [checkpoint_path, search_space_path, manifest_path]
     if eval_metrics_path.exists():
         artifact_paths.append(eval_metrics_path)
-    artifact_paths.append(ppo_model_path)
     log_wandb_artifact(
         wandb_run,
         name=f"stage1-ppo-{output_dir.name}",

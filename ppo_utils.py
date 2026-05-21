@@ -12,7 +12,7 @@ from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.vec_env import VecEnv, sync_envs_normalization, unwrap_vec_normalize
 
-from env_utils import make_vision_vec_env
+from env_utils import make_atari_vec_env, make_box2d_vec_env
 from sb3_nas_policy import build_ppo_model, configure_policy_optimizer
 from supernet_backbone import ArchConfig
 
@@ -89,10 +89,38 @@ def resolve_activation_fn(value: str | None) -> type[nn.Module] | None:
     return activations[name]
 
 
-def use_render_observation(ppo_config: Any) -> bool:
-    if str(getattr(ppo_config, "atari_wrapper", "none")).lower() != "none":
-        return False
-    return not bool(ppo_config.native_image_env)
+def mapping_to_dict(value: Any, name: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not hasattr(value, "items"):
+        raise TypeError(f"{name} must be a mapping.")
+    result: dict[str, Any] = {}
+    for key, item in value.items():
+        if hasattr(item, "items"):
+            result[str(key)] = mapping_to_dict(item, f"{name}.{key}")
+        else:
+            result[str(key)] = item
+    return result
+
+
+def get_env_wrapper_config(ppo_config: Any) -> tuple[str, dict[str, Any]]:
+    atari_wrapper = getattr(ppo_config, "atari_wrapper", None)
+    box2d_wrapper = getattr(ppo_config, "box2d_wrapper", None)
+    has_atari = atari_wrapper is not None
+    has_box2d = box2d_wrapper is not None
+    if has_atari == has_box2d:
+        raise ValueError("Exactly one of env.atari_wrapper or env.box2d_wrapper must be configured.")
+    if has_atari:
+        return "atari", mapping_to_dict(atari_wrapper, "env.atari_wrapper")
+    return "box2d", mapping_to_dict(box2d_wrapper, "env.box2d_wrapper")
+
+
+def parse_optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() in {"none", "null", "off"}:
+        return None
+    return int(value)
 
 
 def get_train_n_envs(ppo_config: Any) -> int:
@@ -103,45 +131,41 @@ def get_eval_n_envs(ppo_config: Any) -> int:
     return int(getattr(ppo_config, "eval_n_envs", 1))
 
 
-def get_max_episode_steps(ppo_config: Any) -> int | None:
-    value = getattr(ppo_config, "max_episode_steps", None)
-    if value is None:
-        return None
-    return int(value)
-
-
-def get_env_kwargs(ppo_config: Any) -> dict[str, Any]:
-    value = getattr(ppo_config, "env_kwargs", None)
-    if value is None:
-        return {}
-    if not hasattr(value, "items"):
-        raise TypeError("env_kwargs must be a mapping.")
-    return {str(key): item for key, item in value.items()}
-
-
 def make_vec_env_from_ppo_config(
     ppo_config: Any,
     seed: int | None = None,
     n_envs: int | None = None,
 ) -> VecEnv:
-    return make_vision_vec_env(
+    wrapper_kind, wrapper_config = get_env_wrapper_config(ppo_config)
+    common_kwargs = dict(
         env_id=ppo_config.env_id,
         n_envs=get_train_n_envs(ppo_config) if n_envs is None else n_envs,
         seed=ppo_config.seed if seed is None else seed,
-        image_size=ppo_config.image_size,
-        use_render_observation=use_render_observation(ppo_config),
+        image_size=int(getattr(ppo_config, "image_size", 64)),
         vector_env_type=getattr(ppo_config, "vector_env_type", "dummy"),
-        frame_stack=int(getattr(ppo_config, "frame_stack", 1)),
-        atari_wrapper=str(getattr(ppo_config, "atari_wrapper", "none")),
-        max_episode_steps=get_max_episode_steps(ppo_config),
-        env_kwargs=get_env_kwargs(ppo_config),
-        frame_skip=int(getattr(ppo_config, "frame_skip", 1)),
-        grayscale_observation=bool(getattr(ppo_config, "grayscale_observation", False)),
-        normalize_observation=bool(getattr(ppo_config, "normalize_observation", False)),
-        normalize_reward=bool(getattr(ppo_config, "normalize_reward", False)),
-        normalize_clip_obs=float(getattr(ppo_config, "normalize_clip_obs", 10.0)),
-        normalize_gamma=float(getattr(ppo_config, "normalize_gamma", getattr(ppo_config, "gamma", 0.99))),
+        frame_stack=int(wrapper_config.get("frame_stack", 1)),
+        max_episode_steps=parse_optional_int(wrapper_config.get("max_episode_steps", None)),
+        env_kwargs=mapping_to_dict(wrapper_config.get("env_kwargs", None), f"env.{wrapper_kind}_wrapper.env_kwargs"),
+        normalize_observation=bool(wrapper_config.get("normalize_observation", False)),
+        normalize_reward=bool(wrapper_config.get("normalize_reward", False)),
+        normalize_clip_obs=float(wrapper_config.get("normalize_clip_obs", 10.0)),
+        normalize_gamma=float(wrapper_config.get("normalize_gamma", getattr(ppo_config, "gamma", 0.99))),
     )
+    if wrapper_kind == "atari":
+        return make_atari_vec_env(**common_kwargs)
+    return make_box2d_vec_env(
+        **common_kwargs,
+        frame_skip=int(wrapper_config.get("frame_skip", 1)),
+        grayscale_observation=bool(wrapper_config.get("grayscale_observation", False)),
+    )
+
+
+def get_vision_spaces_from_ppo_config(ppo_config: Any, seed: int | None = None) -> tuple[Any, Any]:
+    env = make_vec_env_from_ppo_config(ppo_config, seed=seed, n_envs=1)
+    try:
+        return env.observation_space, env.action_space
+    finally:
+        env.close()
 
 
 def parse_hidden_sizes(value: str | Sequence[int] | None) -> tuple[int, ...]:

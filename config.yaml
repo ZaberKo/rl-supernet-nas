@@ -2,11 +2,12 @@ env:
   env_id: ALE/SpaceInvaders-v5
   seed: 0
   image_size: 84
-  native_image_env: true
   vector_env_type: subproc
-  frame_stack: 4
-  atari_wrapper: sb3
-  max_episode_steps: 108000
+  atari_wrapper:
+    frame_stack: 4
+    max_episode_steps: 10800
+    normalize_observation: false
+    normalize_reward: false
 
 ppo:
   train_n_envs: 8
@@ -17,7 +18,7 @@ ppo:
   total_timesteps: 10000000
   features_dim: 256
   learning_rate: lin_2.5e-4
-  head_lr: 0.00025
+  head_lr: lin_2.5e-4
   n_steps: 128 # num rollout steps per env
   batch_size: 256 # minibatch for PPO update
   n_epochs: 4 # repeat rollout data for multiple epochs
@@ -34,6 +35,11 @@ ppo:
   tensorboard_log: null
   policy_net_arch: [256] # actor MLP head after the backbone
   value_net_arch: [256] # critic MLP head after the backbone
+  use_sde: false
+  sde_sample_freq: -1
+  log_std_init: null
+  ortho_init: true
+  activation_fn: tanh
   device: auto
   progress_bar: false
   quiet: false
