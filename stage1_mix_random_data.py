@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ppo_data_file", default="runs/stage1_ppo_max_arch/ppo_representation_samples.h5", help="PPO HDF5 representation samples produced by stage1_train_max_ppo.py.")
     parser.add_argument("--output_dir", default="runs/stage1_mix", help="Directory for the mixed representation dataset and manifest.")
     parser.add_argument("--random_samples", type=int, default=0, help="Exact number of random-policy horizon samples to save. Use 0 to skip random-policy collection.")
-    parser.add_argument("--seed", type=int, default=None, help="Seed used for random-policy collection. Defaults to the PPO config seed.")
+    parser.add_argument("--seed", type=int, default=42, help="Seed used for random-policy collection. Defaults to the PPO config seed.")
     parser.add_argument("--horizon", type=int, default=1, help="Number of future steps packed into each stage2 supervised sample.")
     parser.add_argument("--manifest_name", default="manifest.json", help="File name for the mixed-data summary manifest inside output_dir.")
     return parser.parse_args()
