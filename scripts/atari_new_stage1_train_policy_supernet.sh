@@ -5,7 +5,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 python new_stage1_train_policy_supernet.py \
   --ppo_config config.yaml \
-  --ppo_config_override ppo.n_epochs=8 \
+  --ppo_config_override ppo.n_epochs=4 \
   --ppo_config_override ppo.total_timesteps=20000000 \
   --output_dir runs/atari_space_invaders/new_stage1_policy_supernet \
   --random_subnets 2 \

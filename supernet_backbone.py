@@ -9,7 +9,7 @@ from typing import Any, Mapping
 import torch
 import torch.nn as nn
 
-from primitive_blocks import ElasticConv2d, ElasticGroupNorm2d, ElasticLinear, GroupNorm2d
+from primitive_blocks import DEFAULT_GROUP_NORM_CHANNELS_PER_GROUP, ElasticConv2d, ElasticGroupNorm2d, ElasticLinear, GroupNorm2d
 
 
 @dataclass(frozen=True)
@@ -71,6 +71,9 @@ class SearchSpace:
                 raise ValueError("Each stage must have at least one depth candidate.")
             if tuple(sorted(candidates)) != tuple(candidates):
                 raise ValueError("Depth candidates must be sorted in ascending order.")
+        for width in self.stage_widths:
+            if int(width) % DEFAULT_GROUP_NORM_CHANNELS_PER_GROUP != 0:
+                raise ValueError("Each stage width must be divisible by DEFAULT_GROUP_NORM_CHANNELS_PER_GROUP.")
 
     @property
     def num_stages(self) -> int:

@@ -5,6 +5,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
+
+DEFAULT_GROUP_NORM_CHANNELS_PER_GROUP = 16
+
+
+def group_norm_group_count(num_channels: int, channels_per_group: int) -> int:
+    if channels_per_group <= 0:
+        raise ValueError("channels_per_group must be positive.")
+    if num_channels % channels_per_group != 0:
+        raise ValueError("num_channels must be divisible by channels_per_group.")
+    return num_channels // channels_per_group
+
+
 class ElasticLayerNorm(nn.LayerNorm):
     def __init__(self, *, super_hidden_size, **kwargs):
         super().__init__(super_hidden_size, **kwargs)
@@ -488,6 +500,7 @@ class GroupNorm2d(nn.Module):
     def __init__(
         self,
         num_channels: int,
+        channels_per_group: int = DEFAULT_GROUP_NORM_CHANNELS_PER_GROUP,
         eps: float = 1e-6,
         elementwise_affine: bool = True,
         bias: bool = True,
@@ -496,8 +509,10 @@ class GroupNorm2d(nn.Module):
     ):
         super().__init__()
         self.num_channels = num_channels
+        self.channels_per_group = channels_per_group
+        self.num_groups = group_norm_group_count(num_channels, channels_per_group)
         self.norm = nn.GroupNorm(
-            1,
+            self.num_groups,
             num_channels,
             eps=eps,
             affine=elementwise_affine,
@@ -524,6 +539,7 @@ class ElasticGroupNorm2d(nn.Module):
         self,
         *,
         super_num_channels: int,
+        channels_per_group: int = DEFAULT_GROUP_NORM_CHANNELS_PER_GROUP,
         eps: float = 1e-6,
         elementwise_affine: bool = True,
         bias: bool = True,
@@ -531,8 +547,10 @@ class ElasticGroupNorm2d(nn.Module):
         super().__init__()
         self.super_num_channels = super_num_channels
         self.sample_num_channels = super_num_channels
+        self.channels_per_group = channels_per_group
         self.eps = eps
         self.elementwise_affine = elementwise_affine
+        group_norm_group_count(super_num_channels, channels_per_group)
 
         if elementwise_affine:
             self.weight = nn.Parameter(torch.ones(super_num_channels))
@@ -547,6 +565,7 @@ class ElasticGroupNorm2d(nn.Module):
     def set_sample_config(self, *, sample_num_channels: int):
         if sample_num_channels > self.super_num_channels:
             raise ValueError("sample_num_channels cannot exceed super_num_channels.")
+        group_norm_group_count(sample_num_channels, self.channels_per_group)
         self.sample_num_channels = sample_num_channels
 
     def forward(self, x):
@@ -555,6 +574,7 @@ class ElasticGroupNorm2d(nn.Module):
         feature_dim = x.size(1)
         if feature_dim > self.super_num_channels:
             raise ValueError("Input channels cannot exceed super_num_channels.")
+        num_groups = group_norm_group_count(feature_dim, self.channels_per_group)
 
         if self.elementwise_affine:
             weight = self.weight[:feature_dim]
@@ -562,7 +582,7 @@ class ElasticGroupNorm2d(nn.Module):
         else:
             weight = bias = None
 
-        return F.group_norm(x, 1, weight=weight, bias=bias, eps=self.eps)
+        return F.group_norm(x, num_groups, weight=weight, bias=bias, eps=self.eps)
 
     def get_active_subnet(self):
         if self.elementwise_affine:
@@ -579,6 +599,7 @@ class ElasticGroupNorm2d(nn.Module):
 
         sub = GroupNorm2d(
             self.sample_num_channels,
+            channels_per_group=self.channels_per_group,
             eps=self.eps,
             elementwise_affine=self.elementwise_affine,
             bias=self.bias is not None,
