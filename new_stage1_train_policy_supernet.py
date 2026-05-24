@@ -577,7 +577,7 @@ def sandwich_actor_update(
     entropy_loss_sum = 0.0
     max_dynamics_loss_sum = 0.0
     subnet_loss_sum = 0.0
-    subnet_kl_sum = 0.0
+    policy_distill_kl_sum = 0.0
     subnet_dynamics_loss_sum = 0.0
     approx_kl_sum = 0.0
     clip_fraction_sum = 0.0
@@ -642,14 +642,14 @@ def sandwich_actor_update(
                 sampled_arches.append(search_space.sample_arch())
 
             subnet_loss_values = []
-            subnet_kl_values = []
+            policy_distill_kl_values = []
             subnet_dyn_loss_values = []
             subnet_scale = 1.0 / float(len(sampled_arches))
             for arch in sampled_arches:
                 policy.set_active_arch(arch)
                 subnet_features = policy.encode(batch_observations)
                 student_params = policy.distribution_params_from_features(subnet_features)
-                distill_loss = policy_kl_distillation_loss(
+                policy_distill_kl_loss = policy_kl_distillation_loss(
                     action_space=action_space,
                     teacher_params=teacher_params,
                     student_params=student_params,
@@ -665,9 +665,9 @@ def sandwich_actor_update(
                     action_space=action_space,
                     sample_weights=rollout_data.dynamics_masks,
                 )
-                subnet_loss = distill_loss + float(beta_dyn) * subnet_dyn_loss
+                subnet_loss = policy_distill_kl_loss + float(beta_dyn) * subnet_dyn_loss
                 subnet_loss_values.append(float(subnet_loss.detach().cpu()))
-                subnet_kl_values.append(float(distill_loss.detach().cpu()))
+                policy_distill_kl_values.append(float(policy_distill_kl_loss.detach().cpu()))
                 subnet_dyn_loss_values.append(float(subnet_dyn_loss.detach().cpu()))
                 (subnet_loss * subnet_scale).backward()
 
@@ -676,7 +676,7 @@ def sandwich_actor_update(
             actor_optimizer.step()
 
             subnet_loss_value = float(np.mean(subnet_loss_values))
-            subnet_kl_value = float(np.mean(subnet_kl_values))
+            policy_distill_kl_value = float(np.mean(policy_distill_kl_values))
             subnet_dyn_loss_value = float(np.mean(subnet_dyn_loss_values))
             update_count += 1
             loss_sum += max_loss_value + subnet_loss_value
@@ -685,7 +685,7 @@ def sandwich_actor_update(
             entropy_loss_sum += entropy_loss_value
             max_dynamics_loss_sum += max_dyn_loss_value
             subnet_loss_sum += subnet_loss_value
-            subnet_kl_sum += subnet_kl_value
+            policy_distill_kl_sum += policy_distill_kl_value
             subnet_dynamics_loss_sum += subnet_dyn_loss_value
             approx_kl_sum += float(approx_kl.cpu())
             clip_fraction_sum += float(clip_fraction.cpu())
@@ -702,7 +702,7 @@ def sandwich_actor_update(
         "actor/entropy_loss": entropy_loss_sum / denominator,
         "actor/max_dynamics_loss": max_dynamics_loss_sum / denominator,
         "actor/subnet_loss": subnet_loss_sum / denominator,
-        "actor/subnet_policy_kl": subnet_kl_sum / denominator,
+        "actor/policy_distill_kl": policy_distill_kl_sum / denominator,
         "actor/subnet_dynamics_loss": subnet_dynamics_loss_sum / denominator,
         "actor/approx_kl": approx_kl_sum / denominator,
         "actor/clip_fraction": clip_fraction_sum / denominator,
@@ -1054,10 +1054,10 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                 "iteration": int(iteration),
                 "total_timesteps": int(total_timesteps),
                 "progress_remaining": float(progress_remaining),
-                "train/actor_lr": float(actor_lr),
-                "train/critic_lr": float(critic_lr),
-                "train/clip_range": float(clip_range),
-                "train/beta_dyn": float(args.beta_dyn),
+                "actor_lr": float(actor_lr),
+                "critic_lr": float(critic_lr),
+                "clip_range": float(clip_range),
+                "beta_dyn": float(args.beta_dyn),
                 **rollout_metrics,
                 **actor_metrics,
                 **critic_metrics,
@@ -1071,9 +1071,8 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             progress_bar.set_postfix(
                 {
                     "ret": f"{rollout_metrics['rollout/return_mean']:.3g}",
-                    "rew": f"{rollout_metrics['rollout/mean_reward_per_step']:.3g}",
                     "actor": f"{actor_metrics['actor/loss']:.3g}",
-                    "kl": f"{actor_metrics['actor/subnet_policy_kl']:.3g}",
+                    "distill_kl": f"{actor_metrics['actor/policy_distill_kl']:.3g}",
                     "dyn": f"{actor_metrics['actor/subnet_dynamics_loss']:.3g}",
                     "critic": f"{critic_metrics['critic/loss']:.3g}",
                     "lr": f"{actor_lr:.2g}",
