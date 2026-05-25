@@ -229,3 +229,4 @@ pyrightconfig.json
 # Local experiment outputs
 runs/
 wandb/
+debug/
