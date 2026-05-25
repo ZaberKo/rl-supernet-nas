@@ -140,34 +140,79 @@ python stage1_mix_random_data.py --horizon 3
 python stage2_train_supernet.py --trajectory_data runs/stage1_mix/representation_data.arrow --train_steps 5000 --random_subnets 4 --projection_dim 128 --dynamics_horizon 3 --dynamics_betas 1.0,0.5,0.25
 ```
 
-## Stage 2B: 单架构 PPO 诊断
+## New Stage 1B: 单架构 PPO finetune 诊断
 
 运行：
 
 ```bash
 source .venv/bin/activate
-python stage2_train_arch_ppo.py
+python new_stage1_train_arch_ppo.py
 ```
 
-这个阶段用于在进入 stage3 搜索前，先拿一个 JSON 中指定的单个 `ArchConfig` 做 PPO finetune 诊断。默认 `--arch_config arch_configs/max_arch.json` 表示当前 search space 的最大架构；脚本会从 `--supernet_checkpoint runs/stage2/supernet_backbone_stage2.pt` 继承 stage2 学到的 backbone 参数，重新初始化 PPO actor/critic head，并按 `--candidate_timesteps` 做一次单架构 PPO 学习。
+这个阶段用于在进入 `new_stage2_ea_search.py` 前，先拿一个 JSON 中指定的单个 `ArchConfig` 做 PPO finetune 诊断。默认 `--arch_config arch_configs/max_arch.json` 表示当前 search space 的最大架构；脚本会从 `--supernet_checkpoint runs/new_stage1_policy_supernet/policy_supernet_best.pt` 读取 `new_stage1_train_policy_supernet.py` 保存的 actor supernet 和 critic 参数，然后按 `--candidate_timesteps` 对指定子网做一次 PPO finetune。
 
 输出包括：
 
-- `metrics.jsonl`：SB3 PPO 的 rollout/train 指标和初始、周期性、最终 eval reward；每行用 `type` 和 `total_timesteps` 区分 train/eval 记录。
-- `ppo_supernet_stage2_arch.pt`：可选保存最终 PPO policy checkpoint，包含当前激活架构。
+- `metrics.jsonl`：critic warmup、rollout、actor/critic update、初始/周期性/最终 eval return；每行用 `type`、`total_timesteps` 和 `total_env_timesteps` 区分记录。
+- `policy_supernet_arch_ppo.pt`：可选保存最终 actor supernet、critic、optimizer 和当前激活架构。
 - `manifest.json`：记录 arch、checkpoint、参数量、seed、train/eval metrics 路径。
 
-`--supernet_backbone_lr <= 0` 时冻结继承的 stage2 backbone，只训练 PPO head；大于 0 时会给 backbone 单独设置 learning rate，PPO head 使用 `ppo.head_lr`。
+`--supernet_backbone_lr <= 0` 时冻结继承的 supernet backbone，只训练 actor head；大于 0 时会给 backbone 单独设置 learning rate，actor head 使用 `ppo.learning_rate`。`--critic_warmup_timesteps` 可在 actor PPO finetune 前只更新 critic。
 
 示例：
 
 ```bash
 source .venv/bin/activate
-python stage2_train_arch_ppo.py \
-  --supernet_checkpoint runs/stage2/supernet_backbone_stage2.pt \
+python new_stage1_train_arch_ppo.py \
+  --supernet_checkpoint runs/new_stage1_policy_supernet/policy_supernet_best.pt \
   --arch_config arch_configs/max_arch.json \
-  --output_dir runs/stage2_arch_ppo_max \
+  --output_dir runs/new_stage1_arch_ppo_max \
   --candidate_timesteps 10000 \
+  --critic_warmup_timesteps 0 \
+  --ppo_config_override ppo.eval_episodes=3
+```
+
+Atari 便捷脚本默认评估最大网络：
+
+```bash
+scripts/atari_new_stage1_train_arch_ppo.sh
+```
+
+切换到最小网络或固定随机采样网络：
+
+```bash
+python new_stage1_train_arch_ppo.py \
+  --ppo_config config.yaml \
+  --supernet_checkpoint runs/atari_space_invaders/new_stage1_policy_supernet/policy_supernet_best.pt \
+  --arch_config arch_configs/min_arch.json \
+  --output_dir runs/atari_space_invaders/new_stage1_arch_ppo_min_arch \
+  --candidate_timesteps 10000 \
+  --critic_warmup_timesteps 0 \
+  --supernet_backbone_lr 0.0 \
+  --ppo_config_override ppo.eval_episodes=3
+
+python new_stage1_train_arch_ppo.py \
+  --ppo_config config.yaml \
+  --supernet_checkpoint runs/atari_space_invaders/new_stage1_policy_supernet/policy_supernet_best.pt \
+  --arch_config arch_configs/random_arch_seed2026.json \
+  --output_dir runs/atari_space_invaders/new_stage1_arch_ppo_random_arch_seed2026 \
+  --candidate_timesteps 10000 \
+  --critic_warmup_timesteps 0 \
+  --supernet_backbone_lr 0.0 \
+  --ppo_config_override ppo.eval_episodes=3
+```
+
+只看 supernet checkpoint 的初始化质量，不做 PPO finetune：
+
+```bash
+python new_stage1_train_arch_ppo.py \
+  --ppo_config config.yaml \
+  --supernet_checkpoint runs/atari_space_invaders/new_stage1_policy_supernet/policy_supernet_best.pt \
+  --arch_config arch_configs/max_arch.json \
+  --output_dir runs/atari_space_invaders/new_stage1_arch_ppo_max_arch_zero_step \
+  --candidate_timesteps 0 \
+  --critic_warmup_timesteps 0 \
+  --supernet_backbone_lr 0.0 \
   --ppo_config_override ppo.eval_episodes=3
 ```
 

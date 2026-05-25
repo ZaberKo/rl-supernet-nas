@@ -55,7 +55,6 @@ def parse_args() -> argparse.Namespace:
     add_ppo_config_args(parser)
     parser.add_argument("--output_dir", default="runs/new_stage2_ea_search", help="Directory for NSGA-II records, search space, and manifest.")
     parser.add_argument("--supernet_checkpoint", default="runs/new_stage1_policy_supernet/policy_supernet_best.pt", help="New stage1 policy-supernet checkpoint used to initialize subnet candidates.")
-    parser.add_argument("--checkpoint_policy_key", default="policy_state_dict", choices=("policy_state_dict", "ema_policy_state_dict"), help="Actor checkpoint entry used to initialize candidates.")
     parser.add_argument("--population_size", type=int, default=6, help="NSGA-II population size.")
     parser.add_argument("--generations", type=int, default=3, help="Number of NSGA-II generations to evaluate.")
     parser.add_argument("--candidate_timesteps", type=int, default=1024, help="PPO finetune timesteps for each subnet candidate.")
@@ -65,8 +64,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--critic_warmup_timesteps", type=int, default=0, help="Critic-only warmup timesteps on current subnet rollouts before actor PPO finetune; 0 disables warmup.")
     parser.add_argument("--projection_dim", type=int, default=0, help="Policy projection dimension. 0 reads the value from the checkpoint.")
     parser.add_argument("--predictor_hidden_dim", type=int, default=0, help="Dynamics predictor hidden dimension. 0 reads the value from the checkpoint args.")
-    parser.add_argument("--load_critic", action=argparse.BooleanOptionalAction, default=True, help="Load critic_policy_state_dict from the checkpoint. Use --no-load_critic to initialize it randomly.")
-    parser.add_argument("--strict_checkpoint_load", action=argparse.BooleanOptionalAction, default=True, help="Use strict state-dict loading for actor and critic checkpoint entries.")
     parser.add_argument("--save_full_history", action="store_true", help="Store full EvoX monitor history in memory for debugging.")
     args = parser.parse_args()
     if args.critic_warmup_timesteps < 0:
@@ -281,26 +278,23 @@ def build_policy_from_checkpoint(
         predictor_hidden_dim=int(constructor_values["predictor_hidden_dim"]),
     ).to(device)
 
-    state_dict = checkpoint_payload.get(args.checkpoint_policy_key)
+    state_dict = checkpoint_payload.get("policy_state_dict")
     if not isinstance(state_dict, Mapping):
-        raise KeyError(f"Checkpoint does not contain {args.checkpoint_policy_key}.")
-    policy.load_state_dict(state_dict, strict=bool(args.strict_checkpoint_load))
+        raise KeyError("Checkpoint does not contain policy_state_dict.")
+    policy.load_state_dict(state_dict, strict=True)
     return policy
 
 
 def load_critic_from_checkpoint(
-    args: argparse.Namespace,
     critic_model: PPO,
     checkpoint_payload: Mapping[str, Any],
 ) -> bool:
-    if not bool(args.load_critic):
-        return False
     state_dict = checkpoint_payload.get("critic_policy_state_dict")
     if state_dict is None:
-        raise KeyError("Checkpoint does not contain critic_policy_state_dict. Use --no-load_critic to initialize the critic randomly.")
+        raise KeyError("Checkpoint does not contain critic_policy_state_dict.")
     if not isinstance(state_dict, Mapping):
         raise TypeError("critic_policy_state_dict must be a mapping.")
-    critic_model.policy.load_state_dict(state_dict, strict=bool(args.strict_checkpoint_load))
+    critic_model.policy.load_state_dict(state_dict, strict=True)
     return True
 
 
@@ -642,7 +636,7 @@ def finetune_and_evaluate_candidate(
             env=train_env,
             learning_rate=critic_lr_schedule,
         )
-        loaded_critic = load_critic_from_checkpoint(args, critic_model, checkpoint_payload)
+        loaded_critic = load_critic_from_checkpoint(critic_model, checkpoint_payload)
 
         rollout_buffer = DynamicsRolloutBuffer(
             buffer_size=int(ppo_config.n_steps),
@@ -758,7 +752,6 @@ def finetune_and_evaluate_candidate(
             "critic_warmup_configured_timesteps": int(args.critic_warmup_timesteps),
             "critic_warmup_actual_timesteps": int(critic_warmup_actual_timesteps),
             "total_env_timesteps": int(critic_warmup_actual_timesteps + total_timesteps),
-            "checkpoint_policy_key": str(args.checkpoint_policy_key),
             "loaded_critic": bool(loaded_critic),
             "critic_warmup_metrics": critic_warmup_metrics,
             "finetune_metrics": last_metrics,
@@ -960,7 +953,6 @@ def main() -> None:
         "log": str(log_path),
         "search_space": str(output_dir / "search_space.json"),
         "supernet_checkpoint": str(args.supernet_checkpoint),
-        "checkpoint_policy_key": str(args.checkpoint_policy_key),
         "objectives": ["negative_return", "params"],
         "fitness_procedure": "load_policy_supernet_then_ppo_finetune_then_eval_return",
         "pareto_front": pareto_records,
