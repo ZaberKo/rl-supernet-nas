@@ -393,6 +393,10 @@ def collect_candidate_rollout(
     episode_starts = np.asarray(initial_episode_starts, dtype=np.bool_)
     rollout_reward_sum = 0.0
     rollout_done_count = 0
+    rollout_episode_returns: list[float] = []
+    rollout_episode_lengths: list[float] = []
+    current_rollout_returns = np.zeros(num_envs, dtype=np.float64)
+    current_rollout_lengths = np.zeros(num_envs, dtype=np.int64)
     last_dones = episode_starts
 
     with torch.no_grad():
@@ -428,21 +432,44 @@ def collect_candidate_rollout(
             )
 
             rollout_reward_sum += float(np.asarray(raw_rewards, dtype=np.float32).sum())
-            rollout_done_count += int(np.asarray(raw_dones, dtype=np.bool_).sum())
+            reward_array = np.asarray(raw_rewards, dtype=np.float64)
+            done_array = np.asarray(raw_dones, dtype=np.bool_)
+            current_rollout_returns += reward_array
+            current_rollout_lengths += 1
+            rollout_done_count += int(done_array.sum())
+            for env_index, done in enumerate(done_array):
+                if not bool(done):
+                    continue
+                episode_info = info_list[env_index].get("episode") if isinstance(info_list[env_index], Mapping) else None
+                if isinstance(episode_info, Mapping) and "r" in episode_info:
+                    episode_return = float(episode_info["r"])
+                else:
+                    episode_return = float(current_rollout_returns[env_index])
+                if isinstance(episode_info, Mapping) and "l" in episode_info:
+                    episode_length = float(episode_info["l"])
+                else:
+                    episode_length = float(current_rollout_lengths[env_index])
+                rollout_episode_returns.append(episode_return)
+                rollout_episode_lengths.append(episode_length)
+                current_rollout_returns[env_index] = 0.0
+                current_rollout_lengths[env_index] = 0
             observation = np.asarray(next_observation)
-            episode_starts = np.asarray(raw_dones, dtype=np.bool_)
+            episode_starts = done_array
             last_dones = episode_starts
 
         last_observation_tensor = torch.as_tensor(observation, device=device)
         last_values = predict_critic_values(critic_model, last_observation_tensor)
 
     rollout_buffer.compute_returns_and_advantage(last_values=last_values, dones=last_dones)
+    ep_return = float(np.mean(rollout_episode_returns)) if rollout_episode_returns else 0.0
+    ep_length = float(np.mean(rollout_episode_lengths)) if rollout_episode_lengths else 0.0
     metrics = {
-        "rollout/mean_reward_per_step": rollout_reward_sum / float(max(1, int(n_steps) * num_envs)),
+        "rollout/reward_per_step": rollout_reward_sum / float(max(1, int(n_steps) * num_envs)),
+        "rollout/ep_return": ep_return,
+        "rollout/ep_length": ep_length,
         "rollout/done_count": float(rollout_done_count),
         "rollout/advantage_mean": float(rollout_buffer.advantages.mean()),
         "rollout/advantage_std": float(rollout_buffer.advantages.std()),
-        "rollout/return_mean": float(rollout_buffer.returns.mean()),
     }
     return observation, episode_starts, metrics
 
@@ -728,7 +755,7 @@ def finetune_and_evaluate_candidate(
         eval_episodes = int(getattr(ppo_config, "eval_episodes", 0) or 0)
         if eval_episodes <= 0:
             raise ValueError("ppo.eval_episodes must be positive for search fitness evaluation.")
-        mean_return, std_return = evaluate_actor_subnet(
+        eval_metrics = evaluate_actor_subnet(
             policy=policy,
             train_env=train_env,
             eval_env=eval_env,
@@ -742,8 +769,12 @@ def finetune_and_evaluate_candidate(
         trainable_params = int(sum(parameter.numel() for parameter in policy.parameters() if parameter.requires_grad))
 
         return {
-            "return": float(mean_return),
-            "return_std": float(std_return),
+            "return": float(eval_metrics["ep_return"]),
+            "return_std": float(eval_metrics["ep_return_std"]),
+            "ep_return": float(eval_metrics["ep_return"]),
+            "ep_return_std": float(eval_metrics["ep_return_std"]),
+            "ep_length": float(eval_metrics["ep_length"]),
+            "ep_length_std": float(eval_metrics["ep_length_std"]),
             "params": active_backbone_params,
             "actor_head_params": actor_head_params,
             "policy_params": int(sum(parameter.numel() for parameter in policy.parameters())),

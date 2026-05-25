@@ -5,12 +5,13 @@ env:
   vector_env_type: subproc
   box2d_wrapper:
     frame_stack: 2
-    max_episode_steps: null
+    max_episode_steps: 500 # default 20s (50FPS)
     frame_skip: 2
     grayscale_observation: true
     normalize_observation: false
     normalize_reward: true
     normalize_clip_obs: 10.0
+    normalize_gamma: 0.99
     env_kwargs:
       continuous: true
       domain_randomize: false

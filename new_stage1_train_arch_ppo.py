@@ -164,7 +164,7 @@ def evaluate_and_record(
     total_env_timesteps: int,
     phase: str,
 ) -> dict[str, Any]:
-    mean_return, std_return = evaluate_actor_subnet(
+    eval_metrics = evaluate_actor_subnet(
         policy=policy,
         train_env=train_env,
         eval_env=eval_env,
@@ -178,8 +178,10 @@ def evaluate_and_record(
         "phase": phase,
         "total_timesteps": int(num_timesteps),
         "total_env_timesteps": int(total_env_timesteps),
-        "eval/mean_return": float(mean_return),
-        "eval/std_return": float(std_return),
+        "eval/ep_return": float(eval_metrics["ep_return"]),
+        "eval/ep_return_std": float(eval_metrics["ep_return_std"]),
+        "eval/ep_length": float(eval_metrics["ep_length"]),
+        "eval/ep_length_std": float(eval_metrics["ep_length_std"]),
     }
     log_record(metrics_path, wandb_run, record, step=int(total_env_timesteps))
     return record
@@ -348,8 +350,9 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                 progress_bar,
                 (
                     "new_stage1_arch_eval phase=initial step=0 "
-                    f"mean_return={initial_eval_record['eval/mean_return']:.6g} "
-                    f"std_return={initial_eval_record['eval/std_return']:.6g}"
+                    f"ep_return={initial_eval_record['eval/ep_return']:.6g} "
+                    f"ep_return_std={initial_eval_record['eval/ep_return_std']:.6g} "
+                    f"ep_length={initial_eval_record['eval/ep_length']:.6g}"
                 ),
             )
 
@@ -401,7 +404,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                 progress_bar.set_postfix(
                     {
                         "phase": "warmup",
-                        "ret": f"{rollout_metrics['rollout/return_mean']:.3g}",
+                        "ret": f"{rollout_metrics['rollout/ep_return']:.3g}",
                         "critic": f"{critic_metrics['critic/loss']:.3g}",
                         "lr": f"{critic_lr:.2g}",
                     },
@@ -480,7 +483,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                 progress_bar.set_postfix(
                     {
                         "phase": "train",
-                        "ret": f"{rollout_metrics['rollout/return_mean']:.3g}",
+                        "ret": f"{rollout_metrics['rollout/ep_return']:.3g}",
                         "actor": f"{actor_metrics['actor/loss']:.3g}",
                         "critic": f"{critic_metrics['critic/loss']:.3g}",
                         "lr": f"{actor_lr:.2g}",
@@ -509,8 +512,9 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                     progress_bar,
                     (
                         f"new_stage1_arch_eval phase=periodic step={actual_timesteps} "
-                        f"mean_return={eval_record['eval/mean_return']:.6g} "
-                        f"std_return={eval_record['eval/std_return']:.6g}"
+                        f"ep_return={eval_record['eval/ep_return']:.6g} "
+                        f"ep_return_std={eval_record['eval/ep_return_std']:.6g} "
+                        f"ep_length={eval_record['eval/ep_length']:.6g}"
                     ),
                 )
 
@@ -533,8 +537,9 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                 progress_bar,
                 (
                     f"new_stage1_arch_eval phase=final step={actual_timesteps} "
-                    f"mean_return={final_eval_record['eval/mean_return']:.6g} "
-                    f"std_return={final_eval_record['eval/std_return']:.6g}"
+                    f"ep_return={final_eval_record['eval/ep_return']:.6g} "
+                    f"ep_return_std={final_eval_record['eval/ep_return_std']:.6g} "
+                    f"ep_length={final_eval_record['eval/ep_length']:.6g}"
                 ),
             )
 

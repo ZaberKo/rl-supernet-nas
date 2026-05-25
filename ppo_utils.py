@@ -9,6 +9,7 @@ from typing import Any, Callable, Sequence
 
 import torch
 import torch.nn as nn
+from omegaconf import OmegaConf
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.evaluation import evaluate_policy
@@ -174,31 +175,6 @@ def resolve_activation_fn(value: str | None) -> type[nn.Module] | None:
     return activations[name]
 
 
-def mapping_to_dict(value: Any, name: str) -> dict[str, Any]:
-    if value is None:
-        return {}
-    if not hasattr(value, "items"):
-        raise TypeError(f"{name} must be a mapping.")
-    result: dict[str, Any] = {}
-    for key, item in value.items():
-        if hasattr(item, "items"):
-            result[str(key)] = mapping_to_dict(item, f"{name}.{key}")
-        else:
-            result[str(key)] = item
-    return result
-
-
-def get_env_wrapper_config(ppo_config: Any) -> tuple[str, dict[str, Any]]:
-    atari_wrapper = getattr(ppo_config, "atari_wrapper", None)
-    box2d_wrapper = getattr(ppo_config, "box2d_wrapper", None)
-    has_atari = atari_wrapper is not None
-    has_box2d = box2d_wrapper is not None
-    if has_atari == has_box2d:
-        raise ValueError("Exactly one of env.atari_wrapper or env.box2d_wrapper must be configured.")
-    if has_atari:
-        return "atari", mapping_to_dict(atari_wrapper, "env.atari_wrapper")
-    return "box2d", mapping_to_dict(box2d_wrapper, "env.box2d_wrapper")
-
 
 def parse_optional_int(value: Any) -> int | None:
     if value is None:
@@ -221,28 +197,26 @@ def make_vec_env_from_ppo_config(
     seed: int | None = None,
     n_envs: int | None = None,
 ) -> VecEnv:
-    wrapper_kind, wrapper_config = get_env_wrapper_config(ppo_config)
     common_kwargs = dict(
         env_id=ppo_config.env_id,
         n_envs=get_train_n_envs(ppo_config) if n_envs is None else n_envs,
         seed=ppo_config.seed if seed is None else seed,
         image_size=int(getattr(ppo_config, "image_size", 64)),
         vector_env_type=getattr(ppo_config, "vector_env_type", "dummy"),
-        frame_stack=int(wrapper_config.get("frame_stack", 1)),
-        max_episode_steps=parse_optional_int(wrapper_config.get("max_episode_steps", None)),
-        env_kwargs=mapping_to_dict(wrapper_config.get("env_kwargs", None), f"env.{wrapper_kind}_wrapper.env_kwargs"),
-        normalize_observation=bool(wrapper_config.get("normalize_observation", False)),
-        normalize_reward=bool(wrapper_config.get("normalize_reward", False)),
-        normalize_clip_obs=float(wrapper_config.get("normalize_clip_obs", 10.0)),
-        normalize_gamma=float(wrapper_config.get("normalize_gamma", getattr(ppo_config, "gamma", 0.99))),
     )
-    if wrapper_kind == "atari":
-        return make_atari_vec_env(**common_kwargs)
-    return make_box2d_vec_env(
-        **common_kwargs,
-        frame_skip=int(wrapper_config.get("frame_skip", 1)),
-        grayscale_observation=bool(wrapper_config.get("grayscale_observation", False)),
-    )
+
+    if getattr(ppo_config, "atari_wrapper", None) is not None:
+        return make_atari_vec_env(
+            **common_kwargs,
+            **OmegaConf.to_container(ppo_config.atari_wrapper, resolve=True),
+        )
+    elif getattr(ppo_config, "box2d_wrapper", None) is not None:
+        return make_box2d_vec_env(
+            **common_kwargs,
+            **OmegaConf.to_container(ppo_config.box2d_wrapper, resolve=True),
+        )
+    else:
+        raise ValueError("Exactly one of env.atari_wrapper or env.box2d_wrapper must be configured.")
 
 
 def get_vision_spaces_from_ppo_config(ppo_config: Any, seed: int | None = None) -> tuple[Any, Any]:

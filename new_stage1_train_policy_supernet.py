@@ -403,6 +403,10 @@ def collect_rollout(
     episode_starts = np.asarray(initial_episode_starts, dtype=np.bool_)
     rollout_reward_sum = 0.0
     rollout_done_count = 0
+    rollout_episode_returns: list[float] = []
+    rollout_episode_lengths: list[float] = []
+    current_rollout_returns = np.zeros(num_envs, dtype=np.float64)
+    current_rollout_lengths = np.zeros(num_envs, dtype=np.int64)
     last_dones = episode_starts
 
     with torch.no_grad():
@@ -445,21 +449,44 @@ def collect_rollout(
             )
 
             rollout_reward_sum += float(np.asarray(raw_rewards, dtype=np.float32).sum())
-            rollout_done_count += int(np.asarray(raw_dones, dtype=np.bool_).sum())
+            reward_array = np.asarray(raw_rewards, dtype=np.float64)
+            done_array = np.asarray(raw_dones, dtype=np.bool_)
+            current_rollout_returns += reward_array
+            current_rollout_lengths += 1
+            rollout_done_count += int(done_array.sum())
+            for env_index, done in enumerate(done_array):
+                if not bool(done):
+                    continue
+                episode_info = info_list[env_index].get("episode") if isinstance(info_list[env_index], Mapping) else None
+                if isinstance(episode_info, Mapping) and "r" in episode_info:
+                    episode_return = float(episode_info["r"])
+                else:
+                    episode_return = float(current_rollout_returns[env_index])
+                if isinstance(episode_info, Mapping) and "l" in episode_info:
+                    episode_length = float(episode_info["l"])
+                else:
+                    episode_length = float(current_rollout_lengths[env_index])
+                rollout_episode_returns.append(episode_return)
+                rollout_episode_lengths.append(episode_length)
+                current_rollout_returns[env_index] = 0.0
+                current_rollout_lengths[env_index] = 0
             observation = np.asarray(next_observation)
-            episode_starts = np.asarray(raw_dones, dtype=np.bool_)
+            episode_starts = done_array
             last_dones = episode_starts
 
         last_observation_tensor = torch.as_tensor(observation, device=device)
         last_values = predict_critic_values(critic_model, last_observation_tensor)
 
     rollout_buffer.compute_returns_and_advantage(last_values=last_values, dones=last_dones)
+    ep_return = float(np.mean(rollout_episode_returns)) if rollout_episode_returns else 0.0
+    ep_length = float(np.mean(rollout_episode_lengths)) if rollout_episode_lengths else 0.0
     metrics = {
-        "rollout/mean_reward_per_step": rollout_reward_sum / float(max(1, n_steps * num_envs)),
+        "rollout/reward_per_step": rollout_reward_sum / float(max(1, n_steps * num_envs)),
+        "rollout/ep_return": ep_return,
+        "rollout/ep_length": ep_length,
         "rollout/done_count": float(rollout_done_count),
         "rollout/advantage_mean": float(rollout_buffer.advantages.mean()),
         "rollout/advantage_std": float(rollout_buffer.advantages.std()),
-        "rollout/return_mean": float(rollout_buffer.returns.mean()),
         "rollout/dynamics_mask_mean": float(rollout_buffer.dynamics_masks.mean()),
     }
     return observation, episode_starts, metrics
@@ -573,12 +600,12 @@ def sandwich_actor_update(
 
     loss_sum = 0.0
     max_loss_sum = 0.0
-    max_policy_loss_sum = 0.0
+    policy_loss_sum = 0.0
     entropy_loss_sum = 0.0
-    max_dynamics_loss_sum = 0.0
+    max_dynamic_loss_sum = 0.0
     subnet_loss_sum = 0.0
-    policy_distill_kl_sum = 0.0
-    subnet_dynamics_loss_sum = 0.0
+    policy_distill_loss_sum = 0.0
+    subnet_dynamic_loss_sum = 0.0
     approx_kl_sum = 0.0
     clip_fraction_sum = 0.0
     update_count = 0
@@ -624,9 +651,9 @@ def sandwich_actor_update(
             )
             max_loss = policy_loss + float(ent_coef) * entropy_loss + float(beta_dyn) * max_dyn_loss
             max_loss_value = float(max_loss.detach().cpu())
-            max_policy_loss_value = float(policy_loss.detach().cpu())
+            policy_loss_value = float(policy_loss.detach().cpu())
             entropy_loss_value = float(entropy_loss.detach().cpu())
-            max_dyn_loss_value = float(max_dyn_loss.detach().cpu())
+            max_dynamic_loss_value = float(max_dyn_loss.detach().cpu())
             approx_kl = torch.mean(((ratio - 1.0) - log_ratio).detach())
             clip_fraction = torch.mean((torch.abs(ratio - 1.0) > clip_range).float().detach())
             max_loss.backward()
@@ -642,14 +669,14 @@ def sandwich_actor_update(
                 sampled_arches.append(search_space.sample_arch())
 
             subnet_loss_values = []
-            policy_distill_kl_values = []
+            policy_distill_loss_values = []
             subnet_dyn_loss_values = []
             subnet_scale = 1.0 / float(len(sampled_arches))
             for arch in sampled_arches:
                 policy.set_active_arch(arch)
                 subnet_features = policy.encode(batch_observations)
                 student_params = policy.distribution_params_from_features(subnet_features)
-                policy_distill_kl_loss = policy_kl_distillation_loss(
+                policy_distill_loss = policy_kl_distillation_loss(
                     action_space=action_space,
                     teacher_params=teacher_params,
                     student_params=student_params,
@@ -665,9 +692,9 @@ def sandwich_actor_update(
                     action_space=action_space,
                     sample_weights=rollout_data.dynamics_masks,
                 )
-                subnet_loss = policy_distill_kl_loss + float(beta_dyn) * subnet_dyn_loss
+                subnet_loss = policy_distill_loss + float(beta_dyn) * subnet_dyn_loss
                 subnet_loss_values.append(float(subnet_loss.detach().cpu()))
-                policy_distill_kl_values.append(float(policy_distill_kl_loss.detach().cpu()))
+                policy_distill_loss_values.append(float(policy_distill_loss.detach().cpu()))
                 subnet_dyn_loss_values.append(float(subnet_dyn_loss.detach().cpu()))
                 (subnet_loss * subnet_scale).backward()
 
@@ -676,17 +703,17 @@ def sandwich_actor_update(
             actor_optimizer.step()
 
             subnet_loss_value = float(np.mean(subnet_loss_values))
-            policy_distill_kl_value = float(np.mean(policy_distill_kl_values))
-            subnet_dyn_loss_value = float(np.mean(subnet_dyn_loss_values))
+            policy_distill_loss_value = float(np.mean(policy_distill_loss_values))
+            subnet_dynamic_loss_value = float(np.mean(subnet_dyn_loss_values))
             update_count += 1
             loss_sum += max_loss_value + subnet_loss_value
             max_loss_sum += max_loss_value
-            max_policy_loss_sum += max_policy_loss_value
+            policy_loss_sum += policy_loss_value
             entropy_loss_sum += entropy_loss_value
-            max_dynamics_loss_sum += max_dyn_loss_value
+            max_dynamic_loss_sum += max_dynamic_loss_value
             subnet_loss_sum += subnet_loss_value
-            policy_distill_kl_sum += policy_distill_kl_value
-            subnet_dynamics_loss_sum += subnet_dyn_loss_value
+            policy_distill_loss_sum += policy_distill_loss_value
+            subnet_dynamic_loss_sum += subnet_dynamic_loss_value
             approx_kl_sum += float(approx_kl.cpu())
             clip_fraction_sum += float(clip_fraction.cpu())
 
@@ -698,12 +725,12 @@ def sandwich_actor_update(
     return {
         "actor/loss": loss_sum / denominator,
         "actor/max_loss": max_loss_sum / denominator,
-        "actor/max_policy_loss": max_policy_loss_sum / denominator,
+        "actor/policy_loss": policy_loss_sum / denominator,
         "actor/entropy_loss": entropy_loss_sum / denominator,
-        "actor/max_dynamics_loss": max_dynamics_loss_sum / denominator,
+        "actor/max_dynamic_loss": max_dynamic_loss_sum / denominator,
         "actor/subnet_loss": subnet_loss_sum / denominator,
-        "actor/policy_distill_kl": policy_distill_kl_sum / denominator,
-        "actor/subnet_dynamics_loss": subnet_dynamics_loss_sum / denominator,
+        "actor/policy_distill_loss": policy_distill_loss_sum / denominator,
+        "actor/subnet_dynamic_loss": subnet_dynamic_loss_sum / denominator,
         "actor/approx_kl": approx_kl_sum / denominator,
         "actor/clip_fraction": clip_fraction_sum / denominator,
     }
@@ -745,7 +772,7 @@ def evaluate_actor_subnet(
     n_eval_episodes: int,
     deterministic: bool,
     device: torch.device,
-) -> tuple[float, float]:
+) -> dict[str, float]:
     sync_envs_normalization(train_env, eval_env)
     eval_vec_normalize = unwrap_vec_normalize(eval_env)
     if eval_vec_normalize is not None:
@@ -756,7 +783,9 @@ def evaluate_actor_subnet(
     policy.set_active_arch(arch)
     observations = eval_env.reset()
     current_returns = np.zeros(eval_env.num_envs, dtype=np.float64)
+    current_lengths = np.zeros(eval_env.num_envs, dtype=np.int64)
     episode_returns: list[float] = []
+    episode_lengths: list[float] = []
     with torch.no_grad():
         while len(episode_returns) < n_eval_episodes:
             observation_tensor = torch.as_tensor(observations, device=device)
@@ -769,6 +798,7 @@ def evaluate_actor_subnet(
                 env_actions = np.clip(env_actions, eval_env.action_space.low, eval_env.action_space.high)
             observations, rewards, dones, infos = eval_env.step(env_actions)
             current_returns += np.asarray(rewards, dtype=np.float64)
+            current_lengths += 1
             for env_index, done in enumerate(dones):
                 if not bool(done):
                     continue
@@ -777,12 +807,23 @@ def evaluate_actor_subnet(
                     episode_return = float(episode_info["r"])
                 else:
                     episode_return = float(current_returns[env_index])
+                if isinstance(episode_info, Mapping) and "l" in episode_info:
+                    episode_length = float(episode_info["l"])
+                else:
+                    episode_length = float(current_lengths[env_index])
                 episode_returns.append(episode_return)
+                episode_lengths.append(episode_length)
                 current_returns[env_index] = 0.0
+                current_lengths[env_index] = 0
                 if len(episode_returns) >= n_eval_episodes:
                     break
 
-    return float(np.mean(episode_returns)), float(np.std(episode_returns))
+    return {
+        "ep_return": float(np.mean(episode_returns)),
+        "ep_return_std": float(np.std(episode_returns)),
+        "ep_length": float(np.mean(episode_lengths)),
+        "ep_length_std": float(np.std(episode_lengths)),
+    }
 
 
 def save_supernet_checkpoint(
@@ -902,7 +943,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
         total_timesteps = 0
         iteration = 0
         next_eval_timestep = min(eval_freq, total_timesteps_target)
-        best_eval_max_subnet_mean_return: float | None = None
+        best_eval_max_subnet_ep_return: float | None = None
         final_eval_record: dict[str, Any] = {}
         best_eval_record: dict[str, Any] = {}
 
@@ -983,7 +1024,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             if total_timesteps >= next_eval_timestep:
                 while next_eval_timestep <= total_timesteps:
                     next_eval_timestep += eval_freq
-                max_subnet_mean_return, max_subnet_std_return = evaluate_actor_subnet(
+                max_subnet_eval = evaluate_actor_subnet(
                     policy=policy,
                     train_env=train_env,
                     eval_env=eval_env,
@@ -992,7 +1033,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                     deterministic=bool(ppo_config.eval_deterministic),
                     device=device,
                 )
-                min_subnet_mean_return, min_subnet_std_return = evaluate_actor_subnet(
+                min_subnet_eval = evaluate_actor_subnet(
                     policy=policy,
                     train_env=train_env,
                     eval_env=eval_env,
@@ -1002,20 +1043,24 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                     device=device,
                 )
                 is_best_max_subnet = (
-                    best_eval_max_subnet_mean_return is None
-                    or max_subnet_mean_return > best_eval_max_subnet_mean_return
+                    best_eval_max_subnet_ep_return is None
+                    or max_subnet_eval["ep_return"] > best_eval_max_subnet_ep_return
                 )
                 if is_best_max_subnet:
-                    best_eval_max_subnet_mean_return = float(max_subnet_mean_return)
+                    best_eval_max_subnet_ep_return = float(max_subnet_eval["ep_return"])
                 eval_record = {
                     "type": "eval",
                     "iteration": int(iteration),
                     "total_timesteps": int(total_timesteps),
-                    "eval/max_subnet_mean_return": float(max_subnet_mean_return),
-                    "eval/max_subnet_std_return": float(max_subnet_std_return),
-                    "eval/min_subnet_mean_return": float(min_subnet_mean_return),
-                    "eval/min_subnet_std_return": float(min_subnet_std_return),
-                    "eval/best_max_subnet_mean_return": float(best_eval_max_subnet_mean_return),
+                    "eval/max_subnet_ep_return": float(max_subnet_eval["ep_return"]),
+                    "eval/max_subnet_ep_return_std": float(max_subnet_eval["ep_return_std"]),
+                    "eval/max_subnet_ep_length": float(max_subnet_eval["ep_length"]),
+                    "eval/max_subnet_ep_length_std": float(max_subnet_eval["ep_length_std"]),
+                    "eval/min_subnet_ep_return": float(min_subnet_eval["ep_return"]),
+                    "eval/min_subnet_ep_return_std": float(min_subnet_eval["ep_return_std"]),
+                    "eval/min_subnet_ep_length": float(min_subnet_eval["ep_length"]),
+                    "eval/min_subnet_ep_length_std": float(min_subnet_eval["ep_length_std"]),
+                    "eval/best_max_subnet_ep_return": float(best_eval_max_subnet_ep_return),
                     "eval/is_best_max_subnet": bool(is_best_max_subnet),
                 }
                 final_eval_record = dict(eval_record)
@@ -1028,8 +1073,8 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                 progress_bar.write(
                     (
                         f"new_stage1_eval step={total_timesteps} "
-                        f"max_subnet_mean_return={max_subnet_mean_return:.6g} "
-                        f"min_subnet_mean_return={min_subnet_mean_return:.6g} "
+                        f"max_subnet_ep_return={max_subnet_eval['ep_return']:.6g} "
+                        f"min_subnet_ep_return={min_subnet_eval['ep_return']:.6g} "
                         f"is_best_max_subnet={is_best_max_subnet}"
                     )
                 )
@@ -1070,10 +1115,10 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             )
             progress_bar.set_postfix(
                 {
-                    "ret": f"{rollout_metrics['rollout/return_mean']:.3g}",
+                    "ret": f"{rollout_metrics['rollout/ep_return']:.3g}",
                     "actor": f"{actor_metrics['actor/loss']:.3g}",
-                    "distill_kl": f"{actor_metrics['actor/policy_distill_kl']:.3g}",
-                    "dyn": f"{actor_metrics['actor/subnet_dynamics_loss']:.3g}",
+                    "distill": f"{actor_metrics['actor/policy_distill_loss']:.3g}",
+                    "dyn": f"{actor_metrics['actor/subnet_dynamic_loss']:.3g}",
                     "critic": f"{critic_metrics['critic/loss']:.3g}",
                     "lr": f"{actor_lr:.2g}",
                 },
@@ -1104,7 +1149,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             "configured_total_timesteps": int(total_timesteps_target),
             "max_arch": search_space.max_arch().to_dict(),
             "min_arch": search_space.min_arch().to_dict(),
-            "best_eval_max_subnet_mean_return": best_eval_max_subnet_mean_return,
+            "best_eval_max_subnet_ep_return": best_eval_max_subnet_ep_return,
             "best_eval": best_eval_record,
             "last_eval": final_eval_record,
             "checkpoint_fields": [

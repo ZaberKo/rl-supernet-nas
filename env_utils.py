@@ -105,27 +105,54 @@ def is_atari_env(env_id: str) -> bool:
     return env_id.startswith("ALE/") or env_id.endswith("NoFrameskip-v4")
 
 
+def apply_time_limit(env: gym.Env, max_episode_steps: int | None) -> gym.Env:
+    if max_episode_steps is None:
+        return env
+    max_steps = int(max_episode_steps)
+    if max_steps <= 0:
+        return env
+    return gym.wrappers.TimeLimit(env, max_episode_steps=max_steps)
+
+
+def remove_outer_time_limit(env: gym.Env) -> gym.Env:
+    if isinstance(env, gym.wrappers.TimeLimit):
+        return env.env
+    return env
+
+
 def make_single_atari_env(
     env_id: str,
     seed: int,
     image_size: int = 84,
     max_episode_steps: int | None = None,
     env_kwargs: dict[str, Any] | None = None,
+    noop_max: int = 30,
+    frame_skip: int = 4,
+    terminal_on_life_loss: bool = True,
+    clip_reward: bool = True,
+    action_repeat_probability: float = 0.0,
 ) -> Callable[[], gym.Env]:
     def _init() -> gym.Env:
         if not is_atari_env(env_id):
             raise ValueError("The Atari wrapper requires an Atari environment.")
         kwargs: dict[str, Any] = dict(env_kwargs or {})
-        if max_episode_steps is not None:
-            max_steps = int(max_episode_steps)
-            kwargs["max_episode_steps"] = max_steps if max_steps > 0 else -1
         kwargs["frameskip"] = 1
         kwargs["repeat_action_probability"] = 0.0
         env = gym.make(env_id, **kwargs)
+        env = remove_outer_time_limit(env)
         screen_size = int(image_size)
         if screen_size <= 0:
             raise ValueError("image_size must be positive for Atari environments.")
-        env = AtariWrapper(env, screen_size=screen_size)
+        env = AtariWrapper(
+            env,
+            noop_max=int(noop_max),
+            frame_skip=int(frame_skip),
+            screen_size=screen_size,
+            terminal_on_life_loss=bool(terminal_on_life_loss),
+            clip_reward=bool(clip_reward),
+            action_repeat_probability=float(action_repeat_probability),
+        )
+        env = apply_time_limit(env, max_episode_steps)
         env.reset(seed=seed)
         return env
 
@@ -143,16 +170,15 @@ def make_single_box2d_env(
 ) -> Callable[[], gym.Env]:
     def _init() -> gym.Env:
         kwargs: dict[str, Any] = dict(env_kwargs or {})
-        if max_episode_steps is not None:
-            max_steps = int(max_episode_steps)
-            kwargs["max_episode_steps"] = max_steps if max_steps > 0 else -1
         env = gym.make(env_id, **kwargs)
+        env = remove_outer_time_limit(env)
         if frame_skip > 1:
             env = FrameSkipWrapper(env, skip=frame_skip)
         if grayscale_observation:
             env = GrayscaleImageObservation(env)
         if image_size > 0 and env.observation_space.shape[:2] != (image_size, image_size):
             env = ResizeImageObservation(env, image_size=image_size)
+        env = apply_time_limit(env, max_episode_steps)
         env.reset(seed=seed)
         return env
 
@@ -208,6 +234,11 @@ def make_atari_vec_env(
     frame_stack: int = 1,
     max_episode_steps: int | None = None,
     env_kwargs: dict[str, Any] | None = None,
+    noop_max: int = 30,
+    frame_skip: int = 4,
+    terminal_on_life_loss: bool = True,
+    clip_reward: bool = True,
+    action_repeat_probability: float = 0.0,
     normalize_observation: bool = False,
     normalize_reward: bool = False,
     normalize_clip_obs: float = 10.0,
@@ -220,6 +251,11 @@ def make_atari_vec_env(
             image_size=image_size,
             max_episode_steps=max_episode_steps,
             env_kwargs=env_kwargs,
+            noop_max=noop_max,
+            frame_skip=frame_skip,
+            terminal_on_life_loss=terminal_on_life_loss,
+            clip_reward=clip_reward,
+            action_repeat_probability=action_repeat_probability,
         )
         for rank in range(n_envs)
     ]

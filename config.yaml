@@ -4,10 +4,17 @@ env:
   image_size: 84
   vector_env_type: subproc
   atari_wrapper:
+    noop_max: 30
+    frame_skip: 4
     frame_stack: 4
-    max_episode_steps: 10800
+    terminal_on_life_loss: true
+    clip_reward: true
+    action_repeat_probability: 0.0
+    max_episode_steps: 2700 # 3 min
     normalize_observation: false
     normalize_reward: false
+    normalize_clip_obs: 10.0
+    normalize_gamma: 0.99
 
 ppo:
   train_n_envs: 8
