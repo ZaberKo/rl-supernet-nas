@@ -23,8 +23,6 @@ from tqdm.auto import tqdm
 from config_utils import add_ppo_config_args, build_run_config, load_ppo_config, ppo_config_to_dict
 from ppo_utils import (
     append_jsonl_record,
-    get_eval_n_envs,
-    get_train_n_envs,
     make_vec_env_from_ppo_config,
     parse_hidden_sizes,
     parse_optional_float,
@@ -40,7 +38,8 @@ from representation_losses import (
 )
 from supernet_backbone import ArchConfig, SearchSpace, SupernetCNNBackbone, infer_input_channels
 from trajectory_data import resolve_terminal_next_observations, split_done_flags
-from wandb_utils import finish_wandb_run, init_wandb_run, log_wandb, log_wandb_artifact
+from env_utils import EVAL_SEED_OFFSET
+from wandb_utils import finish_wandb_run, init_wandb_run, log_wandb
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,11 +51,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", default="runs/new_stage1_policy_supernet", help="Directory for checkpoints, metrics, and manifest.")
     parser.add_argument("--random_subnets", type=int, default=2, help="Number of random subnets distilled per PPO iteration, in addition to the min subnet.")
     parser.add_argument("--distill_temperature", type=float, default=1.0, help="Temperature for discrete policy KL distillation.")
-    parser.add_argument("--beta_dyn", type=float, default=0.01, help="Weight for the latent dynamics auxiliary loss.")
-    parser.add_argument("--ema_tau", type=float, default=0.99, help="EMA teacher update coefficient.")
-    parser.add_argument("--projection_dim", type=int, default=128, help="Latent projection dimension for the dynamics branch.")
-    parser.add_argument("--predictor_hidden_dim", type=int, default=512, help="Hidden dimension for the action-conditioned dynamics predictor.")
-    parser.add_argument("--critic_learning_rate", default="", help="Critic learning rate schedule. Empty reuses ppo.learning_rate.")
     return parser.parse_args()
 
 
@@ -232,41 +226,41 @@ def build_sb3_critic_model(
     learning_rate: Any,
 ) -> PPO:
     policy_kwargs: dict[str, Any] = {
-        "net_arch": {"pi": [], "vf": list(parse_hidden_sizes(getattr(ppo_config, "value_net_arch", ())))},
-        "features_extractor_kwargs": {"features_dim": int(ppo_config.features_dim)},
+        "net_arch": {"pi": [], "vf": list(parse_hidden_sizes(ppo_config.value_net_arch))},
+        "features_extractor_kwargs": {"features_dim": ppo_config.features_dim},
     }
-    activation_fn = resolve_activation_fn(getattr(ppo_config, "activation_fn", None))
+    activation_fn = resolve_activation_fn(ppo_config.activation_fn)
     if activation_fn is not None:
         policy_kwargs["activation_fn"] = activation_fn
-    if getattr(ppo_config, "ortho_init", None) is not None:
-        policy_kwargs["ortho_init"] = bool(ppo_config.ortho_init)
-    log_std_init = parse_optional_float(getattr(ppo_config, "log_std_init", None))
+    if ppo_config.ortho_init is not None:
+        policy_kwargs["ortho_init"] = ppo_config.ortho_init
+    log_std_init = parse_optional_float(ppo_config.log_std_init)
     if log_std_init is not None:
-        policy_kwargs["log_std_init"] = float(log_std_init)
+        policy_kwargs["log_std_init"] = log_std_init
 
     return PPO(
         "CnnPolicy",
         env,
         learning_rate=learning_rate,
-        n_steps=int(ppo_config.n_steps),
-        batch_size=int(ppo_config.batch_size),
-        n_epochs=int(ppo_config.n_epochs),
-        gamma=float(ppo_config.gamma),
-        gae_lambda=float(ppo_config.gae_lambda),
-        clip_range=parse_schedule_value(getattr(ppo_config, "clip_range")),
-        normalize_advantage=bool(ppo_config.normalize_advantage),
-        ent_coef=float(ppo_config.ent_coef),
-        vf_coef=float(ppo_config.vf_coef),
-        max_grad_norm=float(ppo_config.max_grad_norm),
-        target_kl=parse_optional_float(getattr(ppo_config, "target_kl", None)),
-        stats_window_size=int(ppo_config.stats_window_size),
-        tensorboard_log=getattr(ppo_config, "tensorboard_log", None),
+        n_steps=ppo_config.n_steps,
+        batch_size=ppo_config.batch_size,
+        n_epochs=ppo_config.n_epochs,
+        gamma=ppo_config.gamma,
+        gae_lambda=ppo_config.gae_lambda,
+        clip_range=parse_schedule_value(ppo_config.clip_range),
+        normalize_advantage=ppo_config.normalize_advantage,
+        ent_coef=ppo_config.ent_coef,
+        vf_coef=ppo_config.vf_coef,
+        max_grad_norm=ppo_config.max_grad_norm,
+        target_kl=parse_optional_float(ppo_config.target_kl),
+        stats_window_size=ppo_config.stats_window_size,
+        tensorboard_log=ppo_config.tensorboard_log,
         policy_kwargs=policy_kwargs,
-        use_sde=bool(getattr(ppo_config, "use_sde", False)) and isinstance(env.action_space, spaces.Box),
-        sde_sample_freq=int(getattr(ppo_config, "sde_sample_freq", -1)),
-        seed=int(ppo_config.seed),
+        use_sde=ppo_config.use_sde and isinstance(env.action_space, spaces.Box),
+        sde_sample_freq=ppo_config.sde_sample_freq,
+        seed=ppo_config.seed,
         device=str(ppo_config.device),
-        verbose=0 if bool(ppo_config.quiet) else 1,
+        verbose=0 if ppo_config.quiet else 1,
     )
 
 
@@ -882,19 +876,16 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
     search_space_path.write_text(json.dumps(search_space.to_dict(), indent=2))
 
     total_timesteps_target = int(ppo_config.total_timesteps)
-    actor_lr_schedule = parse_schedule_value(getattr(ppo_config, "learning_rate"))
-    critic_lr_schedule = parse_schedule_value(args.critic_learning_rate or getattr(ppo_config, "learning_rate"))
-    clip_range_schedule = parse_schedule_value(getattr(ppo_config, "clip_range"))
     eval_freq = int(ppo_config.eval_freq)
     eval_episodes = int(ppo_config.eval_episodes)
     if eval_freq <= 0 or eval_episodes <= 0:
         raise ValueError("new_stage1 requires positive ppo.eval_freq and ppo.eval_episodes.")
 
-    train_env = make_vec_env_from_ppo_config(ppo_config, seed=int(ppo_config.seed), n_envs=get_train_n_envs(ppo_config))
+    train_env = make_vec_env_from_ppo_config(ppo_config, seed=int(ppo_config.seed), n_envs=ppo_config.train_n_envs)
     eval_env = make_vec_env_from_ppo_config(
         ppo_config,
-        seed=int(ppo_config.seed) + 50,
-        n_envs=get_eval_n_envs(ppo_config),
+        seed=int(ppo_config.seed) + EVAL_SEED_OFFSET,
+        n_envs=ppo_config.eval_n_envs,
     )
     progress_bar = None
     try:
@@ -902,40 +893,54 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             observation_space=train_env.observation_space,
             action_space=train_env.action_space,
             search_space=search_space,
-            features_dim=int(ppo_config.features_dim),
-            policy_net_arch=parse_hidden_sizes(getattr(ppo_config, "policy_net_arch", ())),
-            activation_fn=resolve_activation_fn(getattr(ppo_config, "activation_fn", None)),
-            log_std_init=parse_optional_float(getattr(ppo_config, "log_std_init", None)),
-            ortho_init=bool(getattr(ppo_config, "ortho_init", False)),
-            projection_dim=int(args.projection_dim),
-            predictor_hidden_dim=int(args.predictor_hidden_dim),
+            features_dim=ppo_config.features_dim,
+            policy_net_arch=parse_hidden_sizes(ppo_config.policy_net_arch),
+            activation_fn=resolve_activation_fn(ppo_config.activation_fn),
+            log_std_init=parse_optional_float(ppo_config.log_std_init),
+            ortho_init=ppo_config.ortho_init,
+            projection_dim=ppo_config.projection_dim,
+            predictor_hidden_dim=ppo_config.predictor_hidden_dim,
         ).to(device)
-        ema_policy = copy.deepcopy(policy).to(device)
-        for parameter in ema_policy.parameters():
-            parameter.requires_grad_(False)
+        if ppo_config.beta_dyn > 0.0:
+            ema_policy = copy.deepcopy(policy).to(device)
+            for parameter in ema_policy.parameters():
+                parameter.requires_grad_(False)
+        else:
+            ema_policy = policy
+        critic_lr_schedule = parse_schedule_value(ppo_config.critic_lr)
+        policy_head_lr_schedule = parse_schedule_value(ppo_config.policy_head_lr)
+        policy_backbone_lr_schedule = parse_schedule_value(ppo_config.policy_backbone_lr)
+        clip_range_schedule = parse_schedule_value(ppo_config.clip_range)
+
         critic_model = build_sb3_critic_model(
             ppo_config=ppo_config,
             env=train_env,
             learning_rate=critic_lr_schedule,
         )
 
-        initial_actor_lr = float(actor_lr_schedule(1.0)) if callable(actor_lr_schedule) else float(actor_lr_schedule)
+        initial_head_lr = float(policy_head_lr_schedule(1.0)) if callable(policy_head_lr_schedule) else float(policy_head_lr_schedule)
+        initial_backbone_lr = float(policy_backbone_lr_schedule(1.0)) if callable(policy_backbone_lr_schedule) else float(policy_backbone_lr_schedule)
+
+        backbone_params = list(policy.backbone.parameters())
+        head_params = [p for n, p in policy.named_parameters() if not n.startswith("backbone.")]
         actor_optimizer = torch.optim.Adam(
-            policy.parameters(),
-            lr=initial_actor_lr,
+            [
+                {"params": backbone_params, "lr": initial_backbone_lr, "group_name": "backbone"},
+                {"params": head_params, "lr": initial_head_lr, "group_name": "head"},
+            ],
             betas=(0.9, 0.999),
             eps=1e-5,
             weight_decay=0.0,
         )
         critic_optimizer = critic_model.policy.optimizer
         rollout_buffer = DynamicsRolloutBuffer(
-            buffer_size=int(ppo_config.n_steps),
+            buffer_size=ppo_config.n_steps,
             observation_space=train_env.observation_space,
             action_space=train_env.action_space,
             device=device,
-            gae_lambda=float(ppo_config.gae_lambda),
-            gamma=float(ppo_config.gamma),
-            n_envs=int(train_env.num_envs),
+            gae_lambda=ppo_config.gae_lambda,
+            gamma=ppo_config.gamma,
+            n_envs=train_env.num_envs,
         )
 
         observation = train_env.reset()
@@ -956,25 +961,29 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                 "action_space": type(train_env.action_space).__name__,
                 "observation_shape": list(train_env.observation_space.shape),
                 "dynamics_loss": "normalized_cosine_distance",
-                "actor_use_sde_ignored": bool(getattr(ppo_config, "use_sde", False)),
+                "actor_use_sde_ignored": ppo_config.use_sde,
             },
         )
         progress_bar = tqdm(
-            total=total_timesteps_target,
-            desc="new_stage1_train",
+            total=ppo_config.total_timesteps,
+            desc="new_stage1_policy_supernet",
             unit="step",
             dynamic_ncols=True,
-            disable=bool(ppo_config.quiet),
+            disable=ppo_config.quiet,
         )
 
         while total_timesteps < total_timesteps_target:
             iteration += 1
             progress_remaining = 1.0 - float(total_timesteps) / float(max(1, total_timesteps_target))
-            actor_lr = float(actor_lr_schedule(progress_remaining)) if callable(actor_lr_schedule) else float(actor_lr_schedule)
+            actor_lr = float(policy_head_lr_schedule(progress_remaining)) if callable(policy_head_lr_schedule) else float(policy_head_lr_schedule)
+            backbone_lr = float(policy_backbone_lr_schedule(progress_remaining)) if callable(policy_backbone_lr_schedule) else float(policy_backbone_lr_schedule)
             critic_lr = float(critic_lr_schedule(progress_remaining)) if callable(critic_lr_schedule) else float(critic_lr_schedule)
             clip_range = float(clip_range_schedule(progress_remaining)) if callable(clip_range_schedule) else float(clip_range_schedule)
             for param_group in actor_optimizer.param_groups:
-                param_group["lr"] = actor_lr
+                if param_group.get("group_name") == "backbone":
+                    param_group["lr"] = backbone_lr
+                else:
+                    param_group["lr"] = actor_lr
             for param_group in critic_optimizer.param_groups:
                 param_group["lr"] = critic_lr
 
@@ -1000,25 +1009,26 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                 rollout_buffer=rollout_buffer,
                 search_space=search_space,
                 action_space=train_env.action_space,
-                n_epochs=int(ppo_config.n_epochs),
-                batch_size=int(ppo_config.batch_size),
+                n_epochs=ppo_config.n_epochs,
+                batch_size=ppo_config.batch_size,
                 clip_range=clip_range,
-                normalize_advantage=bool(ppo_config.normalize_advantage),
-                ent_coef=float(ppo_config.ent_coef),
-                max_grad_norm=float(ppo_config.max_grad_norm),
-                beta_dyn=float(args.beta_dyn),
-                target_kl=parse_optional_float(getattr(ppo_config, "target_kl", None)),
-                random_subnets=int(args.random_subnets),
-                temperature=float(args.distill_temperature),
+                normalize_advantage=ppo_config.normalize_advantage,
+                ent_coef=ppo_config.ent_coef,
+                max_grad_norm=ppo_config.max_grad_norm,
+                beta_dyn=ppo_config.beta_dyn,
+                target_kl=parse_optional_float(ppo_config.target_kl),
+                random_subnets=args.random_subnets,
+                temperature=args.distill_temperature,
             )
-            update_ema_model(ema_policy, policy, tau=float(args.ema_tau))
+            if ppo_config.beta_dyn > 0.0:
+                update_ema_model(ema_policy, policy, tau=ppo_config.ema_tau)
             critic_metrics = critic_update(
                 critic_model=critic_model,
                 optimizer=critic_optimizer,
                 rollout_buffer=rollout_buffer,
-                n_epochs=int(ppo_config.n_epochs),
-                batch_size=int(ppo_config.batch_size),
-                max_grad_norm=float(ppo_config.max_grad_norm),
+                n_epochs=ppo_config.n_epochs,
+                batch_size=ppo_config.batch_size,
+                max_grad_norm=ppo_config.max_grad_norm,
             )
 
             if total_timesteps >= next_eval_timestep:
@@ -1167,7 +1177,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                 "latent_dynamics_loss": "normalized_cosine_distance",
                 "latent_dynamics_transition": "residual_delta",
                 "latent_target": "ema_same_active_subnet",
-                "sde": "ignored_diag_gaussian_used" if bool(getattr(ppo_config, "use_sde", False)) else "not_requested",
+                "sde": "ignored_diag_gaussian_used" if ppo_config.use_sde else "not_requested",
             },
             "args": vars(args),
             "ppo_config": ppo_config_to_dict(ppo_config),
@@ -1175,13 +1185,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
         manifest_path = output_dir / "manifest.json"
         manifest_path.write_text(json.dumps(manifest, indent=2))
 
-        artifact_paths = [last_checkpoint_path, best_checkpoint_path, metrics_path, search_space_path, manifest_path]
-        log_wandb_artifact(
-            wandb_run,
-            name=f"new-stage1-policy-{output_dir.name}",
-            artifact_type="new-stage1-output",
-            paths=artifact_paths,
-        )
+
         finish_wandb_run(wandb_run)
         return manifest
     finally:

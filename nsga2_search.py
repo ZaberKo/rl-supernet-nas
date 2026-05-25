@@ -14,6 +14,7 @@ from omegaconf import DictConfig, OmegaConf
 from config_utils import ppo_config_to_dict
 from ea_codec import GeneCodec
 from ppo_utils import finetune_and_evaluate_arch
+from env_utils import EVAL_SEED_OFFSET
 from supernet_backbone import ArchConfig
 
 
@@ -167,7 +168,7 @@ class RLSubnetProblem(Problem):
             + self.eval_call_index * int(self.args_dict["eval_call_seed_stride"])
             + candidate_index * int(self.args_dict["candidate_seed_stride"])
         )
-        eval_seed = train_seed + int(self.args_dict["eval_seed_offset"])
+        eval_seed = int(self.ppo_config_dict["seed"]) + EVAL_SEED_OFFSET
         return SubnetEvalConfig(
             args=self.args_dict,
             ppo_config=self.ppo_config_dict,

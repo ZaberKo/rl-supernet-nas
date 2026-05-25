@@ -184,13 +184,6 @@ def parse_optional_int(value: Any) -> int | None:
     return int(value)
 
 
-def get_train_n_envs(ppo_config: Any) -> int:
-    return int(getattr(ppo_config, "train_n_envs", 1))
-
-
-def get_eval_n_envs(ppo_config: Any) -> int:
-    return int(getattr(ppo_config, "eval_n_envs", 1))
-
 
 def make_vec_env_from_ppo_config(
     ppo_config: Any,
@@ -199,10 +192,10 @@ def make_vec_env_from_ppo_config(
 ) -> VecEnv:
     common_kwargs = dict(
         env_id=ppo_config.env_id,
-        n_envs=get_train_n_envs(ppo_config) if n_envs is None else n_envs,
+        n_envs=ppo_config.train_n_envs if n_envs is None else n_envs,
         seed=ppo_config.seed if seed is None else seed,
-        image_size=int(getattr(ppo_config, "image_size", 64)),
-        vector_env_type=getattr(ppo_config, "vector_env_type", "dummy"),
+        image_size=ppo_config.image_size,
+        vector_env_type=ppo_config.vector_env_type,
     )
 
     if getattr(ppo_config, "atari_wrapper", None) is not None:
@@ -280,13 +273,13 @@ def learn_ppo(
     model: PPO,
     total_timesteps: int,
     callback: BaseCallback | None = None,
-    progress_bar: bool = False,
+    run_id: str | None = None,
 ) -> None:
     if total_timesteps > 0:
         model.learn(
             total_timesteps=total_timesteps,
             callback=callback,
-            progress_bar=progress_bar,
+            reset_num_timesteps=False,
         )
 
 
@@ -326,8 +319,8 @@ def finetune_and_evaluate_arch(
     train_seed: int,
     eval_seed: int,
 ) -> tuple[PPO, float, float]:
-    train_env = make_vec_env_from_ppo_config(ppo_config, seed=train_seed, n_envs=get_train_n_envs(ppo_config))
-    eval_env = make_vec_env_from_ppo_config(ppo_config, seed=eval_seed, n_envs=get_eval_n_envs(ppo_config))
+    train_env = make_vec_env_from_ppo_config(ppo_config, seed=train_seed, n_envs=ppo_config.train_n_envs)
+    eval_env = make_vec_env_from_ppo_config(ppo_config, seed=eval_seed, n_envs=ppo_config.eval_n_envs)
     try:
         checkpoint_path = args.supernet_checkpoint if Path(args.supernet_checkpoint).exists() else None
         model = build_ppo_model_from_config(
@@ -346,7 +339,7 @@ def finetune_and_evaluate_arch(
         learn_ppo(
             model,
             total_timesteps=args.candidate_timesteps,
-            progress_bar=ppo_config.progress_bar,
+            run_id=f"finetune_{train_seed}",
         )
         mean_reward, std_reward = evaluate_ppo_model(
             model,

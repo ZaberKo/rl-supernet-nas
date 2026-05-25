@@ -15,6 +15,8 @@ from stable_baselines3.common.atari_wrappers import AtariWrapper
 from stable_baselines3.common.preprocessing import is_image_space_channels_first
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecEnv, VecFrameStack, VecMonitor, VecNormalize, VecTransposeImage
 
+EVAL_SEED_OFFSET = 42
+
 
 class FrameSkipWrapper(gym.Wrapper):
     def __init__(self, env: gym.Env, skip: int):

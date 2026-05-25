@@ -185,14 +185,14 @@ def save_policy_backbone(
     search_space: SearchSpace,
     extra: dict[str, Any] | None = None,
 ) -> None:
-    payload: dict[str, Any] = {
+    state_dict: dict[str, Any] = {
         "backbone_state_dict": policy.features_extractor.backbone.state_dict(),
         "search_space": search_space.to_dict(),
         "active_arch": policy.features_extractor.backbone.active_arch.to_dict(),
     }
     if extra:
-        payload.update(extra)
-    torch.save(payload, Path(path))
+        state_dict.update(extra)
+    torch.save(state_dict, Path(path))
 
 
 def save_ppo_supernet_checkpoint(
@@ -202,7 +202,7 @@ def save_ppo_supernet_checkpoint(
     extra: dict[str, Any] | None = None,
 ) -> None:
     policy = model.policy
-    payload: dict[str, Any] = {
+    state_dict: dict[str, Any] = {
         "policy_state_dict": policy.state_dict(),
         "search_space": search_space.to_dict(),
         "active_arch": policy.features_extractor.backbone.active_arch.to_dict(),
@@ -211,5 +211,5 @@ def save_ppo_supernet_checkpoint(
         "num_timesteps": int(model.num_timesteps),
     }
     if extra:
-        payload.update(extra)
-    torch.save(payload, Path(path))
+        state_dict.update(extra)
+    torch.save(state_dict, Path(path))

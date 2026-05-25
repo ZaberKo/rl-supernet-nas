@@ -18,14 +18,19 @@ env:
 
 ppo:
   train_n_envs: 8
-  eval_n_envs: 8
-  eval_episodes: 8
+  eval_n_envs: 16
+  eval_episodes: 16
   eval_freq: 102400 # training timesteps between stage1 evaluations; use 0 to disable
   eval_deterministic: true
   total_timesteps: 4000000
   features_dim: 256
-  learning_rate: lin_1e-4
-  head_lr: lin_1e-4
+  policy_backbone_lr: lin_1e-4
+  policy_head_lr: lin_1e-4
+  critic_lr: lin_1e-4
+  projection_dim: 128
+  predictor_hidden_dim: 512
+  beta_dyn: 0.0
+  ema_tau: 0.99
   n_steps: 512 # num rollout steps per env
   batch_size: 128 # minibatch for PPO update
   n_epochs: 10 # repeat rollout data for multiple epochs
@@ -48,5 +53,5 @@ ppo:
   ortho_init: false
   activation_fn: gelu
   device: auto
-  progress_bar: false
+
   quiet: false

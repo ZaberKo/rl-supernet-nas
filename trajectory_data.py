@@ -147,9 +147,9 @@ def write_hdf5_metadata(
     chunk_size: int,
     target_chunk_bytes: int,
 ) -> None:
-    payload = hdf5_base_metadata(horizon, chunk_size, target_chunk_bytes)
-    payload.update(metadata)
-    payload["num_samples"] = int(num_samples)
+    metadata_dict = hdf5_base_metadata(horizon, chunk_size, target_chunk_bytes)
+    metadata_dict.update(metadata)
+    metadata_dict["num_samples"] = int(num_samples)
     for key in (
         "dataset_type",
         "supervised_schema_version",
@@ -161,8 +161,8 @@ def write_hdf5_metadata(
         "compression",
         "compression_opts",
     ):
-        dataset_file.attrs[key] = payload[key]
-    dataset_file.attrs["metadata_json"] = json.dumps(payload)
+        dataset_file.attrs[key] = metadata_dict[key]
+    dataset_file.attrs["metadata_json"] = json.dumps(metadata_dict)
 
 
 def hdf5_compression_kwargs() -> dict[str, Any]:
@@ -373,8 +373,8 @@ def write_supervised_transition_samples(
     action_shape = tuple(int(value) for value in np.asarray(first["actions"]).shape[1:])
     observation_dtype = np.asarray(first["observation"]).dtype
     action_dtype = np.asarray(first["actions"]).dtype
-    payload_metadata = dict(metadata or {})
-    payload_metadata.update(
+    metadata_dict = dict(metadata or {})
+    metadata_dict.update(
         {
             "dataset_type": SUPERVISED_DATASET_TYPE,
             "supervised_schema_version": 1,
@@ -415,7 +415,7 @@ def write_supervised_transition_samples(
 
     dataset = ArrowDataset.from_generator(row_generator, features=features)
     dataset.save_to_disk(str(output_path))
-    write_metadata(output_path, payload_metadata)
+    write_metadata(output_path, metadata_dict)
 
 
 def write_supervised_transition_samples_from_hdf5_files(
@@ -449,8 +449,8 @@ def write_supervised_transition_samples_from_hdf5_files(
     if num_raw_transitions is None or num_raw_transitions <= 0:
         num_raw_transitions = total_samples
 
-    payload_metadata = dict(metadata or {})
-    payload_metadata.update(
+    metadata_dict = dict(metadata or {})
+    metadata_dict.update(
         {
             "dataset_type": SUPERVISED_DATASET_TYPE,
             "supervised_schema_version": 1,
@@ -495,7 +495,7 @@ def write_supervised_transition_samples_from_hdf5_files(
 
     dataset = ArrowDataset.from_generator(row_generator, features=features)
     dataset.save_to_disk(str(output_path))
-    write_metadata(output_path, payload_metadata)
+    write_metadata(output_path, metadata_dict)
 
 
 def load_supervised_transition_rows(path: str | Path) -> list[dict[str, Any]]:
@@ -898,8 +898,8 @@ class TrajectoryRecorderCallback(BaseCallback):
             )
 
     def save(self, metadata: dict[str, Any] | None = None) -> None:
-        payload = dict(metadata or {})
-        payload.update(
+        metadata_dict = dict(metadata or {})
+        metadata_dict.update(
             {
                 "num_eligible_samples": int(self.eligible_samples),
                 "num_raw_transitions": int(self.raw_transitions),
@@ -910,7 +910,7 @@ class TrajectoryRecorderCallback(BaseCallback):
                 "horizon": int(self.horizon),
             }
         )
-        self.writer.close(metadata=payload)
+        self.writer.close(metadata=metadata_dict)
 
 
 def sample_action_batch(action_space: gym.Space, n_envs: int) -> np.ndarray:

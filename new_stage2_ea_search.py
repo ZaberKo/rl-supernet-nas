@@ -20,6 +20,17 @@ from omegaconf import DictConfig, OmegaConf
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import VecEnv
 
+from checkpoint_utils import (
+    build_network_ppo_config,
+    build_policy_from_checkpoint,
+    checkpoint_arg,
+    checkpoint_mapping,
+    checkpoint_ppo_value,
+    load_checkpoint,
+    load_critic_from_checkpoint,
+    resolve_policy_constructor_values,
+    validate_checkpoint_search_space,
+)
 from config_utils import add_ppo_config_args, build_run_config, load_ppo_config, ppo_config_to_dict
 from ea_codec import GeneCodec
 from new_stage1_train_policy_supernet import (
@@ -33,8 +44,6 @@ from new_stage1_train_policy_supernet import (
 )
 from nsga2_search import DiscreteNSGA2
 from ppo_utils import (
-    get_eval_n_envs,
-    get_train_n_envs,
     make_vec_env_from_ppo_config,
     parse_hidden_sizes,
     parse_optional_float,
@@ -44,7 +53,8 @@ from ppo_utils import (
 )
 from supernet_backbone import ArchConfig, SearchSpace
 from trajectory_data import resolve_terminal_next_observations, split_done_flags
-from wandb_utils import finish_wandb_run, init_wandb_run, log_wandb, log_wandb_artifact
+from env_utils import EVAL_SEED_OFFSET
+from wandb_utils import finish_wandb_run, init_wandb_run, log_wandb
 
 
 def parse_args() -> argparse.Namespace:
@@ -57,20 +67,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--supernet_checkpoint", default="runs/new_stage1_policy_supernet/policy_supernet_best.pt", help="New stage1 policy-supernet checkpoint used to initialize subnet candidates.")
     parser.add_argument("--population_size", type=int, default=6, help="NSGA-II population size.")
     parser.add_argument("--generations", type=int, default=3, help="Number of NSGA-II generations to evaluate.")
-    parser.add_argument("--candidate_timesteps", type=int, default=1024, help="PPO finetune timesteps for each subnet candidate.")
     parser.add_argument("--eval_workers", type=int, default=1, help="Torch multiprocessing workers for parallel subnet evaluation.")
-    parser.add_argument("--supernet_backbone_lr", type=float, default=0.0, help="Backbone learning rate during candidate PPO finetune; <=0 freezes the inherited backbone.")
-    parser.add_argument("--critic_learning_rate", default="", help="Critic learning rate schedule. Empty reuses ppo.learning_rate.")
     parser.add_argument("--critic_warmup_timesteps", type=int, default=0, help="Critic-only warmup timesteps on current subnet rollouts before actor PPO finetune; 0 disables warmup.")
-    parser.add_argument("--projection_dim", type=int, default=0, help="Policy projection dimension. 0 reads the value from the checkpoint.")
-    parser.add_argument("--predictor_hidden_dim", type=int, default=0, help="Dynamics predictor hidden dimension. 0 reads the value from the checkpoint args.")
     parser.add_argument("--save_full_history", action="store_true", help="Store full EvoX monitor history in memory for debugging.")
     args = parser.parse_args()
     if args.critic_warmup_timesteps < 0:
         raise ValueError("critic_warmup_timesteps must be non-negative.")
     args.eval_call_seed_stride = 10_000
     args.candidate_seed_stride = 100
-    args.eval_seed_offset = 50
+
     args.mp_start_method = "spawn"
     args.worker_torch_threads = 1
     return args
@@ -178,124 +183,6 @@ def log_generation(
     log_wandb(wandb_run, summary, step=generation)
 
 
-def load_checkpoint_payload(path: str | Path, map_location: str | torch.device) -> dict[str, Any]:
-    checkpoint_path = Path(path)
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Policy-supernet checkpoint does not exist: {checkpoint_path}")
-    payload = torch.load(checkpoint_path, map_location=map_location)
-    if not isinstance(payload, Mapping):
-        raise TypeError("Policy-supernet checkpoint payload must be a mapping.")
-    return dict(payload)
-
-
-def checkpoint_mapping(payload: Mapping[str, Any], key: str) -> dict[str, Any]:
-    value = payload.get(key)
-    if not isinstance(value, Mapping):
-        return {}
-    return dict(value)
-
-
-def checkpoint_arg(payload: Mapping[str, Any], key: str, default: Any) -> Any:
-    args = checkpoint_mapping(payload, "args")
-    return args.get(key, default)
-
-
-def checkpoint_ppo_value(payload: Mapping[str, Any], runtime_ppo_config: Any, key: str, default: Any = None) -> Any:
-    checkpoint_ppo_config = checkpoint_mapping(payload, "ppo_config")
-    if key in checkpoint_ppo_config:
-        return checkpoint_ppo_config[key]
-    return getattr(runtime_ppo_config, key, default)
-
-
-def build_network_ppo_config(payload: Mapping[str, Any], runtime_ppo_config: Any, seed: int) -> DictConfig:
-    values = ppo_config_to_dict(runtime_ppo_config)
-    checkpoint_ppo_config = checkpoint_mapping(payload, "ppo_config")
-    for key in (
-        "features_dim",
-        "policy_net_arch",
-        "value_net_arch",
-        "activation_fn",
-        "ortho_init",
-        "log_std_init",
-    ):
-        if key in checkpoint_ppo_config:
-            values[key] = checkpoint_ppo_config[key]
-    values["seed"] = int(seed)
-    return OmegaConf.create(values)
-
-
-def resolve_policy_constructor_values(
-    payload: Mapping[str, Any],
-    args: argparse.Namespace,
-    ppo_config: Any,
-) -> dict[str, Any]:
-    projection_dim = int(args.projection_dim)
-    if projection_dim <= 0:
-        projection_dim = int(payload.get("projection_dim", checkpoint_arg(payload, "projection_dim", 128)))
-
-    predictor_hidden_dim = int(args.predictor_hidden_dim)
-    if predictor_hidden_dim <= 0:
-        predictor_hidden_dim = int(checkpoint_arg(payload, "predictor_hidden_dim", 512))
-
-    return {
-        "features_dim": int(payload.get("features_dim", checkpoint_ppo_value(payload, ppo_config, "features_dim"))),
-        "policy_net_arch": parse_hidden_sizes(checkpoint_ppo_value(payload, ppo_config, "policy_net_arch", ())),
-        "activation_fn": resolve_activation_fn(checkpoint_ppo_value(payload, ppo_config, "activation_fn", None)),
-        "log_std_init": parse_optional_float(checkpoint_ppo_value(payload, ppo_config, "log_std_init", None)),
-        "ortho_init": bool(checkpoint_ppo_value(payload, ppo_config, "ortho_init", False)),
-        "projection_dim": projection_dim,
-        "predictor_hidden_dim": predictor_hidden_dim,
-    }
-
-
-def validate_checkpoint_search_space(payload: Mapping[str, Any], search_space: SearchSpace) -> None:
-    checkpoint_search_space = payload.get("search_space")
-    if checkpoint_search_space is None:
-        return
-    if checkpoint_search_space != search_space.to_dict():
-        raise ValueError("Checkpoint search_space does not match the current SearchSpace defaults.")
-
-
-def build_policy_from_checkpoint(
-    args: argparse.Namespace,
-    ppo_config: Any,
-    train_env: VecEnv,
-    search_space: SearchSpace,
-    checkpoint_payload: Mapping[str, Any],
-    device: torch.device,
-) -> PolicySupernet:
-    constructor_values = resolve_policy_constructor_values(checkpoint_payload, args, ppo_config)
-    policy = PolicySupernet(
-        observation_space=train_env.observation_space,
-        action_space=train_env.action_space,
-        search_space=search_space,
-        features_dim=int(constructor_values["features_dim"]),
-        policy_net_arch=constructor_values["policy_net_arch"],
-        activation_fn=constructor_values["activation_fn"],
-        log_std_init=constructor_values["log_std_init"],
-        ortho_init=bool(constructor_values["ortho_init"]),
-        projection_dim=int(constructor_values["projection_dim"]),
-        predictor_hidden_dim=int(constructor_values["predictor_hidden_dim"]),
-    ).to(device)
-
-    state_dict = checkpoint_payload.get("policy_state_dict")
-    if not isinstance(state_dict, Mapping):
-        raise KeyError("Checkpoint does not contain policy_state_dict.")
-    policy.load_state_dict(state_dict, strict=True)
-    return policy
-
-
-def load_critic_from_checkpoint(
-    critic_model: PPO,
-    checkpoint_payload: Mapping[str, Any],
-) -> bool:
-    state_dict = checkpoint_payload.get("critic_policy_state_dict")
-    if state_dict is None:
-        raise KeyError("Checkpoint does not contain critic_policy_state_dict.")
-    if not isinstance(state_dict, Mapping):
-        raise TypeError("critic_policy_state_dict must be a mapping.")
-    critic_model.policy.load_state_dict(state_dict, strict=True)
-    return True
 
 
 def actor_head_parameters(policy: PolicySupernet) -> list[torch.nn.Parameter]:
@@ -307,34 +194,35 @@ def actor_head_parameters(policy: PolicySupernet) -> list[torch.nn.Parameter]:
 
 def configure_actor_optimizer(
     policy: PolicySupernet,
-    actor_lr: Any,
-    backbone_lr: float,
+    head_lr: Any,
+    backbone_lr: Any,
 ) -> torch.optim.Optimizer:
     for parameter in policy.parameters():
         parameter.requires_grad_(False)
 
-    head_params = actor_head_parameters(policy)
+    head_params = [p for n, p in policy.named_parameters() if not n.startswith("backbone.")]
     for parameter in head_params:
         parameter.requires_grad_(True)
 
-    actor_lr_start = float(actor_lr(1.0)) if callable(actor_lr) else float(actor_lr)
+    head_lr_start = float(head_lr(1.0)) if callable(head_lr) else float(head_lr)
+    backbone_lr_start = float(backbone_lr(1.0)) if callable(backbone_lr) else float(backbone_lr)
     optimizer_kwargs = {
         "betas": (0.9, 0.999),
         "eps": 1e-5,
         "weight_decay": 0.0,
     }
 
-    if float(backbone_lr) <= 0.0:
-        return torch.optim.Adam(head_params, lr=actor_lr_start, **optimizer_kwargs)
-
     backbone_params = list(policy.backbone.parameters())
+    if float(backbone_lr_start) <= 0.0:
+        return torch.optim.Adam(head_params, lr=head_lr_start, **optimizer_kwargs)
+
     for parameter in backbone_params:
         parameter.requires_grad_(True)
 
     return torch.optim.Adam(
         [
-            {"params": backbone_params, "lr": float(backbone_lr), "group_name": "backbone"},
-            {"params": head_params, "lr": actor_lr_start, "group_name": "head"},
+            {"params": backbone_params, "lr": backbone_lr_start, "group_name": "backbone"},
+            {"params": head_params, "lr": head_lr_start, "group_name": "head"},
         ],
         **optimizer_kwargs,
     )
@@ -632,38 +520,39 @@ def finetune_and_evaluate_candidate(
     set_global_seeds(train_seed)
     device = resolve_device(str(ppo_config.device))
     search_space = SearchSpace()
-    checkpoint_payload = load_checkpoint_payload(args.supernet_checkpoint, map_location=device)
-    validate_checkpoint_search_space(checkpoint_payload, search_space)
+    checkpoint = load_checkpoint(args.supernet_checkpoint, map_location=device)
+    validate_checkpoint_search_space(checkpoint, search_space)
 
-    train_env = make_vec_env_from_ppo_config(ppo_config, seed=train_seed, n_envs=get_train_n_envs(ppo_config))
-    eval_env = make_vec_env_from_ppo_config(ppo_config, seed=eval_seed, n_envs=get_eval_n_envs(ppo_config))
+    train_env = make_vec_env_from_ppo_config(ppo_config, seed=train_seed, n_envs=ppo_config.train_n_envs)
+    eval_env = make_vec_env_from_ppo_config(ppo_config, seed=eval_seed, n_envs=ppo_config.eval_n_envs)
     try:
         policy = build_policy_from_checkpoint(
             args=args,
             ppo_config=ppo_config,
             train_env=train_env,
             search_space=search_space,
-            checkpoint_payload=checkpoint_payload,
+            checkpoint=checkpoint,
             device=device,
         )
         policy.set_active_arch(arch_config)
 
-        actor_lr_schedule = parse_schedule_value(getattr(ppo_config, "learning_rate"))
-        critic_lr_schedule = parse_schedule_value(args.critic_learning_rate or getattr(ppo_config, "learning_rate"))
-        clip_range_schedule = parse_schedule_value(getattr(ppo_config, "clip_range"))
+        actor_lr_schedule = parse_schedule_value(ppo_config.policy_head_lr)
+        backbone_lr_schedule = parse_schedule_value(ppo_config.policy_backbone_lr)
+        critic_lr_schedule = parse_schedule_value(ppo_config.critic_lr)
+        clip_range_schedule = parse_schedule_value(ppo_config.clip_range)
         actor_optimizer = configure_actor_optimizer(
             policy=policy,
-            actor_lr=actor_lr_schedule,
-            backbone_lr=float(args.supernet_backbone_lr),
+            head_lr=actor_lr_schedule,
+            backbone_lr=backbone_lr_schedule,
         )
 
-        critic_ppo_config = build_network_ppo_config(checkpoint_payload, ppo_config, seed=train_seed)
+        critic_ppo_config = build_network_ppo_config(checkpoint.get("ppo_config", {}), ppo_config, seed=train_seed)
         critic_model = build_sb3_critic_model(
             ppo_config=critic_ppo_config,
             env=train_env,
             learning_rate=critic_lr_schedule,
         )
-        loaded_critic = load_critic_from_checkpoint(critic_model, checkpoint_payload)
+        loaded_critic = load_critic_from_checkpoint(critic_model, checkpoint)
 
         rollout_buffer = DynamicsRolloutBuffer(
             buffer_size=int(ppo_config.n_steps),
@@ -696,15 +585,16 @@ def finetune_and_evaluate_candidate(
 
         total_timesteps = 0
         last_metrics: dict[str, float] = {}
-        target_timesteps = max(0, int(args.candidate_timesteps))
-        target_kl = parse_optional_float(getattr(ppo_config, "target_kl", None))
+        target_timesteps = max(0, ppo_config.total_timesteps)
+        target_kl = parse_optional_float(ppo_config.target_kl)
 
         while total_timesteps < target_timesteps:
             progress_remaining = 1.0 - float(total_timesteps) / float(max(1, target_timesteps))
             actor_lr = float(actor_lr_schedule(progress_remaining)) if callable(actor_lr_schedule) else float(actor_lr_schedule)
+            backbone_lr = float(backbone_lr_schedule(progress_remaining)) if callable(backbone_lr_schedule) else float(backbone_lr_schedule)
             critic_lr = float(critic_lr_schedule(progress_remaining)) if callable(critic_lr_schedule) else float(critic_lr_schedule)
             clip_range = float(clip_range_schedule(progress_remaining)) if callable(clip_range_schedule) else float(clip_range_schedule)
-            update_actor_optimizer_learning_rate(actor_optimizer, actor_lr, float(args.supernet_backbone_lr))
+            update_actor_optimizer_learning_rate(actor_optimizer, actor_lr, backbone_lr)
             update_optimizer_learning_rate(critic_model.policy.optimizer, critic_lr)
 
             observation, episode_starts, rollout_metrics = collect_candidate_rollout(
@@ -752,7 +642,7 @@ def finetune_and_evaluate_candidate(
                 **critic_metrics,
             }
 
-        eval_episodes = int(getattr(ppo_config, "eval_episodes", 0) or 0)
+        eval_episodes = ppo_config.eval_episodes
         if eval_episodes <= 0:
             raise ValueError("ppo.eval_episodes must be positive for search fitness evaluation.")
         eval_metrics = evaluate_actor_subnet(
@@ -761,7 +651,7 @@ def finetune_and_evaluate_candidate(
             eval_env=eval_env,
             arch=arch_config,
             n_eval_episodes=eval_episodes,
-            deterministic=bool(getattr(ppo_config, "eval_deterministic", True)),
+            deterministic=ppo_config.eval_deterministic,
             device=device,
         )
         active_backbone_params = int(policy.backbone.elastic_num_params)
@@ -853,7 +743,7 @@ class NewPolicySubnetProblem(Problem):
             + self.eval_call_index * int(self.args_dict["eval_call_seed_stride"])
             + candidate_index * int(self.args_dict["candidate_seed_stride"])
         )
-        eval_seed = train_seed + int(self.args_dict["eval_seed_offset"])
+        eval_seed = int(self.ppo_config_dict["seed"]) + EVAL_SEED_OFFSET
         return NewPolicySubnetEvalConfig(
             args=self.args_dict,
             ppo_config=self.ppo_config_dict,
@@ -1004,12 +894,7 @@ def main() -> None:
         },
         step=max(0, args.generations - 1),
     )
-    log_wandb_artifact(
-        wandb_run,
-        name=f"new-stage2-{output_dir.name}",
-        artifact_type="new-stage2-output",
-        paths=[records_path, log_path, output_dir / "search_space.json", manifest_path],
-    )
+
     finish_wandb_run(wandb_run)
     print(json.dumps(manifest, indent=2))
 

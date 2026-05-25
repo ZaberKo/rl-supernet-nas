@@ -6,8 +6,6 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 
-DEFAULT_GROUP_NORM_CHANNELS_PER_GROUP = 16
-
 
 def group_norm_group_count(num_channels: int, channels_per_group: int) -> int:
     if channels_per_group <= 0:
@@ -500,7 +498,7 @@ class GroupNorm2d(nn.Module):
     def __init__(
         self,
         num_channels: int,
-        channels_per_group: int = DEFAULT_GROUP_NORM_CHANNELS_PER_GROUP,
+        channels_per_group: int = 16,
         eps: float = 1e-6,
         elementwise_affine: bool = True,
         bias: bool = True,
@@ -539,7 +537,7 @@ class ElasticGroupNorm2d(nn.Module):
         self,
         *,
         super_num_channels: int,
-        channels_per_group: int = DEFAULT_GROUP_NORM_CHANNELS_PER_GROUP,
+        channels_per_group: int = 16,
         eps: float = 1e-6,
         elementwise_affine: bool = True,
         bias: bool = True,

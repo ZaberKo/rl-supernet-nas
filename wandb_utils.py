@@ -60,39 +60,12 @@ def init_wandb_run(stage: str, args: Any, output_dir: str | Path):
 def log_wandb(run: Any, values: dict[str, Any], step: int | None = None) -> None:
     if run is None:
         return
-    payload = sanitize_wandb_value(values)
+    sanitized_values = sanitize_wandb_value(values)
     try:
-        run.log(payload, step=step)
+        run.log(sanitized_values, step=step)
     except Exception as exc:
         print(f"wandb_log_failed error={exc}", flush=True)
 
-
-def log_wandb_artifact(
-    run: Any,
-    name: str,
-    artifact_type: str,
-    paths: list[str | Path],
-) -> None:
-    if run is None:
-        return
-    try:
-        import wandb
-
-        artifact = wandb.Artifact(safe_artifact_name(name), type=artifact_type)
-        has_content = False
-        for raw_path in paths:
-            path = Path(raw_path)
-            if not path.exists():
-                continue
-            if path.is_dir():
-                artifact.add_dir(str(path), name=path.name)
-            else:
-                artifact.add_file(str(path), name=path.name)
-            has_content = True
-        if has_content:
-            run.log_artifact(artifact)
-    except Exception as exc:
-        print(f"wandb_artifact_failed name={name} error={exc}", flush=True)
 
 
 def finish_wandb_run(run: Any) -> None:

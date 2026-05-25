@@ -9,7 +9,8 @@ from typing import Any, Mapping
 import torch
 import torch.nn as nn
 
-from primitive_blocks import DEFAULT_GROUP_NORM_CHANNELS_PER_GROUP, ElasticConv2d, ElasticGroupNorm2d, ElasticLinear, GroupNorm2d
+from checkpoint_utils import load_checkpoint
+from primitive_blocks import ElasticConv2d, ElasticGroupNorm2d, ElasticLinear, GroupNorm2d
 
 
 @dataclass(frozen=True)
@@ -36,9 +37,9 @@ class ArchConfig:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "ArchConfig":
+    def from_dict(cls, config_dict: dict[str, Any]) -> "ArchConfig":
         return cls(
-            stage_depths=tuple(int(value) for value in payload["stage_depths"]),
+            stage_depths=tuple(int(value) for value in config_dict["stage_depths"]),
             layer_configs=tuple(
                 tuple(
                     LayerConfig(
@@ -47,7 +48,7 @@ class ArchConfig:
                     )
                     for layer in stage_layers
                 )
-                for stage_layers in payload["layer_configs"]
+                for stage_layers in config_dict["layer_configs"]
             ),
         )
 
@@ -71,9 +72,6 @@ class SearchSpace:
                 raise ValueError("Each stage must have at least one depth candidate.")
             if tuple(sorted(candidates)) != tuple(candidates):
                 raise ValueError("Depth candidates must be sorted in ascending order.")
-        for width in self.stage_widths:
-            if int(width) % DEFAULT_GROUP_NORM_CHANNELS_PER_GROUP != 0:
-                raise ValueError("Each stage width must be divisible by DEFAULT_GROUP_NORM_CHANNELS_PER_GROUP.")
 
     @property
     def num_stages(self) -> int:
@@ -477,15 +475,13 @@ def load_backbone_from_policy_checkpoint(
     if checkpoint_path is None:
         return None
 
-    payload = torch.load(Path(checkpoint_path), map_location=map_location)
-    if not isinstance(payload, Mapping):
-        raise TypeError("Checkpoint payload must be a mapping.")
-    policy_state_dict = payload.get("policy_state_dict")
+    checkpoint = load_checkpoint(checkpoint_path, map_location)
+    policy_state_dict = checkpoint.get("policy_state_dict")
     if not isinstance(policy_state_dict, Mapping):
         raise KeyError("Stage1 PPO checkpoint must contain policy_state_dict.")
     state_dict = extract_backbone_state_dict_from_policy_state_dict(policy_state_dict)
     backbone.load_state_dict(state_dict, strict=False)
-    return dict(payload)
+    return dict(checkpoint)
 
 
 def load_backbone_from_backbone_checkpoint(
@@ -496,11 +492,9 @@ def load_backbone_from_backbone_checkpoint(
     if checkpoint_path is None:
         return None
 
-    payload = torch.load(Path(checkpoint_path), map_location=map_location)
-    if not isinstance(payload, Mapping):
-        raise TypeError("Checkpoint payload must be a mapping.")
-    backbone_state_dict = payload.get("backbone_state_dict")
+    checkpoint = load_checkpoint(checkpoint_path, map_location)
+    backbone_state_dict = checkpoint.get("backbone_state_dict")
     if not isinstance(backbone_state_dict, Mapping):
         raise KeyError("Stage2 checkpoint must contain backbone_state_dict.")
     backbone.load_state_dict(backbone_state_dict, strict=False)
-    return dict(payload)
+    return dict(checkpoint)
