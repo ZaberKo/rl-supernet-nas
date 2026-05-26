@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from types import MethodType
-from typing import Any, Callable, Sequence
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -12,7 +13,13 @@ from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.vec_env import VecEnv
 
-from supernet_backbone import ArchConfig, SearchSpace, SupernetCNNBackbone, infer_input_channels, load_backbone_from_backbone_checkpoint
+from supernet_backbone import (
+    ArchConfig,
+    SearchSpace,
+    SupernetCNNBackbone,
+    infer_input_channels,
+    load_backbone_from_backbone_checkpoint,
+)
 
 ScheduleValue = float | Callable[[float], float]
 
@@ -36,7 +43,9 @@ class SupernetFeaturesExtractor(BaseFeaturesExtractor):
         )
         self.backbone.set_sample_config(arch)
         if backbone_checkpoint_path is not None:
-            load_backbone_from_backbone_checkpoint(self.backbone, backbone_checkpoint_path, map_location=map_location)
+            load_backbone_from_backbone_checkpoint(
+                self.backbone, backbone_checkpoint_path, map_location=map_location
+            )
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         return self.backbone(observations)
@@ -157,7 +166,11 @@ def configure_policy_optimizer(
     ]
     policy.optimizer = policy.optimizer_class(
         [
-            {"params": backbone_params, "lr": float(backbone_lr), "group_name": "backbone"},
+            {
+                "params": backbone_params,
+                "lr": float(backbone_lr),
+                "group_name": "backbone",
+            },
             {"params": head_params, "lr": head_lr_start, "group_name": "head"},
         ],
         **policy.optimizer_kwargs,

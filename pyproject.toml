@@ -1,0 +1,37 @@
+[tool.ruff]
+line-length = 88
+indent-width = 4
+target-version = "py312"
+extend-exclude = [
+    ".venv",
+    "runs",
+    "primitive_blocks.py",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "W",
+    "F",
+    "I",
+    "B",
+    "C4",
+    "UP",
+    "SIM",
+    "RUF",
+]
+ignore = [
+    # Keep long CLI help strings, config examples, and manifest values readable.
+    "E501",
+]
+
+fixable = ["ALL"]
+unfixable = []
+
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"

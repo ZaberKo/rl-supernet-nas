@@ -13,8 +13,6 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import VecEnv
 from tqdm.auto import tqdm
 
-from config_utils import add_ppo_config_args, build_run_config, load_ppo_config, ppo_config_to_dict
-from new_stage1_train_policy_supernet import DynamicsRolloutBuffer, build_sb3_critic_model, evaluate_actor_subnet
 from checkpoint_utils import (
     build_network_ppo_config,
     build_policy_from_checkpoint,
@@ -22,10 +20,24 @@ from checkpoint_utils import (
     load_critic_from_checkpoint,
     validate_checkpoint_search_space,
 )
+from config_utils import (
+    add_ppo_config_args,
+    build_run_config,
+    load_ppo_config,
+    ppo_config_to_dict,
+)
+from env_utils import EVAL_SEED_OFFSET
+from new_stage1_train_policy_supernet import (
+    DynamicsRolloutBuffer,
+    build_sb3_critic_model,
+    evaluate_actor_subnet,
+)
 from new_stage2_ea_search import (
     actor_head_parameters,
     collect_candidate_rollout,
     configure_actor_optimizer,
+    configured_backbone_lr,
+    configured_candidate_timesteps,
     count_parameters,
     critic_update,
     fixed_arch_actor_update,
@@ -42,11 +54,11 @@ from ppo_utils import (
     resolve_device,
 )
 from supernet_backbone import ArchConfig, SearchSpace
-from env_utils import EVAL_SEED_OFFSET
 from wandb_utils import finish_wandb_run, init_wandb_run, log_wandb
 
-
-DEFAULT_ARCH_CONFIG_PATH = Path(__file__).resolve().parent / "arch_configs" / "max_arch.json"
+DEFAULT_ARCH_CONFIG_PATH = (
+    Path(__file__).resolve().parent / "arch_configs" / "max_arch.json"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,16 +67,48 @@ def parse_args() -> argparse.Namespace:
         allow_abbrev=False,
     )
     add_ppo_config_args(parser)
-    parser.add_argument("--arch_config", default=str(DEFAULT_ARCH_CONFIG_PATH), help="JSON file containing one ArchConfig object.")
+    parser.add_argument(
+        "--arch_config",
+        default=str(DEFAULT_ARCH_CONFIG_PATH),
+        help="JSON file containing one ArchConfig object.",
+    )
     parser.add_argument(
         "--supernet_checkpoint",
         default="runs/new_stage1_policy_supernet/policy_supernet_best.pt",
         help="New stage1 policy-supernet checkpoint used to initialize the actor supernet and critic.",
     )
-    parser.add_argument("--output_dir", default="runs/new_stage1_arch_ppo", help="Directory for PPO metrics, checkpoint, and manifest.")
+    parser.add_argument(
+        "--output_dir",
+        default="runs/new_stage1_arch_ppo",
+        help="Directory for PPO metrics, checkpoint, and manifest.",
+    )
+    parser.add_argument(
+        "--candidate_timesteps",
+        type=int,
+        default=None,
+        help="PPO finetune timesteps for this architecture; defaults to ppo.total_timesteps.",
+    )
+    parser.add_argument(
+        "--supernet_backbone_lr",
+        type=float,
+        default=None,
+        help="Optional fixed backbone learning rate during finetune; <= 0 freezes the backbone. Defaults to ppo.policy_backbone_lr.",
+    )
+    parser.add_argument(
+        "--critic_warmup_timesteps",
+        type=int,
+        default=0,
+        help="Critic-only warmup timesteps before actor PPO finetune; 0 disables warmup.",
+    )
 
-    parser.add_argument("--suffix", default="", help="Optional suffix to append to the stage name.")
+    parser.add_argument(
+        "--suffix", default="", help="Optional suffix to append to the stage name."
+    )
     args = parser.parse_args()
+    if args.candidate_timesteps is not None and args.candidate_timesteps < 0:
+        raise ValueError("candidate_timesteps must be non-negative.")
+    if args.critic_warmup_timesteps < 0:
+        raise ValueError("critic_warmup_timesteps must be non-negative.")
     return args
 
 
@@ -90,7 +134,9 @@ def validate_arch_config(search_space: SearchSpace, arch_config: ArchConfig) -> 
     if len(arch_config.stage_depths) != search_space.num_stages:
         raise ValueError("Architecture stage count does not match the search space.")
     if len(arch_config.layer_configs) != search_space.num_stages:
-        raise ValueError("Architecture layer config stage count does not match the search space.")
+        raise ValueError(
+            "Architecture layer config stage count does not match the search space."
+        )
 
     for stage_index, (depth, candidates, stage_layers, max_depth) in enumerate(
         zip(
@@ -104,12 +150,21 @@ def validate_arch_config(search_space: SearchSpace, arch_config: ArchConfig) -> 
         if int(depth) not in candidates:
             raise ValueError(f"Stage {stage_index} depth is not in the search space.")
         if len(stage_layers) != max_depth:
-            raise ValueError(f"Stage {stage_index} must contain {max_depth} layer configs.")
+            raise ValueError(
+                f"Stage {stage_index} must contain {max_depth} layer configs."
+            )
         for layer_index, layer_config in enumerate(stage_layers):
             if int(layer_config.kernel_size) not in search_space.kernel_size_candidates:
-                raise ValueError(f"Stage {stage_index} layer {layer_index} kernel size is not in the search space.")
-            if int(layer_config.expand_ratio) not in search_space.expand_ratio_candidates:
-                raise ValueError(f"Stage {stage_index} layer {layer_index} expand ratio is not in the search space.")
+                raise ValueError(
+                    f"Stage {stage_index} layer {layer_index} kernel size is not in the search space."
+                )
+            if (
+                int(layer_config.expand_ratio)
+                not in search_space.expand_ratio_candidates
+            ):
+                raise ValueError(
+                    f"Stage {stage_index} layer {layer_index} expand ratio is not in the search space."
+                )
 
 
 def numeric_values(record: Mapping[str, Any]) -> dict[str, Any]:
@@ -120,7 +175,9 @@ def numeric_values(record: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def log_record(metrics_path: Path, wandb_run: Any, record: Mapping[str, Any], step: int) -> None:
+def log_record(
+    metrics_path: Path, wandb_run: Any, record: Mapping[str, Any], step: int
+) -> None:
     append_jsonl_record(metrics_path, record)
     log_wandb(wandb_run, numeric_values(record), step=step)
 
@@ -132,7 +189,9 @@ def write_progress(progress_bar: tqdm | None, message: str) -> None:
     progress_bar.write(message)
 
 
-def update_progress_bar(progress_bar: tqdm | None, configured_total: int, current_total: int) -> None:
+def update_progress_bar(
+    progress_bar: tqdm | None, configured_total: int, current_total: int
+) -> None:
     if progress_bar is None:
         return
     bounded_total = min(max(0, int(configured_total)), max(0, int(current_total)))
@@ -207,7 +266,9 @@ def save_arch_checkpoint(
             "arch_config": arch_config.to_dict(),
             "supernet_checkpoint": str(args.supernet_checkpoint),
             "features_dim": checkpoint.get("features_dim", ppo_config.features_dim),
-            "projection_dim": checkpoint.get("projection_dim", ppo_config.projection_dim),
+            "projection_dim": checkpoint.get(
+                "projection_dim", ppo_config.projection_dim
+            ),
             "args": vars(args),
             "ppo_config": ppo_config_to_dict(ppo_config),
         },
@@ -223,7 +284,11 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
     last_checkpoint_path = output_dir / "policy_supernet_arch_ppo_last.pt"
     best_checkpoint_path = output_dir / "policy_supernet_arch_ppo_best.pt"
 
-    stage_name = f"new_stage1_train_arch_ppo_{args.suffix}" if getattr(args, "suffix", "") else "new_stage1_train_arch_ppo"
+    stage_name = (
+        f"new_stage1_train_arch_ppo_{args.suffix}"
+        if getattr(args, "suffix", "")
+        else "new_stage1_train_arch_ppo"
+    )
     run_config = build_run_config(args, ppo_config)
     wandb_run = init_wandb_run(stage_name, run_config, output_dir)
     train_env = None
@@ -244,15 +309,18 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
         checkpoint = load_checkpoint(args.supernet_checkpoint, map_location=device)
         validate_checkpoint_search_space(checkpoint, search_space)
 
-        train_env = make_vec_env_from_ppo_config(ppo_config, seed=train_seed, n_envs=ppo_config.train_n_envs)
+        train_env = make_vec_env_from_ppo_config(
+            ppo_config, seed=train_seed, n_envs=ppo_config.train_n_envs
+        )
         eval_episodes = ppo_config.eval_episodes
         eval_deterministic = ppo_config.eval_deterministic
         eval_freq = ppo_config.eval_freq
         if eval_episodes > 0:
-            eval_env = make_vec_env_from_ppo_config(ppo_config, seed=eval_seed, n_envs=ppo_config.eval_n_envs)
+            eval_env = make_vec_env_from_ppo_config(
+                ppo_config, seed=eval_seed, n_envs=ppo_config.eval_n_envs
+            )
 
         policy = build_policy_from_checkpoint(
-            args=args,
             ppo_config=ppo_config,
             train_env=train_env,
             search_space=search_space,
@@ -263,15 +331,18 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
 
         critic_lr_schedule = parse_schedule_value(ppo_config.critic_lr)
         policy_head_lr_schedule = parse_schedule_value(ppo_config.policy_head_lr)
-        policy_backbone_lr_schedule = parse_schedule_value(ppo_config.policy_backbone_lr)
+        policy_backbone_lr_schedule = configured_backbone_lr(args, ppo_config)
         clip_range_schedule = parse_schedule_value(ppo_config.clip_range)
+        target_timesteps = configured_candidate_timesteps(args, ppo_config)
         actor_optimizer = configure_actor_optimizer(
             policy=policy,
             head_lr=policy_head_lr_schedule,
             backbone_lr=policy_backbone_lr_schedule,
         )
 
-        critic_ppo_config = build_network_ppo_config(checkpoint.get("ppo_config", {}), ppo_config, seed=train_seed)
+        critic_ppo_config = build_network_ppo_config(
+            checkpoint.get("ppo_config", {}), ppo_config, seed=train_seed
+        )
         critic_model = build_sb3_critic_model(
             ppo_config=critic_ppo_config,
             env=train_env,
@@ -297,7 +368,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                 "stage": stage_name,
                 "supernet_checkpoint": str(args.supernet_checkpoint),
                 "arch_config_path": str(args.arch_config),
-                "candidate_timesteps": ppo_config.total_timesteps,
+                "candidate_timesteps": int(target_timesteps),
                 "train_seed": train_seed,
                 "eval_seed": eval_seed,
                 "device": str(device),
@@ -307,7 +378,9 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             },
         )
 
-        configured_progress_total = max(0, ppo_config.total_timesteps)
+        configured_progress_total = max(0, int(args.critic_warmup_timesteps)) + int(
+            target_timesteps
+        )
         if configured_progress_total > 0:
             progress_bar = tqdm(
                 total=configured_progress_total,
@@ -325,7 +398,11 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
         best_eval_ep_return: float | None = None
         best_eval_record: dict[str, Any] | None = None
 
-        def maybe_save_best_checkpoint(record: dict[str, Any], current_actual_timesteps: int, current_total_env_timesteps: int) -> None:
+        def maybe_save_best_checkpoint(
+            record: dict[str, Any],
+            current_actual_timesteps: int,
+            current_total_env_timesteps: int,
+        ) -> None:
             nonlocal best_eval_ep_return, best_eval_record
             ep_return = float(record["eval/ep_return"])
             if best_eval_ep_return is None or ep_return > best_eval_ep_return:
@@ -376,12 +453,18 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
 
         observation = train_env.reset()
         episode_starts = np.ones((train_env.num_envs,), dtype=np.bool_)
-        warmup_target = 0
+        warmup_target = max(0, int(args.critic_warmup_timesteps))
         warmup_iteration = 0
         while critic_warmup_actual_timesteps < warmup_target:
             warmup_iteration += 1
-            progress_remaining = 1.0 - float(critic_warmup_actual_timesteps) / float(max(1, warmup_target))
-            critic_lr = float(critic_lr_schedule(progress_remaining)) if callable(critic_lr_schedule) else float(critic_lr_schedule)
+            progress_remaining = 1.0 - float(critic_warmup_actual_timesteps) / float(
+                max(1, warmup_target)
+            )
+            critic_lr = (
+                float(critic_lr_schedule(progress_remaining))
+                if callable(critic_lr_schedule)
+                else float(critic_lr_schedule)
+            )
             update_optimizer_learning_rate(critic_optimizer, critic_lr)
             observation, episode_starts, rollout_metrics = collect_candidate_rollout(
                 policy=policy,
@@ -395,7 +478,9 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                 gamma=float(ppo_config.gamma),
                 device=device,
             )
-            critic_warmup_actual_timesteps += int(ppo_config.n_steps) * int(train_env.num_envs)
+            critic_warmup_actual_timesteps += int(ppo_config.n_steps) * int(
+                train_env.num_envs
+            )
             total_env_timesteps = critic_warmup_actual_timesteps + actual_timesteps
             critic_metrics = critic_update(
                 critic_model=critic_model,
@@ -417,7 +502,9 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                 **prefixed_metrics("critic_warmup", critic_metrics),
             }
             log_record(metrics_path, wandb_run, record, step=total_env_timesteps)
-            update_progress_bar(progress_bar, configured_progress_total, total_env_timesteps)
+            update_progress_bar(
+                progress_bar, configured_progress_total, total_env_timesteps
+            )
             if progress_bar is not None:
                 progress_bar.set_postfix(
                     {
@@ -429,18 +516,35 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                     refresh=True,
                 )
 
-        target_timesteps = max(0, ppo_config.total_timesteps)
         target_kl = parse_optional_float(ppo_config.target_kl)
         next_eval_timestep = eval_freq if eval_freq > 0 else 0
         train_iteration = 0
         last_train_record: dict[str, Any] = {}
         while actual_timesteps < target_timesteps:
             train_iteration += 1
-            progress_remaining = 1.0 - float(actual_timesteps) / float(max(1, target_timesteps))
-            actor_lr = float(policy_head_lr_schedule(progress_remaining)) if callable(policy_head_lr_schedule) else float(policy_head_lr_schedule)
-            backbone_lr = float(policy_backbone_lr_schedule(progress_remaining)) if callable(policy_backbone_lr_schedule) else float(policy_backbone_lr_schedule)
-            critic_lr = float(critic_lr_schedule(progress_remaining)) if callable(critic_lr_schedule) else float(critic_lr_schedule)
-            clip_range = float(clip_range_schedule(progress_remaining)) if callable(clip_range_schedule) else float(clip_range_schedule)
+            progress_remaining = 1.0 - float(actual_timesteps) / float(
+                max(1, target_timesteps)
+            )
+            actor_lr = (
+                float(policy_head_lr_schedule(progress_remaining))
+                if callable(policy_head_lr_schedule)
+                else float(policy_head_lr_schedule)
+            )
+            backbone_lr = (
+                float(policy_backbone_lr_schedule(progress_remaining))
+                if callable(policy_backbone_lr_schedule)
+                else float(policy_backbone_lr_schedule)
+            )
+            critic_lr = (
+                float(critic_lr_schedule(progress_remaining))
+                if callable(critic_lr_schedule)
+                else float(critic_lr_schedule)
+            )
+            clip_range = (
+                float(clip_range_schedule(progress_remaining))
+                if callable(clip_range_schedule)
+                else float(clip_range_schedule)
+            )
             update_actor_optimizer_learning_rate(actor_optimizer, actor_lr, backbone_lr)
             update_optimizer_learning_rate(critic_optimizer, critic_lr)
 
@@ -497,7 +601,9 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             }
             last_train_record = dict(train_record)
             log_record(metrics_path, wandb_run, train_record, step=total_env_timesteps)
-            update_progress_bar(progress_bar, configured_progress_total, total_env_timesteps)
+            update_progress_bar(
+                progress_bar, configured_progress_total, total_env_timesteps
+            )
             if progress_bar is not None:
                 progress_bar.set_postfix(
                     {
@@ -510,7 +616,11 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                     refresh=True,
                 )
 
-            if eval_env is not None and next_eval_timestep > 0 and actual_timesteps >= next_eval_timestep:
+            if (
+                eval_env is not None
+                and next_eval_timestep > 0
+                and actual_timesteps >= next_eval_timestep
+            ):
                 while next_eval_timestep <= actual_timesteps:
                     next_eval_timestep += eval_freq
                 eval_record = evaluate_and_record(
@@ -536,7 +646,9 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                         f"ep_length={eval_record['eval/ep_length']:.6g}"
                     ),
                 )
-                maybe_save_best_checkpoint(eval_record, actual_timesteps, total_env_timesteps)
+                maybe_save_best_checkpoint(
+                    eval_record, actual_timesteps, total_env_timesteps
+                )
 
             save_arch_checkpoint(
                 last_checkpoint_path,
@@ -579,13 +691,21 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                     f"ep_length={final_eval_record['eval/ep_length']:.6g}"
                 ),
             )
-            maybe_save_best_checkpoint(final_eval_record, actual_timesteps, total_env_timesteps)
+            maybe_save_best_checkpoint(
+                final_eval_record, actual_timesteps, total_env_timesteps
+            )
 
         policy.set_active_arch(arch_config)
         active_backbone_params = int(policy.backbone.elastic_num_params)
         actor_head_params = count_parameters(actor_head_parameters(policy))
         policy_params = int(sum(parameter.numel() for parameter in policy.parameters()))
-        trainable_policy_params = int(sum(parameter.numel() for parameter in policy.parameters() if parameter.requires_grad))
+        trainable_policy_params = int(
+            sum(
+                parameter.numel()
+                for parameter in policy.parameters()
+                if parameter.requires_grad
+            )
+        )
 
         save_arch_checkpoint(
             last_checkpoint_path,
@@ -614,7 +734,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             "best_checkpoint": str(best_checkpoint_path),
             "metrics": str(metrics_path),
             "search_space": str(search_space_path),
-            "configured_candidate_timesteps": ppo_config.total_timesteps,
+            "configured_candidate_timesteps": int(target_timesteps),
             "critic_warmup_actual_timesteps": int(critic_warmup_actual_timesteps),
             "total_env_timesteps": int(total_env_timesteps),
             "active_backbone_params": active_backbone_params,

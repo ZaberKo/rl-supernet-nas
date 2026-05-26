@@ -1,6 +1,6 @@
-import argparse
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 import torch
 from omegaconf import DictConfig, OmegaConf
@@ -11,7 +11,10 @@ from config_utils import ppo_config_to_dict
 from ppo_utils import parse_hidden_sizes, parse_optional_float, resolve_activation_fn
 from supernet_backbone import SearchSpace
 
-def load_checkpoint(path: str | Path, map_location: str | torch.device) -> dict[str, Any]:
+
+def load_checkpoint(
+    path: str | Path, map_location: str | torch.device
+) -> dict[str, Any]:
     checkpoint_path = Path(path)
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint_path}")
@@ -20,7 +23,10 @@ def load_checkpoint(path: str | Path, map_location: str | torch.device) -> dict[
         raise TypeError("Checkpoint data must be a mapping.")
     return dict(checkpoint)
 
-def build_network_ppo_config(checkpoint_ppo: Mapping[str, Any], runtime_ppo_config: Any, seed: int) -> DictConfig:
+
+def build_network_ppo_config(
+    checkpoint_ppo: Mapping[str, Any], runtime_ppo_config: Any, seed: int
+) -> DictConfig:
     values = ppo_config_to_dict(runtime_ppo_config)
     for key in (
         "features_dim",
@@ -35,15 +41,20 @@ def build_network_ppo_config(checkpoint_ppo: Mapping[str, Any], runtime_ppo_conf
     values["seed"] = int(seed)
     return OmegaConf.create(values)
 
-def validate_checkpoint_search_space(checkpoint: Mapping[str, Any], search_space: SearchSpace) -> None:
+
+def validate_checkpoint_search_space(
+    checkpoint: Mapping[str, Any], search_space: SearchSpace
+) -> None:
     checkpoint_search_space = checkpoint.get("search_space")
     if checkpoint_search_space is None:
         return
     if checkpoint_search_space != search_space.to_dict():
-        raise ValueError("Checkpoint search_space does not match the current SearchSpace defaults.")
+        raise ValueError(
+            "Checkpoint search_space does not match the current SearchSpace defaults."
+        )
+
 
 def build_policy_from_checkpoint(
-    args: argparse.Namespace,
     ppo_config: Any,
     train_env: VecEnv,
     search_space: SearchSpace,
@@ -57,11 +68,15 @@ def build_policy_from_checkpoint(
 
     projection_dim = ppo_config.projection_dim
     if projection_dim <= 0:
-        projection_dim = checkpoint.get("projection_dim", checkpoint_args.get("projection_dim", 128))
+        projection_dim = checkpoint.get(
+            "projection_dim", checkpoint_args.get("projection_dim", 128)
+        )
 
     predictor_hidden_dim = ppo_config.predictor_hidden_dim
     if predictor_hidden_dim <= 0:
-        predictor_hidden_dim = checkpoint_args.get("predictor_hidden_dim", 512)
+        predictor_hidden_dim = checkpoint.get(
+            "predictor_hidden_dim", checkpoint_args.get("predictor_hidden_dim", 512)
+        )
 
     def get_ppo_val(key: str) -> Any:
         return checkpoint_ppo.get(key, getattr(ppo_config, key))
@@ -84,6 +99,7 @@ def build_policy_from_checkpoint(
         raise KeyError("Checkpoint does not contain policy_state_dict.")
     policy.load_state_dict(state_dict, strict=True)
     return policy
+
 
 def load_critic_from_checkpoint(
     critic_model: PPO,

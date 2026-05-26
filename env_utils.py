@@ -1,19 +1,26 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import suppress
 from typing import Any
 
 import gymnasium as gym
 import numpy as np
 
-try:
+with suppress(ImportError):
     import ale_py  # noqa: F401
-except ImportError:
-    pass
 from gymnasium import spaces
 from stable_baselines3.common.atari_wrappers import AtariWrapper
 from stable_baselines3.common.preprocessing import is_image_space_channels_first
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecEnv, VecFrameStack, VecMonitor, VecNormalize, VecTransposeImage
+from stable_baselines3.common.vec_env import (
+    DummyVecEnv,
+    SubprocVecEnv,
+    VecEnv,
+    VecFrameStack,
+    VecMonitor,
+    VecNormalize,
+    VecTransposeImage,
+)
 
 EVAL_SEED_OFFSET = 42
 
@@ -178,7 +185,10 @@ def make_single_box2d_env(
             env = FrameSkipWrapper(env, skip=frame_skip)
         if grayscale_observation:
             env = GrayscaleImageObservation(env)
-        if image_size > 0 and env.observation_space.shape[:2] != (image_size, image_size):
+        if image_size > 0 and env.observation_space.shape[:2] != (
+            image_size,
+            image_size,
+        ):
             env = ResizeImageObservation(env, image_size=image_size)
         env = apply_time_limit(env, max_episode_steps)
         env.reset(seed=seed)
@@ -209,9 +219,8 @@ def make_vec_env_from_factories(
         raise ValueError(f"Unsupported vector_env_type: {vector_env_type}")
     env = VecMonitor(env)
     observation_space = env.observation_space
-    if (
-        len(observation_space.shape) == 3
-        and not is_image_space_channels_first(observation_space)
+    if len(observation_space.shape) == 3 and not is_image_space_channels_first(
+        observation_space
     ):
         env = VecTransposeImage(env)
     if frame_stack > 1:

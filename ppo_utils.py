@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping
 import json
 import math
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -14,7 +14,11 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.logger import KVWriter, filter_excluded_keys
-from stable_baselines3.common.vec_env import VecEnv, sync_envs_normalization, unwrap_vec_normalize
+from stable_baselines3.common.vec_env import (
+    VecEnv,
+    sync_envs_normalization,
+    unwrap_vec_normalize,
+)
 
 from env_utils import make_atari_vec_env, make_box2d_vec_env
 from sb3_nas_policy import build_ppo_model, configure_policy_optimizer
@@ -111,9 +115,17 @@ class JsonlTrainingMetricsWriter(KVWriter):
         self.file = path.open("a")
         self.log_fn = log_fn
 
-    def write(self, key_values: dict[str, Any], key_excluded: dict[str, tuple[str, ...]], step: int = 0) -> None:
+    def write(
+        self,
+        key_values: dict[str, Any],
+        key_excluded: dict[str, tuple[str, ...]],
+        step: int = 0,
+    ) -> None:
         values = filter_excluded_keys(key_values, key_excluded, "json")
-        metrics = {normalize_metric_key(key): jsonable_metric_value(value) for key, value in values.items()}
+        metrics = {
+            normalize_metric_key(key): jsonable_metric_value(value)
+            for key, value in values.items()
+        }
         if not metrics:
             return
         metrics.setdefault("total_timesteps", int(step))
@@ -175,7 +187,6 @@ def resolve_activation_fn(value: str | None) -> type[nn.Module] | None:
     return activations[name]
 
 
-
 def parse_optional_int(value: Any) -> int | None:
     if value is None:
         return None
@@ -184,19 +195,18 @@ def parse_optional_int(value: Any) -> int | None:
     return int(value)
 
 
-
 def make_vec_env_from_ppo_config(
     ppo_config: Any,
     seed: int | None = None,
     n_envs: int | None = None,
 ) -> VecEnv:
-    common_kwargs = dict(
-        env_id=ppo_config.env_id,
-        n_envs=ppo_config.train_n_envs if n_envs is None else n_envs,
-        seed=ppo_config.seed if seed is None else seed,
-        image_size=ppo_config.image_size,
-        vector_env_type=ppo_config.vector_env_type,
-    )
+    common_kwargs = {
+        "env_id": ppo_config.env_id,
+        "n_envs": ppo_config.train_n_envs if n_envs is None else n_envs,
+        "seed": ppo_config.seed if seed is None else seed,
+        "image_size": ppo_config.image_size,
+        "vector_env_type": ppo_config.vector_env_type,
+    }
 
     if getattr(ppo_config, "atari_wrapper", None) is not None:
         return make_atari_vec_env(
@@ -209,10 +219,14 @@ def make_vec_env_from_ppo_config(
             **OmegaConf.to_container(ppo_config.box2d_wrapper, resolve=True),
         )
     else:
-        raise ValueError("Exactly one of env.atari_wrapper or env.box2d_wrapper must be configured.")
+        raise ValueError(
+            "Exactly one of env.atari_wrapper or env.box2d_wrapper must be configured."
+        )
 
 
-def get_vision_spaces_from_ppo_config(ppo_config: Any, seed: int | None = None) -> tuple[Any, Any]:
+def get_vision_spaces_from_ppo_config(
+    ppo_config: Any, seed: int | None = None
+) -> tuple[Any, Any]:
     env = make_vec_env_from_ppo_config(ppo_config, seed=seed, n_envs=1)
     try:
         return env.observation_space, env.action_space
@@ -233,7 +247,6 @@ def build_ppo_model_from_config(
     env: VecEnv,
     arch_config: ArchConfig,
     backbone_checkpoint_path: str | None = None,
-    learning_rate_attr: str = "learning_rate",
     model_seed: int | None = None,
 ) -> PPO:
     return build_ppo_model(
@@ -241,7 +254,7 @@ def build_ppo_model_from_config(
         arch_config=arch_config,
         features_dim=ppo_config.features_dim,
         backbone_checkpoint_path=backbone_checkpoint_path,
-        learning_rate=parse_schedule_value(getattr(ppo_config, learning_rate_attr)),
+        learning_rate=parse_schedule_value(ppo_config.policy_head_lr),
         n_steps=ppo_config.n_steps,
         batch_size=ppo_config.batch_size,
         n_epochs=ppo_config.n_epochs,
@@ -273,7 +286,6 @@ def learn_ppo(
     model: PPO,
     total_timesteps: int,
     callback: BaseCallback | None = None,
-    run_id: str | None = None,
 ) -> None:
     if total_timesteps > 0:
         model.learn(
@@ -286,7 +298,7 @@ def learn_ppo(
 def steps_for_transition_budget(transitions: int, n_envs: int) -> int:
     if transitions <= 0:
         return 0
-    return int(math.ceil(transitions / max(1, n_envs)))
+    return math.ceil(transitions / max(1, n_envs))
 
 
 def evaluate_ppo_model(
@@ -319,27 +331,47 @@ def finetune_and_evaluate_arch(
     train_seed: int,
     eval_seed: int,
 ) -> tuple[PPO, float, float]:
-    train_env = make_vec_env_from_ppo_config(ppo_config, seed=train_seed, n_envs=ppo_config.train_n_envs)
-    eval_env = make_vec_env_from_ppo_config(ppo_config, seed=eval_seed, n_envs=ppo_config.eval_n_envs)
+    train_env = make_vec_env_from_ppo_config(
+        ppo_config, seed=train_seed, n_envs=ppo_config.train_n_envs
+    )
+    eval_env = make_vec_env_from_ppo_config(
+        ppo_config, seed=eval_seed, n_envs=ppo_config.eval_n_envs
+    )
     try:
-        checkpoint_path = args.supernet_checkpoint if Path(args.supernet_checkpoint).exists() else None
+        checkpoint_path = (
+            args.supernet_checkpoint
+            if Path(args.supernet_checkpoint).exists()
+            else None
+        )
+        head_lr = parse_schedule_value(ppo_config.policy_head_lr)
+        backbone_lr_arg = getattr(args, "supernet_backbone_lr", None)
+        if backbone_lr_arg is None:
+            backbone_lr_schedule = parse_schedule_value(ppo_config.policy_backbone_lr)
+            backbone_lr = (
+                float(backbone_lr_schedule(1.0))
+                if callable(backbone_lr_schedule)
+                else float(backbone_lr_schedule)
+            )
+        else:
+            backbone_lr = float(backbone_lr_arg)
+        candidate_timesteps = getattr(args, "candidate_timesteps", None)
+        if candidate_timesteps is None:
+            candidate_timesteps = ppo_config.total_timesteps
         model = build_ppo_model_from_config(
             ppo_config=ppo_config,
             env=train_env,
             arch_config=arch_config,
             backbone_checkpoint_path=checkpoint_path,
-            learning_rate_attr="head_lr",
             model_seed=train_seed,
         )
         configure_policy_optimizer(
             model,
-            head_lr=parse_schedule_value(ppo_config.head_lr),
-            backbone_lr=args.supernet_backbone_lr,
+            head_lr=head_lr,
+            backbone_lr=backbone_lr,
         )
         learn_ppo(
             model,
-            total_timesteps=args.candidate_timesteps,
-            run_id=f"finetune_{train_seed}",
+            total_timesteps=max(0, int(candidate_timesteps)),
         )
         mean_reward, std_reward = evaluate_ppo_model(
             model,

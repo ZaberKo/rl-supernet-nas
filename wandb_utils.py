@@ -4,7 +4,6 @@ import os
 from pathlib import Path
 from typing import Any
 
-
 WANDB_PROJECT = "rl-supernet-nas"
 
 
@@ -65,7 +64,6 @@ def log_wandb(run: Any, values: dict[str, Any], step: int | None = None) -> None
         run.log(sanitized_values, step=step)
     except Exception as exc:
         print(f"wandb_log_failed error={exc}", flush=True)
-
 
 
 def finish_wandb_run(run: Any) -> None:

@@ -6,13 +6,21 @@ from typing import Any
 
 from omegaconf import DictConfig, OmegaConf
 
-
 DEFAULT_PPO_CONFIG_PATH = Path(__file__).resolve().parent / "config.yaml"
 
 
 def add_ppo_config_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--ppo_config", default=str(DEFAULT_PPO_CONFIG_PATH), help="Path to the shared env/PPO YAML config.")
-    parser.add_argument("--ppo_config_override", action="append", default=[], help="OmegaConf dotlist override for env/PPO config, for example ppo.total_timesteps=10000.")
+    parser.add_argument(
+        "--ppo_config",
+        default=str(DEFAULT_PPO_CONFIG_PATH),
+        help="Path to the shared env/PPO YAML config.",
+    )
+    parser.add_argument(
+        "--ppo_config_override",
+        action="append",
+        default=[],
+        help="OmegaConf dotlist override for env/PPO config, for example ppo.total_timesteps=10000.",
+    )
 
 
 def load_ppo_config(args: argparse.Namespace) -> DictConfig:
@@ -37,7 +45,9 @@ def ppo_config_to_dict(ppo_config: DictConfig | dict[str, Any]) -> dict[str, Any
     return values
 
 
-def build_run_config(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
+def build_run_config(
+    args: argparse.Namespace, ppo_config: DictConfig
+) -> dict[str, Any]:
     return {
         "args": vars(args),
         "ppo_config": ppo_config_to_dict(ppo_config),

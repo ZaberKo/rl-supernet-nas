@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 import os
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -13,8 +13,8 @@ from omegaconf import DictConfig, OmegaConf
 
 from config_utils import ppo_config_to_dict
 from ea_codec import GeneCodec
-from ppo_utils import finetune_and_evaluate_arch
 from env_utils import EVAL_SEED_OFFSET
+from ppo_utils import finetune_and_evaluate_arch
 from supernet_backbone import ArchConfig
 
 
@@ -92,9 +92,13 @@ class DiscreteNSGA2(NSGA2):
             ),
             device=device,
         )
-        population = random_integer_population(pop_size=pop_size, lb=self.lb, ub=self.ub)
+        population = random_integer_population(
+            pop_size=pop_size, lb=self.lb, ub=self.ub
+        )
         if initial_population is not None and initial_population.numel() > 0:
-            initial_population = initial_population.to(device=self.lb.device, dtype=torch.float32).round()
+            initial_population = initial_population.to(
+                device=self.lb.device, dtype=torch.float32
+            ).round()
             count = min(pop_size, initial_population.shape[0])
             population[:count] = initial_population[:count]
         self.pop = Mutable(population)
@@ -131,7 +135,9 @@ def _evaluate_subnet_worker(config: SubnetEvalConfig) -> dict[str, Any]:
         "return": float(mean_return),
         "return_std": float(std_return),
         "params": int(backbone.elastic_num_params),
-        "policy_params": int(sum(parameter.numel() for parameter in model.policy.parameters())),
+        "policy_params": int(
+            sum(parameter.numel() for parameter in model.policy.parameters())
+        ),
         "train_seed": config.train_seed,
         "eval_seed": config.eval_seed,
         "pid": os.getpid(),
@@ -162,7 +168,9 @@ class RLSubnetProblem(Problem):
         self.last_cache_hits = 0
         self._pool = None
 
-    def _make_eval_config(self, gene: list[int], candidate_index: int) -> SubnetEvalConfig:
+    def _make_eval_config(
+        self, gene: list[int], candidate_index: int
+    ) -> SubnetEvalConfig:
         train_seed = (
             int(self.ppo_config_dict["seed"])
             + self.eval_call_index * int(self.args_dict["eval_call_seed_stride"])
@@ -188,7 +196,7 @@ class RLSubnetProblem(Problem):
 
     @torch.compiler.disable
     def evaluate(self, pop: torch.Tensor) -> torch.Tensor:
-        genes = [[int(round(value)) for value in row.tolist()] for row in pop.detach().cpu()]
+        genes = [[round(value) for value in row.tolist()] for row in pop.detach().cpu()]
         records: list[dict[str, Any] | None] = [None] * len(genes)
         pending: list[SubnetEvalConfig] = []
         pending_indices: list[int] = []
@@ -210,7 +218,7 @@ class RLSubnetProblem(Problem):
             else:
                 pool = self._ensure_pool()
                 evaluated = pool.map(_evaluate_subnet_worker, pending)
-            for index, record in zip(pending_indices, evaluated):
+            for index, record in zip(pending_indices, evaluated, strict=True):
                 key = tuple(record["gene"])
                 self.cache[key] = dict(record)
                 records[index] = record

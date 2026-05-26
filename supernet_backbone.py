@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import asdict, dataclass
 import random
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass
+from itertools import pairwise
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 import torch
 import torch.nn as nn
 
-from checkpoint_utils import load_checkpoint
-from primitive_blocks import ElasticConv2d, ElasticGroupNorm2d, ElasticLinear, GroupNorm2d
+from primitive_blocks import (
+    ElasticConv2d,
+    ElasticGroupNorm2d,
+    ElasticLinear,
+    GroupNorm2d,
+)
 
 
 @dataclass(frozen=True)
@@ -37,7 +43,7 @@ class ArchConfig:
         }
 
     @classmethod
-    def from_dict(cls, config_dict: dict[str, Any]) -> "ArchConfig":
+    def from_dict(cls, config_dict: dict[str, Any]) -> ArchConfig:
         return cls(
             stage_depths=tuple(int(value) for value in config_dict["stage_depths"]),
             layer_configs=tuple(
@@ -62,7 +68,9 @@ class SearchSpace:
 
     def __post_init__(self) -> None:
         if len(self.stage_widths) != len(self.stage_depth_candidates):
-            raise ValueError("stage_widths and stage_depth_candidates must have the same length.")
+            raise ValueError(
+                "stage_widths and stage_depth_candidates must have the same length."
+            )
         if not self.kernel_size_candidates:
             raise ValueError("kernel_size_candidates must not be empty.")
         if not self.expand_ratio_candidates:
@@ -94,9 +102,13 @@ class SearchSpace:
 
     def max_arch(self) -> ArchConfig:
         return self._build_arch(
-            stage_depth_indices=[len(candidates) - 1 for candidates in self.stage_depth_candidates],
-            kernel_indices=[len(self.kernel_size_candidates) - 1] * sum(self.max_stage_depths),
-            expand_indices=[len(self.expand_ratio_candidates) - 1] * sum(self.max_stage_depths),
+            stage_depth_indices=[
+                len(candidates) - 1 for candidates in self.stage_depth_candidates
+            ],
+            kernel_indices=[len(self.kernel_size_candidates) - 1]
+            * sum(self.max_stage_depths),
+            expand_indices=[len(self.expand_ratio_candidates) - 1]
+            * sum(self.max_stage_depths),
         )
 
     def sample_arch(self) -> ArchConfig:
@@ -124,7 +136,9 @@ class SearchSpace:
     ) -> ArchConfig:
         stage_depths = tuple(
             candidates[index]
-            for candidates, index in zip(self.stage_depth_candidates, stage_depth_indices)
+            for candidates, index in zip(
+                self.stage_depth_candidates, stage_depth_indices, strict=True
+            )
         )
         layer_configs = []
         offset = 0
@@ -134,7 +148,9 @@ class SearchSpace:
                 stage_layers.append(
                     LayerConfig(
                         kernel_size=self.kernel_size_candidates[kernel_indices[offset]],
-                        expand_ratio=self.expand_ratio_candidates[expand_indices[offset]],
+                        expand_ratio=self.expand_ratio_candidates[
+                            expand_indices[offset]
+                        ],
                     )
                 )
                 offset += 1
@@ -144,7 +160,9 @@ class SearchSpace:
     def to_dict(self) -> dict[str, Any]:
         return {
             "stage_widths": list(self.stage_widths),
-            "stage_depth_candidates": [list(values) for values in self.stage_depth_candidates],
+            "stage_depth_candidates": [
+                list(values) for values in self.stage_depth_candidates
+            ],
             "kernel_size_candidates": list(self.kernel_size_candidates),
             "expand_ratio_candidates": list(self.expand_ratio_candidates),
         }
@@ -210,7 +228,9 @@ class FixedCNNBackbone(nn.Module):
         super().__init__()
         self.stem = stem
         self.transitions = nn.ModuleList(transitions)
-        self.stages = nn.ModuleList([nn.ModuleList(stage_blocks) for stage_blocks in stages])
+        self.stages = nn.ModuleList(
+            [nn.ModuleList(stage_blocks) for stage_blocks in stages]
+        )
         self.pool = pool
         self.project = project
         self.output_activation = output_activation
@@ -260,7 +280,9 @@ class ElasticMBConvBlock(nn.Module):
             bias=False,
             candidate_kernel_sizes=kernel_size_candidates,
         )
-        self.depthwise_norm = ElasticGroupNorm2d(super_num_channels=self.max_mid_channels)
+        self.depthwise_norm = ElasticGroupNorm2d(
+            super_num_channels=self.max_mid_channels
+        )
         self.project = ElasticConv2d(
             super_in_channels=self.max_mid_channels,
             super_out_channels=channels,
@@ -358,12 +380,14 @@ class SupernetCNNBackbone(nn.Module):
 
         self.stem = ConvLNAct(input_channels, widths[0], stride=2)
         transitions: list[nn.Module] = [nn.Identity()]
-        for in_channels, out_channels in zip(widths[:-1], widths[1:]):
+        for in_channels, out_channels in pairwise(widths):
             transitions.append(ConvLNAct(in_channels, out_channels, stride=2))
         self.transitions = nn.ModuleList(transitions)
 
         stages: list[nn.ModuleList] = []
-        for width, max_depth in zip(widths, self.search_space.max_stage_depths):
+        for width, max_depth in zip(
+            widths, self.search_space.max_stage_depths, strict=True
+        ):
             blocks = nn.ModuleList(
                 [
                     ElasticMBConvBlock(
@@ -377,8 +401,12 @@ class SupernetCNNBackbone(nn.Module):
             stages.append(blocks)
         self.stages = nn.ModuleList(stages)
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.project = ElasticLinear(super_in_dim=widths[-1], super_out_dim=feature_dim, bias=True)
-        self.project.set_sample_config(sample_in_dim=widths[-1], sample_out_dim=feature_dim)
+        self.project = ElasticLinear(
+            super_in_dim=widths[-1], super_out_dim=feature_dim, bias=True
+        )
+        self.project.set_sample_config(
+            sample_in_dim=widths[-1], sample_out_dim=feature_dim
+        )
         self.output_activation = nn.SiLU(inplace=True)
         self.active_arch = self.search_space.max_arch()
         self.set_sample_config(self.active_arch)
@@ -387,10 +415,14 @@ class SupernetCNNBackbone(nn.Module):
         if len(arch_config.stage_depths) != len(self.stages):
             raise ValueError("Architecture stage count does not match the backbone.")
         self.active_arch = arch_config
-        for blocks, stage_layers in zip(self.stages, arch_config.layer_configs):
+        for blocks, stage_layers in zip(
+            self.stages, arch_config.layer_configs, strict=True
+        ):
             if len(stage_layers) != len(blocks):
-                raise ValueError("Architecture layer count does not match the backbone.")
-            for block, layer_config in zip(blocks, stage_layers):
+                raise ValueError(
+                    "Architecture layer count does not match the backbone."
+                )
+            for block, layer_config in zip(blocks, stage_layers, strict=True):
                 block.set_sample_config(
                     sample_kernel_size=layer_config.kernel_size,
                     sample_expand_ratio=layer_config.expand_ratio,
@@ -422,7 +454,9 @@ class SupernetCNNBackbone(nn.Module):
         stages: list[list[nn.Module]] = []
         for stage_index, blocks in enumerate(self.stages):
             active_depth = self.active_arch.stage_depths[stage_index]
-            stages.append([block.get_active_subnet() for block in blocks[:active_depth]])
+            stages.append(
+                [block.get_active_subnet() for block in blocks[:active_depth]]
+            )
         return FixedCNNBackbone(
             stem=copy.deepcopy(self.stem),
             transitions=[copy.deepcopy(transition) for transition in self.transitions],
@@ -456,14 +490,18 @@ def infer_input_channels(observation_shape: tuple[int, ...]) -> int:
 POLICY_BACKBONE_PREFIX = "features_extractor.backbone."
 
 
-def extract_backbone_state_dict_from_policy_state_dict(policy_state_dict: Mapping[str, Any]) -> dict[str, Any]:
+def extract_backbone_state_dict_from_policy_state_dict(
+    policy_state_dict: Mapping[str, Any],
+) -> dict[str, Any]:
     backbone_state_dict = {
         key.removeprefix(POLICY_BACKBONE_PREFIX): value
         for key, value in policy_state_dict.items()
         if key.startswith(POLICY_BACKBONE_PREFIX)
     }
     if not backbone_state_dict:
-        raise KeyError(f"No keys found with prefix {POLICY_BACKBONE_PREFIX!r} in policy_state_dict.")
+        raise KeyError(
+            f"No keys found with prefix {POLICY_BACKBONE_PREFIX!r} in policy_state_dict."
+        )
     return backbone_state_dict
 
 
@@ -474,6 +512,8 @@ def load_backbone_from_policy_checkpoint(
 ) -> dict[str, Any] | None:
     if checkpoint_path is None:
         return None
+
+    from checkpoint_utils import load_checkpoint
 
     checkpoint = load_checkpoint(checkpoint_path, map_location)
     policy_state_dict = checkpoint.get("policy_state_dict")
@@ -491,6 +531,8 @@ def load_backbone_from_backbone_checkpoint(
 ) -> dict[str, Any] | None:
     if checkpoint_path is None:
         return None
+
+    from checkpoint_utils import load_checkpoint
 
     checkpoint = load_checkpoint(checkpoint_path, map_location)
     backbone_state_dict = checkpoint.get("backbone_state_dict")

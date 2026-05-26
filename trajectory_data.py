@@ -1,20 +1,21 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import random
-from typing import Any, Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from pathlib import Path
+from typing import Any
 
 import gymnasium as gym
 import h5py
 import numpy as np
 import torch
 from datasets import Dataset as ArrowDataset
-from datasets import Features, Sequence as ArrowSequence, Value
+from datasets import Features, Value
+from datasets import Sequence as ArrowSequence
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.vec_env import VecEnv
 from torch.utils.data import Dataset as TorchDataset
-
 
 TRAJECTORY_METADATA_FILE = "metadata.json"
 SUPERVISED_DATASET_TYPE = "supervised_transition_samples"
@@ -100,21 +101,47 @@ def read_hdf5_metadata(path: str | Path) -> dict[str, Any]:
         raise ValueError(f"Expected an HDF5 representation dataset: {path}")
     with h5py.File(path, "r") as dataset_file:
         if dataset_file.attrs.get("dataset_type") != SUPERVISED_DATASET_TYPE:
-            raise ValueError(f"Expected a supervised HDF5 representation dataset: {path}")
+            raise ValueError(
+                f"Expected a supervised HDF5 representation dataset: {path}"
+            )
         raw_metadata = dataset_file.attrs.get("metadata_json", "{}")
         if isinstance(raw_metadata, bytes):
             raw_metadata = raw_metadata.decode("utf-8")
         metadata = json.loads(str(raw_metadata))
-        metadata.setdefault("dataset_type", dataset_file.attrs.get("dataset_type", SUPERVISED_DATASET_TYPE))
-        metadata.setdefault("trajectory_storage_format", dataset_file.attrs.get("trajectory_storage_format", HDF5_REPRESENTATION_STORAGE_FORMAT))
-        metadata.setdefault("supervised_schema_version", int(dataset_file.attrs.get("supervised_schema_version", HDF5_REPRESENTATION_SCHEMA_VERSION)))
+        metadata.setdefault(
+            "dataset_type",
+            dataset_file.attrs.get("dataset_type", SUPERVISED_DATASET_TYPE),
+        )
+        metadata.setdefault(
+            "trajectory_storage_format",
+            dataset_file.attrs.get(
+                "trajectory_storage_format", HDF5_REPRESENTATION_STORAGE_FORMAT
+            ),
+        )
+        metadata.setdefault(
+            "supervised_schema_version",
+            int(
+                dataset_file.attrs.get(
+                    "supervised_schema_version", HDF5_REPRESENTATION_SCHEMA_VERSION
+                )
+            ),
+        )
         metadata.setdefault("horizon", int(dataset_file.attrs.get("horizon", 1)))
         if "observation" in dataset_file:
-            metadata.setdefault("num_samples", int(dataset_file["observation"].shape[0]))
-            metadata.setdefault("observation_shape", [int(value) for value in dataset_file["observation"].shape[1:]])
-            metadata.setdefault("observation_dtype", str(dataset_file["observation"].dtype))
+            metadata.setdefault(
+                "num_samples", int(dataset_file["observation"].shape[0])
+            )
+            metadata.setdefault(
+                "observation_shape",
+                [int(value) for value in dataset_file["observation"].shape[1:]],
+            )
+            metadata.setdefault(
+                "observation_dtype", str(dataset_file["observation"].dtype)
+            )
         else:
-            metadata.setdefault("num_samples", int(dataset_file.attrs.get("num_samples", 0)))
+            metadata.setdefault(
+                "num_samples", int(dataset_file.attrs.get("num_samples", 0))
+            )
         if "actions" in dataset_file:
             action_shape = dataset_file["actions"].shape[2:]
             metadata.setdefault("action_shape", [int(value) for value in action_shape])
@@ -172,10 +199,16 @@ def hdf5_compression_kwargs() -> dict[str, Any]:
     }
 
 
-def hdf5_chunk_shape(values: np.ndarray, max_chunk_samples: int, target_chunk_bytes: int) -> tuple[int, ...]:
+def hdf5_chunk_shape(
+    values: np.ndarray, max_chunk_samples: int, target_chunk_bytes: int
+) -> tuple[int, ...]:
     sample_shape = tuple(int(value) for value in values.shape[1:])
-    sample_bytes = max(1, int(np.dtype(values.dtype).itemsize * np.prod(sample_shape, dtype=np.int64)))
-    chunk_samples = max(1, min(int(max_chunk_samples), int(target_chunk_bytes) // sample_bytes))
+    sample_bytes = max(
+        1, int(np.dtype(values.dtype).itemsize * np.prod(sample_shape, dtype=np.int64))
+    )
+    chunk_samples = max(
+        1, min(int(max_chunk_samples), int(target_chunk_bytes) // sample_bytes)
+    )
     return (chunk_samples, *sample_shape)
 
 
@@ -240,8 +273,12 @@ def build_supervised_transition_features(
             "step_index": Value("int64"),
             "env_index": Value("int64"),
             "observation": fixed_shape_feature(observation_shape, observation_dtype),
-            "actions": fixed_shape_feature((horizon, *tuple(action_shape)), action_dtype),
-            "targets": fixed_shape_feature((horizon, *tuple(observation_shape)), observation_dtype),
+            "actions": fixed_shape_feature(
+                (horizon, *tuple(action_shape)), action_dtype
+            ),
+            "targets": fixed_shape_feature(
+                (horizon, *tuple(observation_shape)), observation_dtype
+            ),
             "dones": fixed_shape_feature((horizon,), np.dtype(np.bool_)),
             "terminateds": fixed_shape_feature((horizon,), np.dtype(np.bool_)),
             "truncateds": fixed_shape_feature((horizon,), np.dtype(np.bool_)),
@@ -249,7 +286,9 @@ def build_supervised_transition_features(
     )
 
 
-def _resolve_source_steps(arrays: dict[str, np.ndarray], num_steps: int, num_envs: int) -> np.ndarray:
+def _resolve_source_steps(
+    arrays: dict[str, np.ndarray], num_steps: int, num_envs: int
+) -> np.ndarray:
     source_steps = arrays.get("source_steps")
     if source_steps is None:
         return np.broadcast_to(
@@ -260,7 +299,9 @@ def _resolve_source_steps(arrays: dict[str, np.ndarray], num_steps: int, num_env
     if source_steps.shape == (num_steps,):
         return np.broadcast_to(source_steps[:, None], (num_steps, num_envs))
     if source_steps.shape != (num_steps, num_envs):
-        raise ValueError("source_steps must have shape [num_steps] or [num_steps, num_envs].")
+        raise ValueError(
+            "source_steps must have shape [num_steps] or [num_steps, num_envs]."
+        )
     return source_steps
 
 
@@ -293,7 +334,10 @@ def iter_supervised_transition_samples_from_arrays(
         raise ValueError("actions must start with [num_steps, num_envs].")
     if next_observations.shape != observations.shape:
         raise ValueError("next_observations must match observations shape.")
-    if terminateds.shape != (num_steps, num_envs) or truncateds.shape != (num_steps, num_envs):
+    if terminateds.shape != (num_steps, num_envs) or truncateds.shape != (
+        num_steps,
+        num_envs,
+    ):
         raise ValueError("done flags must have shape [num_steps, num_envs].")
     source_steps = _resolve_source_steps(arrays, num_steps, num_envs)
     env_indices = _resolve_env_indices(arrays, num_envs)
@@ -323,8 +367,12 @@ def iter_supervised_transition_samples_from_arrays(
                 "source_step": source_step,
                 "observation": np.asarray(observations[start_index, env_index]),
                 "actions": np.asarray(actions[start_index:end_index, env_index]),
-                "targets": np.asarray(next_observations[start_index:end_index, env_index]),
-                "dones": np.asarray(sample_terminateds | sample_truncateds, dtype=np.bool_),
+                "targets": np.asarray(
+                    next_observations[start_index:end_index, env_index]
+                ),
+                "dones": np.asarray(
+                    sample_terminateds | sample_truncateds, dtype=np.bool_
+                ),
                 "terminateds": np.asarray(sample_terminateds, dtype=np.bool_),
                 "truncateds": np.asarray(sample_truncateds, dtype=np.bool_),
             }
@@ -369,7 +417,9 @@ def write_supervised_transition_samples(
     if int(horizon) != inferred_horizon:
         raise ValueError("horizon does not match the sample action shape.")
     horizon = int(horizon)
-    observation_shape = tuple(int(value) for value in np.asarray(first["observation"]).shape)
+    observation_shape = tuple(
+        int(value) for value in np.asarray(first["observation"]).shape
+    )
     action_shape = tuple(int(value) for value in np.asarray(first["actions"]).shape[1:])
     observation_dtype = np.asarray(first["observation"]).dtype
     action_dtype = np.asarray(first["actions"]).dtype
@@ -379,7 +429,7 @@ def write_supervised_transition_samples(
             "dataset_type": SUPERVISED_DATASET_TYPE,
             "supervised_schema_version": 1,
             "horizon": int(horizon),
-            "num_samples": int(len(samples)),
+            "num_samples": len(samples),
             "num_raw_transitions": int(num_raw_transitions),
             "observation_shape": list(observation_shape),
             "observation_dtype": str(observation_dtype),
@@ -402,8 +452,14 @@ def write_supervised_transition_samples(
         for default_sample_id, sample in enumerate(samples):
             yield {
                 "sample_id": int(sample.get("sample_id", default_sample_id)),
-                "source_trajectory_id": int(sample.get("source_trajectory_id", sample.get("env_index", 0))),
-                "step_index": int(sample.get("step_index", sample.get("source_step", default_sample_id))),
+                "source_trajectory_id": int(
+                    sample.get("source_trajectory_id", sample.get("env_index", 0))
+                ),
+                "step_index": int(
+                    sample.get(
+                        "step_index", sample.get("source_step", default_sample_id)
+                    )
+                ),
                 "env_index": int(sample["env_index"]),
                 "observation": np.asarray(sample["observation"]),
                 "actions": np.asarray(sample["actions"]),
@@ -434,15 +490,24 @@ def write_supervised_transition_samples_from_hdf5_files(
     if total_samples <= 0:
         raise ValueError("At least one supervised transition sample is required.")
 
-    first_metadata = next(item for item in input_metadata if int(item.get("num_samples", 0)) > 0)
-    input_horizon = int(first_metadata.get("horizon", horizon if horizon is not None else 1))
+    first_metadata = next(
+        item for item in input_metadata if int(item.get("num_samples", 0)) > 0
+    )
+    input_horizon = int(
+        first_metadata.get("horizon", horizon if horizon is not None else 1)
+    )
     if horizon is not None and int(horizon) != input_horizon:
         raise ValueError("horizon does not match the HDF5 input horizon.")
     for item in input_metadata:
-        if int(item.get("num_samples", 0)) > 0 and int(item.get("horizon", input_horizon)) != input_horizon:
+        if (
+            int(item.get("num_samples", 0)) > 0
+            and int(item.get("horizon", input_horizon)) != input_horizon
+        ):
             raise ValueError("All HDF5 inputs must use the same horizon.")
 
-    observation_shape = tuple(int(value) for value in first_metadata["observation_shape"])
+    observation_shape = tuple(
+        int(value) for value in first_metadata["observation_shape"]
+    )
     observation_dtype = np.dtype(first_metadata["observation_dtype"])
     action_shape = tuple(int(value) for value in first_metadata["action_shape"])
     action_dtype = np.dtype(first_metadata["action_dtype"])
@@ -481,8 +546,14 @@ def write_supervised_transition_samples_from_hdf5_files(
             for sample in iter_hdf5_supervised_transition_rows(path):
                 yield {
                     "sample_id": int(output_sample_id),
-                    "source_trajectory_id": int(sample.get("source_trajectory_id", sample.get("env_index", 0))),
-                    "step_index": int(sample.get("step_index", sample.get("source_step", output_sample_id))),
+                    "source_trajectory_id": int(
+                        sample.get("source_trajectory_id", sample.get("env_index", 0))
+                    ),
+                    "step_index": int(
+                        sample.get(
+                            "step_index", sample.get("source_step", output_sample_id)
+                        )
+                    ),
                     "env_index": int(sample["env_index"]),
                     "observation": np.asarray(sample["observation"]),
                     "actions": np.asarray(sample["actions"]),
@@ -534,11 +605,15 @@ def iter_hdf5_supervised_transition_rows(path: str | Path) -> Iterator[dict[str,
         if "observation" not in dataset_file:
             return
         num_samples = int(dataset_file["observation"].shape[0])
-        env_indices = dataset_file["env_index"] if "env_index" in dataset_file else None
-        source_steps = dataset_file["source_step"] if "source_step" in dataset_file else None
+        env_indices = dataset_file.get("env_index", None)
+        source_steps = dataset_file.get("source_step", None)
         for sample_index in range(num_samples):
             env_index = int(env_indices[sample_index]) if env_indices is not None else 0
-            source_step = int(source_steps[sample_index]) if source_steps is not None else sample_index
+            source_step = (
+                int(source_steps[sample_index])
+                if source_steps is not None
+                else sample_index
+            )
             yield {
                 "sample_id": int(sample_index),
                 "source_trajectory_id": int(env_index),
@@ -548,9 +623,15 @@ def iter_hdf5_supervised_transition_rows(path: str | Path) -> Iterator[dict[str,
                 "observation": np.asarray(dataset_file["observation"][sample_index]),
                 "actions": np.asarray(dataset_file["actions"][sample_index]),
                 "targets": np.asarray(dataset_file["targets"][sample_index]),
-                "dones": np.asarray(dataset_file["dones"][sample_index], dtype=np.bool_),
-                "terminateds": np.asarray(dataset_file["terminateds"][sample_index], dtype=np.bool_),
-                "truncateds": np.asarray(dataset_file["truncateds"][sample_index], dtype=np.bool_),
+                "dones": np.asarray(
+                    dataset_file["dones"][sample_index], dtype=np.bool_
+                ),
+                "terminateds": np.asarray(
+                    dataset_file["terminateds"][sample_index], dtype=np.bool_
+                ),
+                "truncateds": np.asarray(
+                    dataset_file["truncateds"][sample_index], dtype=np.bool_
+                ),
             }
 
 
@@ -625,12 +706,14 @@ class Hdf5RepresentationWriter:
             self._create_dataset(name, arrays[name])
         self._initialized = True
 
-    def _expected_shapes(self, arrays: dict[str, np.ndarray]) -> dict[str, tuple[int, ...]]:
+    def _expected_shapes(
+        self, arrays: dict[str, np.ndarray]
+    ) -> dict[str, tuple[int, ...]]:
         num_samples = int(arrays["observation"].shape[0])
         return {
             "actions": (num_samples, self.horizon, *arrays["actions"].shape[2:]),
             "targets": (num_samples, self.horizon, *arrays["observation"].shape[1:]),
-            **{name: (num_samples, self.horizon) for name in HDF5_FLAG_ARRAYS},
+            **dict.fromkeys(HDF5_FLAG_ARRAYS, (num_samples, self.horizon)),
             "env_index": (num_samples,),
             "source_step": (num_samples,),
         }
@@ -661,7 +744,9 @@ class Hdf5RepresentationWriter:
             return arrays
         for name, expected_shape in self._expected_shapes(arrays).items():
             if arrays[name].shape != expected_shape:
-                raise ValueError(f"{name} must have shape {expected_shape}, got {arrays[name].shape}.")
+                raise ValueError(
+                    f"{name} must have shape {expected_shape}, got {arrays[name].shape}."
+                )
         return arrays
 
     def append(
@@ -708,15 +793,45 @@ class Hdf5RepresentationWriter:
         if not samples:
             return
         self.append(
-            observations=np.stack([np.asarray(sample["observation"]) for sample in samples], axis=0),
-            actions=np.stack([np.asarray(sample["actions"]) for sample in samples], axis=0),
-            targets=np.stack([np.asarray(sample["targets"]) for sample in samples], axis=0),
-            dones=np.stack([np.asarray(sample["dones"], dtype=np.bool_) for sample in samples], axis=0),
-            terminateds=np.stack([np.asarray(sample["terminateds"], dtype=np.bool_) for sample in samples], axis=0),
-            truncateds=np.stack([np.asarray(sample["truncateds"], dtype=np.bool_) for sample in samples], axis=0),
-            env_indices=np.asarray([int(sample["env_index"]) for sample in samples], dtype=np.int32),
+            observations=np.stack(
+                [np.asarray(sample["observation"]) for sample in samples], axis=0
+            ),
+            actions=np.stack(
+                [np.asarray(sample["actions"]) for sample in samples], axis=0
+            ),
+            targets=np.stack(
+                [np.asarray(sample["targets"]) for sample in samples], axis=0
+            ),
+            dones=np.stack(
+                [np.asarray(sample["dones"], dtype=np.bool_) for sample in samples],
+                axis=0,
+            ),
+            terminateds=np.stack(
+                [
+                    np.asarray(sample["terminateds"], dtype=np.bool_)
+                    for sample in samples
+                ],
+                axis=0,
+            ),
+            truncateds=np.stack(
+                [
+                    np.asarray(sample["truncateds"], dtype=np.bool_)
+                    for sample in samples
+                ],
+                axis=0,
+            ),
+            env_indices=np.asarray(
+                [int(sample["env_index"]) for sample in samples], dtype=np.int32
+            ),
             source_steps=np.asarray(
-                [int(sample.get("source_step", sample.get("step_index", sample_index))) for sample_index, sample in enumerate(samples)],
+                [
+                    int(
+                        sample.get(
+                            "source_step", sample.get("step_index", sample_index)
+                        )
+                    )
+                    for sample_index, sample in enumerate(samples)
+                ],
                 dtype=np.int64,
             ),
         )
@@ -728,7 +843,9 @@ class Hdf5RepresentationWriter:
             self.metadata.update(metadata)
         self._write_metadata()
         self.file.flush()
-        self.metadata["actual_bytes"] = int(self.path.stat().st_size) if self.path.exists() else 0
+        self.metadata["actual_bytes"] = (
+            int(self.path.stat().st_size) if self.path.exists() else 0
+        )
         self._write_metadata()
         self.file.flush()
         self.file.close()
@@ -790,7 +907,9 @@ class TrajectoryRecorderCallback(BaseCallback):
         for env_index, info in enumerate(infos or []):
             terminal_observation = info.get("terminal_observation")
             if terminal_observation is not None:
-                terminal_next_observations[int(env_index)] = np.asarray(terminal_observation).copy()
+                terminal_next_observations[int(env_index)] = np.asarray(
+                    terminal_observation
+                ).copy()
         self.rollout_dones.append(dones.copy())
         self.rollout_terminateds.append(terminateds.copy())
         self.rollout_truncateds.append(truncateds.copy())
@@ -798,7 +917,11 @@ class TrajectoryRecorderCallback(BaseCallback):
         return True
 
     def _rollout_actions(self, actions: np.ndarray) -> np.ndarray:
-        if isinstance(self.model.action_space, gym.spaces.Discrete) and actions.ndim >= 3 and actions.shape[-1] == 1:
+        if (
+            isinstance(self.model.action_space, gym.spaces.Discrete)
+            and actions.ndim >= 3
+            and actions.shape[-1] == 1
+        ):
             return actions[..., 0].astype(np.int64, copy=False)
         return actions
 
@@ -806,9 +929,13 @@ class TrajectoryRecorderCallback(BaseCallback):
         next_observations = np.empty_like(observations)
         if observations.shape[0] > 1:
             next_observations[:-1] = observations[1:]
-        final_next_observation = np.asarray(self.locals.get("new_obs", self.model._last_obs))
+        final_next_observation = np.asarray(
+            self.locals.get("new_obs", self.model._last_obs)
+        )
         next_observations[-1] = final_next_observation
-        for step_index, terminal_next_observations in enumerate(self.rollout_terminal_next_observations):
+        for step_index, terminal_next_observations in enumerate(
+            self.rollout_terminal_next_observations
+        ):
             for env_index, terminal_observation in terminal_next_observations.items():
                 next_observations[step_index, env_index] = terminal_observation
         return next_observations
@@ -849,7 +976,9 @@ class TrajectoryRecorderCallback(BaseCallback):
         terminateds = np.stack(self.rollout_terminateds, axis=0)
         truncateds = np.stack(self.rollout_truncateds, axis=0)
         next_observations = self._build_next_observations(observations)
-        source_steps = np.arange(self.next_source_step, self.next_source_step + n_steps, dtype=np.int64)
+        source_steps = np.arange(
+            self.next_source_step, self.next_source_step + n_steps, dtype=np.int64
+        )
         self.raw_transitions += int(n_steps * observations.shape[1])
 
         kept_samples: list[dict[str, Any]] = []
@@ -879,16 +1008,26 @@ class TrajectoryRecorderCallback(BaseCallback):
             )
             for sample in sample_iter:
                 self.eligible_samples += 1
-                if self.max_samples is not None and self.num_samples + len(kept_samples) >= self.max_samples:
+                if (
+                    self.max_samples is not None
+                    and self.num_samples + len(kept_samples) >= self.max_samples
+                ):
                     continue
-                if self.sample_ratio < 1.0 and self.sample_rng.random() >= self.sample_ratio:
+                if (
+                    self.sample_ratio < 1.0
+                    and self.sample_rng.random() >= self.sample_ratio
+                ):
                     continue
                 kept_samples.append(sample)
             self._update_tail(env_index, sequence)
 
         self.writer.append_samples(kept_samples)
         self.next_source_step += n_steps
-        if self.log_fn is not None and self.log_interval > 0 and self.n_calls % self.log_interval == 0:
+        if (
+            self.log_fn is not None
+            and self.log_interval > 0
+            and self.n_calls % self.log_interval == 0
+        ):
             self.log_fn(
                 {
                     "total_timesteps": int(self.num_timesteps),
@@ -906,7 +1045,9 @@ class TrajectoryRecorderCallback(BaseCallback):
                 "num_samples": int(self.num_samples),
                 "sample_ratio": float(self.sample_ratio),
                 "sample_seed": int(self.sample_seed),
-                "max_samples": int(self.max_samples) if self.max_samples is not None else None,
+                "max_samples": int(self.max_samples)
+                if self.max_samples is not None
+                else None,
                 "horizon": int(self.horizon),
             }
         )
@@ -915,7 +1056,9 @@ class TrajectoryRecorderCallback(BaseCallback):
 
 def sample_action_batch(action_space: gym.Space, n_envs: int) -> np.ndarray:
     if isinstance(action_space, gym.spaces.Discrete):
-        return np.asarray([action_space.sample() for _ in range(n_envs)], dtype=np.int64)
+        return np.asarray(
+            [action_space.sample() for _ in range(n_envs)], dtype=np.int64
+        )
     if isinstance(action_space, gym.spaces.Box):
         return np.stack([action_space.sample() for _ in range(n_envs)], axis=0)
     if isinstance(action_space, gym.spaces.MultiDiscrete):
@@ -944,7 +1087,9 @@ def collect_random_transition_arrays(
         actions.append(np.asarray(action).copy())
         terminateds.append(terminated.copy())
         truncateds.append(truncated.copy())
-        next_observations.append(resolve_terminal_next_observations(next_observation, infos))
+        next_observations.append(
+            resolve_terminal_next_observations(next_observation, infos)
+        )
         observation = next_observation
     arrays = {
         "observations": np.stack(observations, axis=0),
@@ -967,8 +1112,7 @@ def update_transition_tail(
         return
     tail_length = min(int(horizon) - 1, int(sequence["observations"].shape[0]))
     tail_by_env[env_index] = {
-        key: np.asarray(value[-tail_length:]).copy()
-        for key, value in sequence.items()
+        key: np.asarray(value[-tail_length:]).copy() for key, value in sequence.items()
     }
 
 
@@ -1008,9 +1152,15 @@ def collect_random_supervised_transition_samples_to_hdf5(
         while writer.num_samples < int(max_samples):
             remaining = int(max_samples) - writer.num_samples
             remaining_steps = max(1, (remaining + env.num_envs - 1) // env.num_envs)
-            chunk_steps = max(1, min(int(rollout_steps), remaining_steps + int(horizon) - 1))
-            arrays, observation = collect_random_transition_arrays(env, chunk_steps, observation)
-            source_steps = np.arange(source_step, source_step + chunk_steps, dtype=np.int64)
+            chunk_steps = max(
+                1, min(int(rollout_steps), remaining_steps + int(horizon) - 1)
+            )
+            arrays, observation = collect_random_transition_arrays(
+                env, chunk_steps, observation
+            )
+            source_steps = np.arange(
+                source_step, source_step + chunk_steps, dtype=np.int64
+            )
             raw_transitions += int(chunk_steps * env.num_envs)
             source_step += chunk_steps
 
@@ -1032,7 +1182,9 @@ def collect_random_supervised_transition_samples_to_hdf5(
                             {
                                 "observations": sequence["observations"][:, None],
                                 "actions": sequence["actions"][:, None],
-                                "next_observations": sequence["next_observations"][:, None],
+                                "next_observations": sequence["next_observations"][
+                                    :, None
+                                ],
                                 "terminateds": sequence["terminateds"][:, None],
                                 "truncateds": sequence["truncateds"][:, None],
                                 "source_steps": sequence["source_steps"],
@@ -1077,10 +1229,19 @@ class TransitionDataset(TorchDataset):
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         row = self.rows[index]
         actions = torch.as_tensor(row["actions"])
-        targets = torch.stack([self._to_image_tensor(target) for target in np.asarray(row["targets"])], dim=0)
-        dones = torch.as_tensor(np.asarray(row["dones"], dtype=np.bool_), dtype=torch.bool)
-        terminateds = torch.as_tensor(np.asarray(row["terminateds"], dtype=np.bool_), dtype=torch.bool)
-        truncateds = torch.as_tensor(np.asarray(row["truncateds"], dtype=np.bool_), dtype=torch.bool)
+        targets = torch.stack(
+            [self._to_image_tensor(target) for target in np.asarray(row["targets"])],
+            dim=0,
+        )
+        dones = torch.as_tensor(
+            np.asarray(row["dones"], dtype=np.bool_), dtype=torch.bool
+        )
+        terminateds = torch.as_tensor(
+            np.asarray(row["terminateds"], dtype=np.bool_), dtype=torch.bool
+        )
+        truncateds = torch.as_tensor(
+            np.asarray(row["truncateds"], dtype=np.bool_), dtype=torch.bool
+        )
         item = {
             "observation": self._to_image_tensor(row["observation"]),
             "actions": actions,
