@@ -258,7 +258,7 @@ def sandwich_actor_update(
     normalize_advantage: bool,
     ent_coef: float,
     max_grad_norm: float,
-    beta_dyn: float,
+    z_dyn_coef: float,
     target_kl: float | None,
     random_subnets: int,
     temperature: float,
@@ -272,8 +272,7 @@ def sandwich_actor_update(
     entropy_loss_sum = 0.0
     max_dynamic_loss_sum = 0.0
     subnet_loss_sum = 0.0
-    policy_distill_loss_sum = 0.0
-    subnet_dynamic_loss_sum = 0.0
+    subnet_policy_distill_loss_sum = 0.0
     approx_kl_sum = 0.0
     clip_fraction_sum = 0.0
     update_count = 0
@@ -326,7 +325,7 @@ def sandwich_actor_update(
             max_loss = (
                 policy_loss
                 + float(ent_coef) * entropy_loss
-                + float(beta_dyn) * max_dyn_loss
+                + float(z_dyn_coef) * max_dyn_loss
             )
             max_loss_value = float(max_loss.detach().cpu())
             policy_loss_value = float(policy_loss.detach().cpu())
@@ -349,12 +348,11 @@ def sandwich_actor_update(
                 }
 
             sampled_arches = [min_arch]
-            for _sample_index in range(max(0, int(random_subnets))):
+            for _sample_index in range(random_subnets):
                 sampled_arches.append(search_space.sample_arch())
 
             subnet_loss_values = []
-            policy_distill_loss_values = []
-            subnet_dyn_loss_values = []
+            subnet_policy_distill_loss_values = []
             subnet_scale = 1.0 / float(len(sampled_arches))
             for arch in sampled_arches:
                 policy.set_active_arch(arch)
@@ -362,28 +360,17 @@ def sandwich_actor_update(
                 student_params = policy.distribution_params_from_features(
                     subnet_features
                 )
-                policy_distill_loss = policy_kl_distillation_loss(
+                subnet_policy_distill_loss = policy_kl_distillation_loss(
                     action_space=action_space,
                     teacher_params=teacher_params,
                     student_params=student_params,
                     temperature=temperature,
                 )
-                subnet_dyn_loss = compute_dynamics_loss(
-                    online_policy=policy,
-                    ema_policy=ema_policy,
-                    arch=arch,
-                    start_features=subnet_features,
-                    next_observations=rollout_data.next_observations,
-                    actions=batch_actions,
-                    action_space=action_space,
-                    sample_weights=rollout_data.dynamics_masks,
-                )
-                subnet_loss = policy_distill_loss + float(beta_dyn) * subnet_dyn_loss
+                subnet_loss = subnet_policy_distill_loss
                 subnet_loss_values.append(float(subnet_loss.detach().cpu()))
-                policy_distill_loss_values.append(
-                    float(policy_distill_loss.detach().cpu())
+                subnet_policy_distill_loss_values.append(
+                    float(subnet_policy_distill_loss.detach().cpu())
                 )
-                subnet_dyn_loss_values.append(float(subnet_dyn_loss.detach().cpu()))
                 (subnet_loss * subnet_scale).backward()
 
             if max_grad_norm > 0.0:
@@ -393,8 +380,7 @@ def sandwich_actor_update(
             actor_optimizer.step()
 
             subnet_loss_value = float(np.mean(subnet_loss_values))
-            policy_distill_loss_value = float(np.mean(policy_distill_loss_values))
-            subnet_dynamic_loss_value = float(np.mean(subnet_dyn_loss_values))
+            subnet_policy_distill_loss_value = float(np.mean(subnet_policy_distill_loss_values))
             update_count += 1
             loss_sum += max_loss_value + subnet_loss_value
             max_loss_sum += max_loss_value
@@ -402,8 +388,7 @@ def sandwich_actor_update(
             entropy_loss_sum += entropy_loss_value
             max_dynamic_loss_sum += max_dynamic_loss_value
             subnet_loss_sum += subnet_loss_value
-            policy_distill_loss_sum += policy_distill_loss_value
-            subnet_dynamic_loss_sum += subnet_dynamic_loss_value
+            subnet_policy_distill_loss_sum += subnet_policy_distill_loss_value
             approx_kl_sum += float(approx_kl.cpu())
             clip_fraction_sum += float(clip_fraction.cpu())
 
@@ -421,8 +406,7 @@ def sandwich_actor_update(
         "actor/entropy_loss": entropy_loss_sum / denominator,
         "actor/max_dynamic_loss": max_dynamic_loss_sum / denominator,
         "actor/subnet_loss": subnet_loss_sum / denominator,
-        "actor/policy_distill_loss": policy_distill_loss_sum / denominator,
-        "actor/subnet_dynamic_loss": subnet_dynamic_loss_sum / denominator,
+        "actor/subnet_policy_distill_loss": subnet_policy_distill_loss_sum / denominator,
         "actor/approx_kl": approx_kl_sum / denominator,
         "actor/clip_fraction": clip_fraction_sum / denominator,
     }
@@ -502,7 +486,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             projection_dim=ppo_config.projection_dim,
             predictor_hidden_dim=ppo_config.predictor_hidden_dim,
         ).to(device)
-        if ppo_config.beta_dyn > 0.0:
+        if ppo_config.z_dyn_coef > 0.0:
             ema_policy = create_ema_policy(policy, device)
         else:
             ema_policy = policy
@@ -622,12 +606,12 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                 normalize_advantage=ppo_config.normalize_advantage,
                 ent_coef=ppo_config.ent_coef,
                 max_grad_norm=ppo_config.max_grad_norm,
-                beta_dyn=ppo_config.beta_dyn,
+                z_dyn_coef=ppo_config.z_dyn_coef,
                 target_kl=ppo_config.target_kl,
                 random_subnets=args.random_subnets,
                 temperature=args.distill_temperature,
             )
-            if ppo_config.beta_dyn > 0.0:
+            if ppo_config.z_dyn_coef > 0.0:
                 update_ema_model(ema_policy, policy, tau=ppo_config.ema_tau)
             critic_metrics = critic_update(
                 critic_model=critic_model,
@@ -730,7 +714,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                 "actor_lr": float(actor_lr),
                 "critic_lr": float(critic_lr),
                 "clip_range": float(clip_range),
-                "beta_dyn": float(ppo_config.beta_dyn),
+                "z_dyn_coef": float(ppo_config.z_dyn_coef),
                 **rollout_metrics,
                 **actor_metrics,
                 **critic_metrics,
@@ -749,8 +733,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                 {
                     "ret": f"{rollout_metrics['rollout/ep_return']:.3g}",
                     "actor": f"{actor_metrics['actor/loss']:.3g}",
-                    "distill": f"{actor_metrics['actor/policy_distill_loss']:.3g}",
-                    "dyn": f"{actor_metrics['actor/subnet_dynamic_loss']:.3g}",
+                    "distill": f"{actor_metrics['actor/subnet_policy_distill_loss']:.3g}",
                     "critic": f"{critic_metrics['critic/loss']:.3g}",
                     "lr": f"{actor_lr:.2g}",
                 },

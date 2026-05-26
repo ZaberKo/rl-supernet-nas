@@ -599,10 +599,10 @@ def fixed_arch_actor_update(
     max_grad_norm: float,
     target_kl: float | None,
     ema_policy: PolicySupernet | None = None,
-    beta_dyn: float = 0.0,
+    z_dyn_coef: float = 0.0,
 ) -> dict[str, float]:
     policy.train()
-    use_dynamics = ema_policy is not None and beta_dyn > 0.0
+    use_dynamics = ema_policy is not None and z_dyn_coef > 0.0
     if use_dynamics:
         ema_policy.eval()
 
@@ -667,7 +667,7 @@ def fixed_arch_actor_update(
                 loss = (
                     policy_loss
                     + float(ent_coef) * entropy_loss
-                    + float(beta_dyn) * dyn_loss
+                    + float(z_dyn_coef) * dyn_loss
                 )
                 dynamics_loss_value = float(dyn_loss.detach().cpu())
             else:

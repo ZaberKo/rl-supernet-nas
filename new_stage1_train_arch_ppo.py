@@ -288,9 +288,9 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
         )
         policy.set_active_arch(arch_config)
 
-        beta_dyn = float(ppo_config.beta_dyn)
+        z_dyn_coef = float(ppo_config.z_dyn_coef)
         ema_policy: PolicySupernet | None = None
-        if beta_dyn > 0.0:
+        if z_dyn_coef > 0.0:
             ema_policy = create_ema_policy(
                 policy, device,
                 checkpoint_ema_state_dict=checkpoint.get("ema_policy_state_dict"),
@@ -539,9 +539,9 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                 max_grad_norm=float(ppo_config.max_grad_norm),
                 target_kl=target_kl,
                 ema_policy=ema_policy,
-                beta_dyn=beta_dyn,
+                z_dyn_coef=z_dyn_coef,
             )
-            if ema_policy is not None and beta_dyn > 0.0:
+            if ema_policy is not None and z_dyn_coef > 0.0:
                 update_ema_model(ema_policy, policy, tau=float(ppo_config.ema_tau))
             critic_metrics = critic_update(
                 critic_model=critic_model,

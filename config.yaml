@@ -29,7 +29,7 @@ ppo:
   critic_lr: lin_2.5e-4
   projection_dim: 128
   predictor_hidden_dim: 512
-  beta_dyn: 0.0
+  z_dyn_coef: 0.0
   ema_tau: 0.99
   n_steps: 128 # num rollout steps per env
   batch_size: 256 # minibatch for PPO update
