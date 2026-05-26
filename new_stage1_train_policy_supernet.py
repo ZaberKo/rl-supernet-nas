@@ -1,59 +1,58 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import json
-import math
-import random
 from collections.abc import Mapping
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from gymnasium import spaces
 from omegaconf import DictConfig
 from stable_baselines3 import PPO
-from stable_baselines3.common.buffers import RolloutBuffer
 from stable_baselines3.common.vec_env import (
     VecEnv,
-    sync_envs_normalization,
-    unwrap_vec_normalize,
 )
 from tqdm.auto import tqdm
 
-from config_utils import (
+from checkpoint_utils import save_checkpoint
+from env_utils import EVAL_SEED_OFFSET, make_vec_env_from_ppo_config
+from ppo_utils import (
+    PolicySupernet,
+    append_jsonl_record,
+    bootstrap_time_limit_rewards,
+    build_sb3_critic_model,
+    compute_dynamics_loss,
+    configure_actor_optimizer,
+    create_ema_policy,
+    critic_update,
+    evaluate_actor_subnet,
+    predict_critic_values,
+    prepare_env_actions,
+    update_actor_optimizer_learning_rate,
+    update_ema_model,
+    update_optimizer_learning_rate,
+)
+from setup_utils import (
     add_ppo_config_args,
     build_run_config,
     load_ppo_config,
-    ppo_config_to_dict,
-)
-from env_utils import EVAL_SEED_OFFSET
-from ppo_utils import (
-    append_jsonl_record,
-    make_vec_env_from_ppo_config,
-    parse_hidden_sizes,
-    parse_optional_float,
     parse_schedule_value,
+    ppo_config_to_dict,
     resolve_activation_fn,
     resolve_device,
-)
-from representation_losses import (
-    LatentDynamicsPredictor,
-    ProjectionHead,
-    encode_action_batch,
-    get_action_dim,
+    set_global_seeds,
 )
 from supernet_backbone import (
-    ArchConfig,
     SearchSpace,
-    SupernetCNNBackbone,
-    infer_input_channels,
 )
-from trajectory_data import resolve_terminal_next_observations, split_done_flags
+from trajectory_data import (
+    DynamicsRolloutBuffer,
+    resolve_terminal_next_observations,
+    split_done_flags,
+)
 from wandb_utils import finish_wandb_run, init_wandb_run, log_wandb
 
 
@@ -81,347 +80,6 @@ def parse_args() -> argparse.Namespace:
         help="Temperature for discrete policy KL distillation.",
     )
     return parser.parse_args()
-
-
-def build_mlp(
-    input_dim: int,
-    hidden_sizes: tuple[int, ...],
-    activation_fn: type[nn.Module] | None,
-) -> tuple[nn.Module, int]:
-    layers: list[nn.Module] = []
-    last_dim = int(input_dim)
-    activation_class = activation_fn or nn.Tanh
-    for hidden_dim in hidden_sizes:
-        layers.append(nn.Linear(last_dim, int(hidden_dim)))
-        layers.append(activation_class())
-        last_dim = int(hidden_dim)
-    if not layers:
-        return nn.Identity(), last_dim
-    return nn.Sequential(*layers), last_dim
-
-
-def maybe_orthogonal_init(module: nn.Module, enabled: bool) -> None:
-    if not enabled:
-        return
-    for item in module.modules():
-        if isinstance(item, (nn.Linear, nn.Conv2d)):
-            nn.init.orthogonal_(item.weight, gain=math.sqrt(2.0))
-            if item.bias is not None:
-                nn.init.constant_(item.bias, 0.0)
-
-
-class PolicySupernet(nn.Module):
-    def __init__(
-        self,
-        observation_space: spaces.Space,
-        action_space: spaces.Space,
-        search_space: SearchSpace,
-        features_dim: int,
-        policy_net_arch: tuple[int, ...],
-        activation_fn: type[nn.Module] | None,
-        log_std_init: float | None,
-        ortho_init: bool,
-        projection_dim: int,
-        predictor_hidden_dim: int,
-    ):
-        super().__init__()
-        if (
-            not isinstance(observation_space, spaces.Box)
-            or len(observation_space.shape) != 3
-        ):
-            raise TypeError("PolicySupernet expects image Box observations.")
-        if not isinstance(action_space, (spaces.Discrete, spaces.Box)):
-            raise TypeError("Only Discrete and Box action spaces are supported.")
-
-        self.action_space = action_space
-        self.search_space = search_space
-        self.features_dim = int(features_dim)
-        self.backbone = SupernetCNNBackbone(
-            input_channels=infer_input_channels(tuple(observation_space.shape)),
-            search_space=search_space,
-            feature_dim=self.features_dim,
-        )
-        self.policy_net, latent_dim = build_mlp(
-            input_dim=self.features_dim,
-            hidden_sizes=policy_net_arch,
-            activation_fn=activation_fn,
-        )
-        self.latent_dim = int(latent_dim)
-
-        if isinstance(action_space, spaces.Discrete):
-            self.action_kind = "discrete"
-            self.action_dim = int(action_space.n)
-            self.action_net = nn.Linear(self.latent_dim, self.action_dim)
-            self.log_std = None
-        else:
-            self.action_kind = "box"
-            self.action_shape = tuple(int(value) for value in action_space.shape)
-            self.action_dim = int(np.prod(self.action_shape, dtype=np.int64))
-            self.action_net = nn.Linear(self.latent_dim, self.action_dim)
-            initial_log_std = 0.0 if log_std_init is None else float(log_std_init)
-            self.log_std = nn.Parameter(
-                torch.ones(self.action_dim, dtype=torch.float32) * initial_log_std
-            )
-
-        maybe_orthogonal_init(self.policy_net, ortho_init)
-        maybe_orthogonal_init(self.action_net, ortho_init)
-        self.projection = ProjectionHead(features_dim, projection_dim)
-        self.predictor = LatentDynamicsPredictor(
-            latent_dim=projection_dim,
-            action_dim=get_action_dim(action_space),
-            hidden_dim=predictor_hidden_dim,
-        )
-
-    def set_active_arch(self, arch: ArchConfig) -> None:
-        self.backbone.set_sample_config(arch)
-
-    def set_max_arch(self) -> None:
-        self.backbone.set_max_arch()
-
-    def set_min_arch(self) -> None:
-        self.backbone.set_min_arch()
-
-    def encode(self, observations: torch.Tensor) -> torch.Tensor:
-        return self.backbone(observations)
-
-    def distribution_params_from_features(
-        self, features: torch.Tensor
-    ) -> dict[str, torch.Tensor]:
-        action_output = self.action_net(self.policy_net(features))
-        if self.action_kind == "discrete":
-            return {"logits": action_output}
-        if self.log_std is None:
-            raise RuntimeError("Continuous policy is missing log_std.")
-        return {
-            "mean": action_output,
-            "log_std": self.log_std.view(1, -1).expand_as(action_output),
-        }
-
-    def distribution_params(
-        self, observations: torch.Tensor
-    ) -> dict[str, torch.Tensor]:
-        return self.distribution_params_from_features(self.encode(observations))
-
-    def distribution_from_params(self, params: Mapping[str, torch.Tensor]):
-        if self.action_kind == "discrete":
-            return torch.distributions.Categorical(logits=params["logits"])
-        std = torch.exp(params["log_std"])
-        base_dist = torch.distributions.Normal(params["mean"], std)
-        return torch.distributions.Independent(base_dist, 1)
-
-    def act(
-        self,
-        observations: torch.Tensor,
-        deterministic: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        params = self.distribution_params(observations)
-        distribution = self.distribution_from_params(params)
-        if self.action_kind == "discrete":
-            if deterministic:
-                actions = torch.argmax(params["logits"], dim=-1)
-            else:
-                actions = distribution.sample()
-        else:
-            actions = params["mean"] if deterministic else distribution.sample()
-        log_prob = distribution.log_prob(actions)
-        entropy = distribution.entropy()
-        return actions, log_prob, entropy
-
-    def evaluate_actions_from_params(
-        self,
-        params: Mapping[str, torch.Tensor],
-        actions: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        distribution = self.distribution_from_params(params)
-        if self.action_kind == "discrete":
-            prepared_actions = actions.long().view(-1)
-        else:
-            prepared_actions = actions.float().view(actions.size(0), self.action_dim)
-        log_prob = distribution.log_prob(prepared_actions)
-        entropy = distribution.entropy()
-        return log_prob, entropy
-
-    def evaluate_actions(
-        self,
-        observations: torch.Tensor,
-        actions: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.evaluate_actions_from_params(
-            self.distribution_params(observations), actions
-        )
-
-    def project_features(self, features: torch.Tensor) -> torch.Tensor:
-        return self.projection(features)
-
-    def project_observations(self, observations: torch.Tensor) -> torch.Tensor:
-        return self.project_features(self.encode(observations))
-
-
-def build_sb3_critic_model(
-    ppo_config: DictConfig,
-    env: VecEnv,
-    learning_rate: Any,
-) -> PPO:
-    policy_kwargs: dict[str, Any] = {
-        "net_arch": {
-            "pi": [],
-            "vf": list(parse_hidden_sizes(ppo_config.value_net_arch)),
-        },
-        "features_extractor_kwargs": {"features_dim": ppo_config.features_dim},
-    }
-    activation_fn = resolve_activation_fn(ppo_config.activation_fn)
-    if activation_fn is not None:
-        policy_kwargs["activation_fn"] = activation_fn
-    if ppo_config.ortho_init is not None:
-        policy_kwargs["ortho_init"] = ppo_config.ortho_init
-    log_std_init = parse_optional_float(ppo_config.log_std_init)
-    if log_std_init is not None:
-        policy_kwargs["log_std_init"] = log_std_init
-
-    return PPO(
-        "CnnPolicy",
-        env,
-        learning_rate=learning_rate,
-        n_steps=ppo_config.n_steps,
-        batch_size=ppo_config.batch_size,
-        n_epochs=ppo_config.n_epochs,
-        gamma=ppo_config.gamma,
-        gae_lambda=ppo_config.gae_lambda,
-        clip_range=parse_schedule_value(ppo_config.clip_range),
-        normalize_advantage=ppo_config.normalize_advantage,
-        ent_coef=ppo_config.ent_coef,
-        vf_coef=ppo_config.vf_coef,
-        max_grad_norm=ppo_config.max_grad_norm,
-        target_kl=parse_optional_float(ppo_config.target_kl),
-        stats_window_size=ppo_config.stats_window_size,
-        tensorboard_log=ppo_config.tensorboard_log,
-        policy_kwargs=policy_kwargs,
-        use_sde=ppo_config.use_sde and isinstance(env.action_space, spaces.Box),
-        sde_sample_freq=ppo_config.sde_sample_freq,
-        seed=ppo_config.seed,
-        device=str(ppo_config.device),
-        verbose=0 if ppo_config.quiet else 1,
-    )
-
-
-def predict_critic_values(
-    critic_model: PPO, observations: torch.Tensor
-) -> torch.Tensor:
-    return critic_model.policy.predict_values(observations).flatten()
-
-
-@dataclass(frozen=True)
-class DynamicsRolloutSamples:
-    observations: torch.Tensor
-    actions: torch.Tensor
-    old_values: torch.Tensor
-    old_log_prob: torch.Tensor
-    advantages: torch.Tensor
-    returns: torch.Tensor
-    next_observations: torch.Tensor
-    dynamics_masks: torch.Tensor
-
-
-class DynamicsRolloutBuffer(RolloutBuffer):
-    def reset(self) -> None:
-        super().reset()
-        self.next_observations = np.zeros(
-            (self.buffer_size, self.n_envs, *self.obs_shape),
-            dtype=self.observation_space.dtype,
-        )
-        self.dynamics_masks = np.zeros(
-            (self.buffer_size, self.n_envs), dtype=np.float32
-        )
-
-    def add_transition(
-        self,
-        obs: np.ndarray,
-        next_obs: np.ndarray,
-        action: np.ndarray,
-        reward: np.ndarray,
-        episode_start: np.ndarray,
-        value: torch.Tensor,
-        log_prob: torch.Tensor,
-        dynamics_mask: np.ndarray,
-    ) -> None:
-        self.next_observations[self.pos] = np.array(next_obs)
-        self.dynamics_masks[self.pos] = np.array(dynamics_mask, dtype=np.float32)
-        super().add(obs, action, reward, episode_start, value, log_prob)
-
-    def get(self, batch_size: int | None = None):
-        assert self.full, ""
-        indices = np.random.permutation(self.buffer_size * self.n_envs)
-        if not self.generator_ready:
-            for tensor_name in (
-                "observations",
-                "actions",
-                "values",
-                "log_probs",
-                "advantages",
-                "returns",
-                "next_observations",
-                "dynamics_masks",
-            ):
-                self.__dict__[tensor_name] = self.swap_and_flatten(
-                    self.__dict__[tensor_name]
-                )
-            self.generator_ready = True
-
-        if batch_size is None:
-            batch_size = self.buffer_size * self.n_envs
-
-        start_index = 0
-        while start_index < self.buffer_size * self.n_envs:
-            yield self._get_samples(indices[start_index : start_index + batch_size])
-            start_index += batch_size
-
-    def _get_samples(self, batch_indices: np.ndarray) -> DynamicsRolloutSamples:
-        data = (
-            self.observations[batch_indices],
-            self.actions[batch_indices].astype(np.float32, copy=False),
-            self.values[batch_indices].flatten(),
-            self.log_probs[batch_indices].flatten(),
-            self.advantages[batch_indices].flatten(),
-            self.returns[batch_indices].flatten(),
-            self.next_observations[batch_indices],
-            self.dynamics_masks[batch_indices].flatten(),
-        )
-        return DynamicsRolloutSamples(*tuple(map(self.to_torch, data)))
-
-
-def bootstrap_time_limit_rewards(
-    rewards: np.ndarray,
-    dones: np.ndarray,
-    infos: list[dict[str, Any]],
-    critic_model: PPO,
-    device: torch.device,
-    gamma: float,
-) -> np.ndarray:
-    adjusted_rewards = np.asarray(rewards, dtype=np.float32).copy()
-    terminal_observations = []
-    terminal_indices = []
-    for env_index, info in enumerate(infos):
-        if not bool(dones[env_index]):
-            continue
-        if not bool(info.get("TimeLimit.truncated", False)):
-            continue
-        terminal_observation = info.get("terminal_observation")
-        if terminal_observation is None:
-            continue
-        terminal_indices.append(env_index)
-        terminal_observations.append(np.asarray(terminal_observation))
-
-    if not terminal_observations:
-        return adjusted_rewards
-
-    terminal_tensor = torch.as_tensor(np.stack(terminal_observations), device=device)
-    with torch.no_grad():
-        terminal_values = (
-            predict_critic_values(critic_model, terminal_tensor).detach().cpu().numpy()
-        )
-    for offset, env_index in enumerate(terminal_indices):
-        adjusted_rewards[env_index] += float(gamma) * float(terminal_values[offset])
-    return adjusted_rewards
 
 
 def collect_rollout(
@@ -459,21 +117,9 @@ def collect_rollout(
             )
             value_tensor = predict_critic_values(critic_model, observation_tensor)
 
-            if isinstance(env.action_space, spaces.Discrete):
-                stored_actions = action_tensor.detach().cpu().numpy().reshape((-1, 1))
-                env_actions = stored_actions.reshape(-1)
-            else:
-                action_shape = tuple(int(value) for value in env.action_space.shape)
-                stored_actions = (
-                    action_tensor.detach()
-                    .cpu()
-                    .numpy()
-                    .reshape((num_envs, *action_shape))
-                    .astype(np.float32)
-                )
-                env_actions = np.clip(
-                    stored_actions, env.action_space.low, env.action_space.high
-                )
+            stored_actions, env_actions = prepare_env_actions(
+                env.action_space, action_tensor, num_envs
+            )
 
             next_observation, raw_rewards, raw_dones, infos = env.step(env_actions)
             info_list = list(infos)
@@ -557,70 +203,6 @@ def collect_rollout(
     return observation, episode_starts, metrics
 
 
-def update_ema_model(
-    ema_policy: PolicySupernet,
-    online_policy: PolicySupernet,
-    tau: float,
-) -> None:
-    if not 0.0 <= tau <= 1.0:
-        raise ValueError("ema_tau must be in [0, 1].")
-    with torch.no_grad():
-        for ema_param, online_param in zip(
-            ema_policy.parameters(), online_policy.parameters(), strict=True
-        ):
-            ema_param.mul_(float(tau)).add_(
-                online_param.detach(), alpha=1.0 - float(tau)
-            )
-        for ema_buffer, online_buffer in zip(
-            ema_policy.buffers(), online_policy.buffers(), strict=True
-        ):
-            ema_buffer.copy_(online_buffer)
-
-
-def compute_dynamics_loss(
-    online_policy: PolicySupernet,
-    ema_policy: PolicySupernet,
-    arch: ArchConfig,
-    start_features: torch.Tensor,
-    next_observations: torch.Tensor,
-    actions: torch.Tensor,
-    action_space: spaces.Space,
-    sample_weights: torch.Tensor | None,
-) -> torch.Tensor:
-    if sample_weights is not None:
-        active_mask = sample_weights.to(device=start_features.device).view(-1) > 0.0
-        if not bool(active_mask.any()):
-            return torch.zeros((), dtype=torch.float32, device=start_features.device)
-        start_features = start_features[active_mask]
-        next_observations = next_observations[active_mask]
-        actions = actions[active_mask]
-        sample_weights = sample_weights.to(device=start_features.device)[active_mask]
-
-    start_latent = online_policy.project_features(start_features)
-    action_features = encode_action_batch(actions, action_space).to(
-        device=start_features.device
-    )
-    predicted_next_latent = start_latent + online_policy.predictor(
-        start_latent, action_features
-    )
-    with torch.no_grad():
-        ema_policy.set_active_arch(arch)
-        target_next_latent = ema_policy.project_observations(next_observations)
-
-    per_sample_loss = 2.0 - 2.0 * F.cosine_similarity(
-        predicted_next_latent,
-        target_next_latent.detach(),
-        dim=-1,
-        eps=1e-6,
-    )
-    if sample_weights is None:
-        return per_sample_loss.mean()
-    prepared_weights = sample_weights.to(
-        dtype=per_sample_loss.dtype, device=per_sample_loss.device
-    ).view_as(per_sample_loss)
-    return (
-        per_sample_loss * prepared_weights
-    ).sum() / prepared_weights.sum().clamp_min(1.0)
 
 
 def policy_kl_distillation_loss(
@@ -846,109 +428,7 @@ def sandwich_actor_update(
     }
 
 
-def critic_update(
-    critic_model: PPO,
-    optimizer: torch.optim.Optimizer,
-    rollout_buffer: DynamicsRolloutBuffer,
-    n_epochs: int,
-    batch_size: int,
-    max_grad_norm: float,
-) -> dict[str, float]:
-    critic_model.policy.train()
-    loss_sum = 0.0
-    update_count = 0
-    for _ in range(int(n_epochs)):
-        for rollout_data in rollout_buffer.get(batch_size):
-            values = predict_critic_values(critic_model, rollout_data.observations)
-            loss = F.mse_loss(values, rollout_data.returns)
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            if max_grad_norm > 0.0:
-                torch.nn.utils.clip_grad_norm_(
-                    critic_model.policy.parameters(), float(max_grad_norm)
-                )
-            optimizer.step()
-            loss_sum += float(loss.detach().cpu())
-            update_count += 1
-    denominator = float(max(1, update_count))
-    return {
-        "critic/loss": loss_sum / denominator,
-    }
-
-
-def evaluate_actor_subnet(
-    policy: PolicySupernet,
-    train_env: VecEnv,
-    eval_env: VecEnv,
-    arch: ArchConfig,
-    n_eval_episodes: int,
-    deterministic: bool,
-    device: torch.device,
-) -> dict[str, float]:
-    sync_envs_normalization(train_env, eval_env)
-    eval_vec_normalize = unwrap_vec_normalize(eval_env)
-    if eval_vec_normalize is not None:
-        eval_vec_normalize.training = False
-        eval_vec_normalize.norm_reward = False
-
-    policy.eval()
-    policy.set_active_arch(arch)
-    observations = eval_env.reset()
-    current_returns = np.zeros(eval_env.num_envs, dtype=np.float64)
-    current_lengths = np.zeros(eval_env.num_envs, dtype=np.int64)
-    episode_returns: list[float] = []
-    episode_lengths: list[float] = []
-    with torch.no_grad():
-        while len(episode_returns) < n_eval_episodes:
-            observation_tensor = torch.as_tensor(observations, device=device)
-            actions, _, _ = policy.act(observation_tensor, deterministic=deterministic)
-            if isinstance(eval_env.action_space, spaces.Discrete):
-                env_actions = actions.detach().cpu().numpy().reshape(-1)
-            else:
-                action_shape = tuple(
-                    int(value) for value in eval_env.action_space.shape
-                )
-                env_actions = (
-                    actions.detach().cpu().numpy().reshape((-1, *action_shape))
-                )
-                env_actions = np.clip(
-                    env_actions, eval_env.action_space.low, eval_env.action_space.high
-                )
-            observations, rewards, dones, infos = eval_env.step(env_actions)
-            current_returns += np.asarray(rewards, dtype=np.float64)
-            current_lengths += 1
-            for env_index, done in enumerate(dones):
-                if not bool(done):
-                    continue
-                episode_info = (
-                    infos[env_index].get("episode")
-                    if isinstance(infos[env_index], dict)
-                    else None
-                )
-                if isinstance(episode_info, Mapping) and "r" in episode_info:
-                    episode_return = float(episode_info["r"])
-                else:
-                    episode_return = float(current_returns[env_index])
-                if isinstance(episode_info, Mapping) and "l" in episode_info:
-                    episode_length = float(episode_info["l"])
-                else:
-                    episode_length = float(current_lengths[env_index])
-                episode_returns.append(episode_return)
-                episode_lengths.append(episode_length)
-                current_returns[env_index] = 0.0
-                current_lengths[env_index] = 0
-                if len(episode_returns) >= n_eval_episodes:
-                    break
-
-    return {
-        "ep_return": float(np.mean(episode_returns)),
-        "ep_return_std": float(np.std(episode_returns)),
-        "ep_length": float(np.mean(episode_lengths)),
-        "ep_length_std": float(np.std(episode_lengths)),
-    }
-
-
-def save_supernet_checkpoint(
+def _save_supernet_checkpoint(
     path: Path,
     args: argparse.Namespace,
     ppo_config: DictConfig,
@@ -957,31 +437,21 @@ def save_supernet_checkpoint(
     critic_model: PPO,
     actor_optimizer: torch.optim.Optimizer,
     critic_optimizer: torch.optim.Optimizer,
-    search_space: SearchSpace,
     total_timesteps: int,
     iteration: int,
 ) -> None:
-    torch.save(
-        {
-            "stage": "new_stage1_policy_supernet",
-            "total_timesteps": int(total_timesteps),
-            "iteration": int(iteration),
-            "policy_state_dict": policy.state_dict(),
-            "ema_policy_state_dict": ema_policy.state_dict(),
-            "critic_policy_state_dict": critic_model.policy.state_dict(),
-            "backbone_state_dict": policy.backbone.state_dict(),
-            "policy_optimizer_state_dict": actor_optimizer.state_dict(),
-            "critic_optimizer_state_dict": critic_optimizer.state_dict(),
-            "search_space": search_space.to_dict(),
-            "max_arch": search_space.max_arch().to_dict(),
-            "min_arch": search_space.min_arch().to_dict(),
-            "features_dim": int(ppo_config.features_dim),
-            "projection_dim": int(ppo_config.projection_dim),
-            "predictor_hidden_dim": int(ppo_config.predictor_hidden_dim),
-            "args": vars(args),
-            "ppo_config": ppo_config_to_dict(ppo_config),
-        },
+    save_checkpoint(
         path,
+        stage="new_stage1_policy_supernet",
+        args=args,
+        ppo_config=ppo_config,
+        policy_state_dict=policy.state_dict(),
+        critic_policy_state_dict=critic_model.policy.state_dict(),
+        actor_optimizer_state_dict=actor_optimizer.state_dict(),
+        critic_optimizer_state_dict=critic_optimizer.state_dict(),
+        ema_policy_state_dict=ema_policy.state_dict(),
+        total_timesteps=total_timesteps,
+        iteration=iteration,
     )
 
 
@@ -993,11 +463,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
     last_checkpoint_path = output_dir / "policy_supernet_last.pt"
     best_checkpoint_path = output_dir / "policy_supernet_best.pt"
 
-    random.seed(int(ppo_config.seed))
-    np.random.seed(int(ppo_config.seed))
-    torch.manual_seed(int(ppo_config.seed))
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(int(ppo_config.seed))
+    set_global_seeds(int(ppo_config.seed))
     device = resolve_device(str(ppo_config.device))
     run_config = build_run_config(args, ppo_config)
     wandb_run = init_wandb_run(
@@ -1029,17 +495,15 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             action_space=train_env.action_space,
             search_space=search_space,
             features_dim=ppo_config.features_dim,
-            policy_net_arch=parse_hidden_sizes(ppo_config.policy_net_arch),
+            policy_net_arch=list(ppo_config.policy_net_arch),
             activation_fn=resolve_activation_fn(ppo_config.activation_fn),
-            log_std_init=parse_optional_float(ppo_config.log_std_init),
+            log_std_init=ppo_config.log_std_init,
             ortho_init=ppo_config.ortho_init,
             projection_dim=ppo_config.projection_dim,
             predictor_hidden_dim=ppo_config.predictor_hidden_dim,
         ).to(device)
         if ppo_config.beta_dyn > 0.0:
-            ema_policy = copy.deepcopy(policy).to(device)
-            for parameter in ema_policy.parameters():
-                parameter.requires_grad_(False)
+            ema_policy = create_ema_policy(policy, device)
         else:
             ema_policy = policy
         critic_lr_schedule = parse_schedule_value(ppo_config.critic_lr)
@@ -1055,33 +519,10 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             learning_rate=critic_lr_schedule,
         )
 
-        initial_head_lr = (
-            float(policy_head_lr_schedule(1.0))
-            if callable(policy_head_lr_schedule)
-            else float(policy_head_lr_schedule)
-        )
-        initial_backbone_lr = (
-            float(policy_backbone_lr_schedule(1.0))
-            if callable(policy_backbone_lr_schedule)
-            else float(policy_backbone_lr_schedule)
-        )
-
-        backbone_params = list(policy.backbone.parameters())
-        head_params = [
-            p for n, p in policy.named_parameters() if not n.startswith("backbone.")
-        ]
-        actor_optimizer = torch.optim.Adam(
-            [
-                {
-                    "params": backbone_params,
-                    "lr": initial_backbone_lr,
-                    "group_name": "backbone",
-                },
-                {"params": head_params, "lr": initial_head_lr, "group_name": "head"},
-            ],
-            betas=(0.9, 0.999),
-            eps=1e-5,
-            weight_decay=0.0,
+        actor_optimizer = configure_actor_optimizer(
+            policy=policy,
+            head_lr=policy_head_lr_schedule,
+            backbone_lr=policy_backbone_lr_schedule,
         )
         critic_optimizer = critic_model.policy.optimizer
         rollout_buffer = DynamicsRolloutBuffer(
@@ -1148,13 +589,8 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                 if callable(clip_range_schedule)
                 else float(clip_range_schedule)
             )
-            for param_group in actor_optimizer.param_groups:
-                if param_group.get("group_name") == "backbone":
-                    param_group["lr"] = backbone_lr
-                else:
-                    param_group["lr"] = actor_lr
-            for param_group in critic_optimizer.param_groups:
-                param_group["lr"] = critic_lr
+            update_actor_optimizer_learning_rate(actor_optimizer, actor_lr, backbone_lr)
+            update_optimizer_learning_rate(critic_optimizer, critic_lr)
 
             policy.set_max_arch()
             observation, episode_starts, rollout_metrics = collect_rollout(
@@ -1187,7 +623,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                 ent_coef=ppo_config.ent_coef,
                 max_grad_norm=ppo_config.max_grad_norm,
                 beta_dyn=ppo_config.beta_dyn,
-                target_kl=parse_optional_float(ppo_config.target_kl),
+                target_kl=ppo_config.target_kl,
                 random_subnets=args.random_subnets,
                 temperature=args.distill_temperature,
             )
@@ -1273,7 +709,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                 )
                 if is_best_max_subnet:
                     best_eval_record = dict(eval_record)
-                    save_supernet_checkpoint(
+                    _save_supernet_checkpoint(
                         best_checkpoint_path,
                         args=args,
                         ppo_config=ppo_config,
@@ -1282,7 +718,6 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                         critic_model=critic_model,
                         actor_optimizer=actor_optimizer,
                         critic_optimizer=critic_optimizer,
-                        search_space=search_space,
                         total_timesteps=total_timesteps,
                         iteration=iteration,
                     )
@@ -1322,7 +757,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                 refresh=True,
             )
 
-            save_supernet_checkpoint(
+            _save_supernet_checkpoint(
                 last_checkpoint_path,
                 args=args,
                 ppo_config=ppo_config,
@@ -1331,7 +766,6 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                 critic_model=critic_model,
                 actor_optimizer=actor_optimizer,
                 critic_optimizer=critic_optimizer,
-                search_space=search_space,
                 total_timesteps=total_timesteps,
                 iteration=iteration,
             )

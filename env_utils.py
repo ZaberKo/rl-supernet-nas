@@ -6,6 +6,7 @@ from typing import Any
 
 import gymnasium as gym
 import numpy as np
+from omegaconf import OmegaConf
 
 with suppress(ImportError):
     import ale_py  # noqa: F401
@@ -149,17 +150,17 @@ def make_single_atari_env(
         kwargs["repeat_action_probability"] = 0.0
         env = gym.make(env_id, **kwargs)
         env = remove_outer_time_limit(env)
-        screen_size = int(image_size)
+        screen_size = image_size
         if screen_size <= 0:
             raise ValueError("image_size must be positive for Atari environments.")
         env = AtariWrapper(
             env,
-            noop_max=int(noop_max),
-            frame_skip=int(frame_skip),
+            noop_max=noop_max,
+            frame_skip=frame_skip,
             screen_size=screen_size,
-            terminal_on_life_loss=bool(terminal_on_life_loss),
-            clip_reward=bool(clip_reward),
-            action_repeat_probability=float(action_repeat_probability),
+            terminal_on_life_loss=terminal_on_life_loss,
+            clip_reward=clip_reward,
+            action_repeat_probability=action_repeat_probability,
         )
         env = apply_time_limit(env, max_episode_steps)
         env.reset(seed=seed)
@@ -318,3 +319,42 @@ def make_box2d_vec_env(
         normalize_clip_obs=normalize_clip_obs,
         normalize_gamma=normalize_gamma,
     )
+
+
+def make_vec_env_from_ppo_config(
+    ppo_config: Any,
+    seed: int | None = None,
+    n_envs: int | None = None,
+) -> VecEnv:
+    common_kwargs = {
+        "env_id": ppo_config.env_id,
+        "n_envs": ppo_config.train_n_envs if n_envs is None else n_envs,
+        "seed": ppo_config.seed if seed is None else seed,
+        "image_size": ppo_config.image_size,
+        "vector_env_type": ppo_config.vector_env_type,
+    }
+
+    if getattr(ppo_config, "atari_wrapper", None) is not None:
+        return make_atari_vec_env(
+            **common_kwargs,
+            **OmegaConf.to_container(ppo_config.atari_wrapper, resolve=True),
+        )
+    elif getattr(ppo_config, "box2d_wrapper", None) is not None:
+        return make_box2d_vec_env(
+            **common_kwargs,
+            **OmegaConf.to_container(ppo_config.box2d_wrapper, resolve=True),
+        )
+    else:
+        raise ValueError(
+            "Exactly one of env.atari_wrapper or env.box2d_wrapper must be configured."
+        )
+
+
+def get_vision_spaces_from_ppo_config(
+    ppo_config: Any, seed: int | None = None
+) -> tuple[Any, Any]:
+    env = make_vec_env_from_ppo_config(ppo_config, seed=seed, n_envs=1)
+    try:
+        return env.observation_space, env.action_space
+    finally:
+        env.close()

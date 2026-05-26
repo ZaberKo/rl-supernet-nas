@@ -11,10 +11,10 @@ from evox.algorithms.mo import NSGA2
 from evox.core import Mutable, Problem
 from omegaconf import DictConfig, OmegaConf
 
-from config_utils import ppo_config_to_dict
 from ea_codec import GeneCodec
 from env_utils import EVAL_SEED_OFFSET
-from ppo_utils import finetune_and_evaluate_arch
+from sb3_nas_policy import finetune_and_evaluate_arch
+from setup_utils import ppo_config_to_dict
 from supernet_backbone import ArchConfig
 
 

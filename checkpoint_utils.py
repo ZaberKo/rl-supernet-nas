@@ -1,14 +1,18 @@
+import argparse
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import torch
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import VecEnv
 
-from config_utils import ppo_config_to_dict
-from ppo_utils import parse_hidden_sizes, parse_optional_float, resolve_activation_fn
+from ppo_utils import (
+    PolicySupernet,
+    resolve_activation_fn,
+)
+from setup_utils import ppo_config_to_dict
 from supernet_backbone import SearchSpace
 
 
@@ -24,34 +28,35 @@ def load_checkpoint(
     return dict(checkpoint)
 
 
-def build_network_ppo_config(
-    checkpoint_ppo: Mapping[str, Any], runtime_ppo_config: Any, seed: int
-) -> DictConfig:
-    values = ppo_config_to_dict(runtime_ppo_config)
-    for key in (
-        "features_dim",
-        "policy_net_arch",
-        "value_net_arch",
-        "activation_fn",
-        "ortho_init",
-        "log_std_init",
-    ):
-        if key in checkpoint_ppo:
-            values[key] = checkpoint_ppo[key]
-    values["seed"] = int(seed)
-    return OmegaConf.create(values)
-
-
-def validate_checkpoint_search_space(
-    checkpoint: Mapping[str, Any], search_space: SearchSpace
+def save_checkpoint(
+    path: Path,
+    *,
+    stage: str,
+    args: argparse.Namespace,
+    ppo_config: DictConfig,
+    policy_state_dict: dict[str, Any],
+    critic_policy_state_dict: dict[str, Any],
+    actor_optimizer_state_dict: dict[str, Any],
+    critic_optimizer_state_dict: dict[str, Any],
+    **extra: Any,
 ) -> None:
-    checkpoint_search_space = checkpoint.get("search_space")
-    if checkpoint_search_space is None:
-        return
-    if checkpoint_search_space != search_space.to_dict():
-        raise ValueError(
-            "Checkpoint search_space does not match the current SearchSpace defaults."
-        )
+    """Unified checkpoint save for all stages.
+
+    Common fields are explicit parameters; stage-specific fields go in ``**extra``.
+    """
+    torch.save(
+        {
+            "stage": stage,
+            "policy_state_dict": policy_state_dict,
+            "critic_policy_state_dict": critic_policy_state_dict,
+            "actor_optimizer_state_dict": actor_optimizer_state_dict,
+            "critic_optimizer_state_dict": critic_optimizer_state_dict,
+            "args": vars(args),
+            "ppo_config": ppo_config_to_dict(ppo_config),
+            **extra,
+        },
+        path,
+    )
 
 
 def build_policy_from_checkpoint(
@@ -60,38 +65,23 @@ def build_policy_from_checkpoint(
     search_space: SearchSpace,
     checkpoint: Mapping[str, Any],
     device: torch.device,
-):
-    from new_stage1_train_policy_supernet import PolicySupernet
+) -> PolicySupernet:
+    """Build a PolicySupernet from ``ppo_config`` and load weights from *checkpoint*.
 
-    checkpoint_args = checkpoint.get("args", {})
-    checkpoint_ppo = checkpoint.get("ppo_config", {})
-
-    projection_dim = ppo_config.projection_dim
-    if projection_dim <= 0:
-        projection_dim = checkpoint.get(
-            "projection_dim", checkpoint_args.get("projection_dim", 128)
-        )
-
-    predictor_hidden_dim = ppo_config.predictor_hidden_dim
-    if predictor_hidden_dim <= 0:
-        predictor_hidden_dim = checkpoint.get(
-            "predictor_hidden_dim", checkpoint_args.get("predictor_hidden_dim", 512)
-        )
-
-    def get_ppo_val(key: str) -> Any:
-        return checkpoint_ppo.get(key, getattr(ppo_config, key))
-
+    All network hyper-parameters are read directly from ``ppo_config``;
+    the checkpoint only supplies the ``policy_state_dict``.
+    """
     policy = PolicySupernet(
         observation_space=train_env.observation_space,
         action_space=train_env.action_space,
         search_space=search_space,
-        features_dim=int(checkpoint.get("features_dim", get_ppo_val("features_dim"))),
-        policy_net_arch=parse_hidden_sizes(get_ppo_val("policy_net_arch")),
-        activation_fn=resolve_activation_fn(get_ppo_val("activation_fn")),
-        log_std_init=parse_optional_float(get_ppo_val("log_std_init")),
-        ortho_init=bool(get_ppo_val("ortho_init")),
-        projection_dim=int(projection_dim),
-        predictor_hidden_dim=int(predictor_hidden_dim),
+        features_dim=int(ppo_config.features_dim),
+        policy_net_arch=list(ppo_config.policy_net_arch or []),
+        activation_fn=resolve_activation_fn(ppo_config.activation_fn),
+        log_std_init=ppo_config.log_std_init,
+        ortho_init=bool(ppo_config.ortho_init),
+        projection_dim=int(ppo_config.projection_dim),
+        predictor_hidden_dim=int(ppo_config.predictor_hidden_dim),
     ).to(device)
 
     state_dict = checkpoint.get("policy_state_dict")

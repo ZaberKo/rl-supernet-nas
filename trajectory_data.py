@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import random
 from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,7 @@ import torch
 from datasets import Dataset as ArrowDataset
 from datasets import Features, Value
 from datasets import Sequence as ArrowSequence
+from stable_baselines3.common.buffers import RolloutBuffer
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.vec_env import VecEnv
 from torch.utils.data import Dataset as TorchDataset
@@ -1306,3 +1308,82 @@ def count_trajectory_file(path: str | Path) -> dict[str, int]:
         )
 
     raise ValueError(f"Unsupported dataset path: {path}")
+
+
+@dataclass(frozen=True)
+class DynamicsRolloutSamples:
+    observations: torch.Tensor
+    actions: torch.Tensor
+    old_values: torch.Tensor
+    old_log_prob: torch.Tensor
+    advantages: torch.Tensor
+    returns: torch.Tensor
+    next_observations: torch.Tensor
+    dynamics_masks: torch.Tensor
+
+
+class DynamicsRolloutBuffer(RolloutBuffer):
+    def reset(self) -> None:
+        super().reset()
+        self.next_observations = np.zeros(
+            (self.buffer_size, self.n_envs, *self.obs_shape),
+            dtype=self.observation_space.dtype,
+        )
+        self.dynamics_masks = np.zeros(
+            (self.buffer_size, self.n_envs), dtype=np.float32
+        )
+
+    def add_transition(
+        self,
+        obs: np.ndarray,
+        next_obs: np.ndarray,
+        action: np.ndarray,
+        reward: np.ndarray,
+        episode_start: np.ndarray,
+        value: torch.Tensor,
+        log_prob: torch.Tensor,
+        dynamics_mask: np.ndarray,
+    ) -> None:
+        self.next_observations[self.pos] = np.array(next_obs)
+        self.dynamics_masks[self.pos] = np.array(dynamics_mask, dtype=np.float32)
+        super().add(obs, action, reward, episode_start, value, log_prob)
+
+    def get(self, batch_size: int | None = None):
+        assert self.full, ""
+        indices = np.random.permutation(self.buffer_size * self.n_envs)
+        if not self.generator_ready:
+            for tensor_name in (
+                "observations",
+                "actions",
+                "values",
+                "log_probs",
+                "advantages",
+                "returns",
+                "next_observations",
+                "dynamics_masks",
+            ):
+                self.__dict__[tensor_name] = self.swap_and_flatten(
+                    self.__dict__[tensor_name]
+                )
+            self.generator_ready = True
+
+        if batch_size is None:
+            batch_size = self.buffer_size * self.n_envs
+
+        start_index = 0
+        while start_index < self.buffer_size * self.n_envs:
+            yield self._get_samples(indices[start_index : start_index + batch_size])
+            start_index += batch_size
+
+    def _get_samples(self, batch_indices: np.ndarray) -> DynamicsRolloutSamples:
+        data = (
+            self.observations[batch_indices],
+            self.actions[batch_indices].astype(np.float32, copy=False),
+            self.values[batch_indices].flatten(),
+            self.log_probs[batch_indices].flatten(),
+            self.advantages[batch_indices].flatten(),
+            self.returns[batch_indices].flatten(),
+            self.next_observations[batch_indices],
+            self.dynamics_masks[batch_indices].flatten(),
+        )
+        return DynamicsRolloutSamples(*tuple(map(self.to_torch, data)))

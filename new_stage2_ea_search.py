@@ -4,8 +4,6 @@ import argparse
 import copy
 import json
 import os
-import random
-from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,44 +14,47 @@ import torch.multiprocessing as mp
 from evox.core import Problem
 from evox.operators.selection import non_dominate_rank
 from evox.workflows import EvalMonitor, StdWorkflow
-from gymnasium import spaces
 from omegaconf import DictConfig, OmegaConf
-from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import VecEnv
 
 from checkpoint_utils import (
-    build_network_ppo_config,
     build_policy_from_checkpoint,
     load_checkpoint,
     load_critic_from_checkpoint,
-    validate_checkpoint_search_space,
 )
-from config_utils import (
+from ea_codec import GeneCodec
+from env_utils import EVAL_SEED_OFFSET
+from nsga2_search import DiscreteNSGA2
+from ppo_utils import (
+from sb3_nas_policy import finetune_and_evaluate_arch
+    PolicySupernet,
+    actor_head_parameters,
+    build_sb3_critic_model,
+    collect_candidate_rollout,
+    configure_actor_optimizer,
+    count_parameters,
+    create_ema_policy,
+    critic_update,
+    critic_warmup,
+    evaluate_actor_subnet,
+    fixed_arch_actor_update,
+    make_vec_env_from_ppo_config,
+    parse_schedule_value,
+    resolve_device,
+    update_actor_optimizer_learning_rate,
+    update_ema_model,
+    update_optimizer_learning_rate,
+)
+from setup_utils import (
     add_ppo_config_args,
     build_run_config,
     load_ppo_config,
     ppo_config_to_dict,
-)
-from ea_codec import GeneCodec
-from env_utils import EVAL_SEED_OFFSET
-from new_stage1_train_policy_supernet import (
-    DynamicsRolloutBuffer,
-    PolicySupernet,
-    bootstrap_time_limit_rewards,
-    build_sb3_critic_model,
-    critic_update,
-    evaluate_actor_subnet,
-    predict_critic_values,
-)
-from nsga2_search import DiscreteNSGA2
-from ppo_utils import (
-    make_vec_env_from_ppo_config,
-    parse_optional_float,
-    parse_schedule_value,
-    resolve_device,
+    set_global_seeds,
 )
 from supernet_backbone import ArchConfig, SearchSpace
-from trajectory_data import resolve_terminal_next_observations, split_done_flags
+from trajectory_data import (
+    DynamicsRolloutBuffer,
+)
 from wandb_utils import finish_wandb_run, init_wandb_run, log_wandb
 
 
@@ -220,386 +221,6 @@ def log_generation(
     log_wandb(wandb_run, summary, step=generation)
 
 
-def actor_head_parameters(policy: PolicySupernet) -> list[torch.nn.Parameter]:
-    parameters = list(policy.policy_net.parameters()) + list(
-        policy.action_net.parameters()
-    )
-    if policy.log_std is not None:
-        parameters.append(policy.log_std)
-    return parameters
-
-
-def configure_actor_optimizer(
-    policy: PolicySupernet,
-    head_lr: Any,
-    backbone_lr: Any,
-) -> torch.optim.Optimizer:
-    for parameter in policy.parameters():
-        parameter.requires_grad_(False)
-
-    head_params = actor_head_parameters(policy)
-    for parameter in head_params:
-        parameter.requires_grad_(True)
-
-    head_lr_start = float(head_lr(1.0)) if callable(head_lr) else float(head_lr)
-    backbone_lr_start = (
-        float(backbone_lr(1.0)) if callable(backbone_lr) else float(backbone_lr)
-    )
-    optimizer_kwargs = {
-        "betas": (0.9, 0.999),
-        "eps": 1e-5,
-        "weight_decay": 0.0,
-    }
-
-    backbone_params = list(policy.backbone.parameters())
-    if float(backbone_lr_start) <= 0.0:
-        return torch.optim.Adam(head_params, lr=head_lr_start, **optimizer_kwargs)
-
-    for parameter in backbone_params:
-        parameter.requires_grad_(True)
-
-    return torch.optim.Adam(
-        [
-            {
-                "params": backbone_params,
-                "lr": backbone_lr_start,
-                "group_name": "backbone",
-            },
-            {"params": head_params, "lr": head_lr_start, "group_name": "head"},
-        ],
-        **optimizer_kwargs,
-    )
-
-
-def update_actor_optimizer_learning_rate(
-    optimizer: torch.optim.Optimizer,
-    actor_lr: float,
-    backbone_lr: float,
-) -> None:
-    for param_group in optimizer.param_groups:
-        if param_group.get("group_name") == "backbone":
-            param_group["lr"] = float(backbone_lr)
-        else:
-            param_group["lr"] = float(actor_lr)
-
-
-def update_optimizer_learning_rate(
-    optimizer: torch.optim.Optimizer, learning_rate: float
-) -> None:
-    for param_group in optimizer.param_groups:
-        param_group["lr"] = float(learning_rate)
-
-
-def prepare_env_actions(
-    action_space: spaces.Space, action_tensor: torch.Tensor, num_envs: int
-) -> tuple[np.ndarray, np.ndarray]:
-    if isinstance(action_space, spaces.Discrete):
-        stored_actions = action_tensor.detach().cpu().numpy().reshape((-1, 1))
-        return stored_actions, stored_actions.reshape(-1)
-
-    if isinstance(action_space, spaces.Box):
-        action_shape = tuple(int(value) for value in action_space.shape)
-        stored_actions = (
-            action_tensor.detach()
-            .cpu()
-            .numpy()
-            .reshape((num_envs, *action_shape))
-            .astype(np.float32)
-        )
-        env_actions = np.clip(stored_actions, action_space.low, action_space.high)
-        return stored_actions, env_actions
-
-    raise TypeError(f"Unsupported action space: {type(action_space).__name__}")
-
-
-def collect_candidate_rollout(
-    policy: PolicySupernet,
-    critic_model: PPO,
-    env: VecEnv,
-    arch: ArchConfig,
-    rollout_buffer: DynamicsRolloutBuffer,
-    initial_observation: np.ndarray,
-    initial_episode_starts: np.ndarray,
-    n_steps: int,
-    gamma: float,
-    device: torch.device,
-) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
-    policy.eval()
-    critic_model.policy.eval()
-    policy.set_active_arch(arch)
-    rollout_buffer.reset()
-
-    num_envs = int(env.num_envs)
-    observation = np.asarray(initial_observation)
-    episode_starts = np.asarray(initial_episode_starts, dtype=np.bool_)
-    rollout_reward_sum = 0.0
-    rollout_done_count = 0
-    rollout_episode_returns: list[float] = []
-    rollout_episode_lengths: list[float] = []
-    current_rollout_returns = np.zeros(num_envs, dtype=np.float64)
-    current_rollout_lengths = np.zeros(num_envs, dtype=np.int64)
-    last_dones = episode_starts
-
-    with torch.no_grad():
-        for _ in range(int(n_steps)):
-            observation_tensor = torch.as_tensor(observation, device=device)
-            action_tensor, log_prob_tensor, _ = policy.act(
-                observation_tensor, deterministic=False
-            )
-            value_tensor = predict_critic_values(critic_model, observation_tensor)
-            stored_actions, env_actions = prepare_env_actions(
-                env.action_space, action_tensor, num_envs
-            )
-
-            next_observation, raw_rewards, raw_dones, infos = env.step(env_actions)
-            info_list = list(infos)
-            resolved_next_observation = resolve_terminal_next_observations(
-                next_observation, info_list
-            )
-            terminated, _truncated = split_done_flags(raw_dones, info_list)
-            dynamics_mask = (~terminated).astype(np.float32)
-            adjusted_rewards = bootstrap_time_limit_rewards(
-                rewards=np.asarray(raw_rewards, dtype=np.float32),
-                dones=np.asarray(raw_dones, dtype=np.bool_),
-                infos=info_list,
-                critic_model=critic_model,
-                device=device,
-                gamma=float(gamma),
-            )
-
-            rollout_buffer.add_transition(
-                obs=observation,
-                next_obs=resolved_next_observation,
-                action=stored_actions,
-                reward=adjusted_rewards,
-                episode_start=episode_starts,
-                value=value_tensor,
-                log_prob=log_prob_tensor,
-                dynamics_mask=dynamics_mask,
-            )
-
-            rollout_reward_sum += float(np.asarray(raw_rewards, dtype=np.float32).sum())
-            reward_array = np.asarray(raw_rewards, dtype=np.float64)
-            done_array = np.asarray(raw_dones, dtype=np.bool_)
-            current_rollout_returns += reward_array
-            current_rollout_lengths += 1
-            rollout_done_count += int(done_array.sum())
-            for env_index, done in enumerate(done_array):
-                if not bool(done):
-                    continue
-                episode_info = (
-                    info_list[env_index].get("episode")
-                    if isinstance(info_list[env_index], Mapping)
-                    else None
-                )
-                if isinstance(episode_info, Mapping) and "r" in episode_info:
-                    episode_return = float(episode_info["r"])
-                else:
-                    episode_return = float(current_rollout_returns[env_index])
-                if isinstance(episode_info, Mapping) and "l" in episode_info:
-                    episode_length = float(episode_info["l"])
-                else:
-                    episode_length = float(current_rollout_lengths[env_index])
-                rollout_episode_returns.append(episode_return)
-                rollout_episode_lengths.append(episode_length)
-                current_rollout_returns[env_index] = 0.0
-                current_rollout_lengths[env_index] = 0
-            observation = np.asarray(next_observation)
-            episode_starts = done_array
-            last_dones = episode_starts
-
-        last_observation_tensor = torch.as_tensor(observation, device=device)
-        last_values = predict_critic_values(critic_model, last_observation_tensor)
-
-    rollout_buffer.compute_returns_and_advantage(
-        last_values=last_values, dones=last_dones
-    )
-    ep_return = (
-        float(np.mean(rollout_episode_returns)) if rollout_episode_returns else 0.0
-    )
-    ep_length = (
-        float(np.mean(rollout_episode_lengths)) if rollout_episode_lengths else 0.0
-    )
-    metrics = {
-        "rollout/reward_per_step": rollout_reward_sum
-        / float(max(1, int(n_steps) * num_envs)),
-        "rollout/ep_return": ep_return,
-        "rollout/ep_length": ep_length,
-        "rollout/done_count": float(rollout_done_count),
-        "rollout/advantage_mean": float(rollout_buffer.advantages.mean()),
-        "rollout/advantage_std": float(rollout_buffer.advantages.std()),
-    }
-    return observation, episode_starts, metrics
-
-
-def fixed_arch_actor_update(
-    policy: PolicySupernet,
-    actor_optimizer: torch.optim.Optimizer,
-    rollout_buffer: DynamicsRolloutBuffer,
-    arch: ArchConfig,
-    action_space: spaces.Space,
-    n_epochs: int,
-    batch_size: int,
-    clip_range: float,
-    normalize_advantage: bool,
-    ent_coef: float,
-    max_grad_norm: float,
-    target_kl: float | None,
-) -> dict[str, float]:
-    policy.train()
-    loss_sum = 0.0
-    policy_loss_sum = 0.0
-    entropy_loss_sum = 0.0
-    approx_kl_sum = 0.0
-    clip_fraction_sum = 0.0
-    update_count = 0
-    continue_training = True
-
-    for _ in range(int(n_epochs)):
-        if not continue_training:
-            break
-        for rollout_data in rollout_buffer.get(int(batch_size)):
-            batch_actions = rollout_data.actions
-            if isinstance(action_space, spaces.Discrete):
-                batch_actions = batch_actions.long().flatten()
-
-            batch_old_log_probs = rollout_data.old_log_prob
-            batch_advantages = rollout_data.advantages
-            if normalize_advantage and batch_advantages.numel() > 1:
-                batch_advantages = (batch_advantages - batch_advantages.mean()) / (
-                    batch_advantages.std() + 1e-8
-                )
-
-            actor_optimizer.zero_grad(set_to_none=True)
-            policy.set_active_arch(arch)
-            new_log_probs, entropy = policy.evaluate_actions(
-                rollout_data.observations, batch_actions
-            )
-            log_ratio = new_log_probs - batch_old_log_probs
-            ratio = torch.exp(log_ratio)
-            unclipped_loss = batch_advantages * ratio
-            clipped_loss = batch_advantages * torch.clamp(
-                ratio, 1.0 - float(clip_range), 1.0 + float(clip_range)
-            )
-            policy_loss = -torch.min(unclipped_loss, clipped_loss).mean()
-            entropy_loss = -entropy.mean()
-            loss = policy_loss + float(ent_coef) * entropy_loss
-            approx_kl = torch.mean(((ratio - 1.0) - log_ratio).detach())
-            clip_fraction = torch.mean(
-                (torch.abs(ratio - 1.0) > float(clip_range)).float().detach()
-            )
-            loss.backward()
-
-            if float(max_grad_norm) > 0.0:
-                torch.nn.utils.clip_grad_norm_(
-                    [
-                        parameter
-                        for parameter in policy.parameters()
-                        if parameter.requires_grad
-                    ],
-                    float(max_grad_norm),
-                )
-            actor_optimizer.step()
-
-            update_count += 1
-            loss_sum += float(loss.detach().cpu())
-            policy_loss_sum += float(policy_loss.detach().cpu())
-            entropy_loss_sum += float(entropy_loss.detach().cpu())
-            approx_kl_sum += float(approx_kl.cpu())
-            clip_fraction_sum += float(clip_fraction.cpu())
-
-            if target_kl is not None and float(approx_kl.cpu()) > 1.5 * float(
-                target_kl
-            ):
-                continue_training = False
-                break
-
-    denominator = float(max(1, update_count))
-    return {
-        "actor/loss": loss_sum / denominator,
-        "actor/policy_loss": policy_loss_sum / denominator,
-        "actor/entropy_loss": entropy_loss_sum / denominator,
-        "actor/approx_kl": approx_kl_sum / denominator,
-        "actor/clip_fraction": clip_fraction_sum / denominator,
-    }
-
-
-def prefixed_metrics(prefix: str, metrics: Mapping[str, float]) -> dict[str, float]:
-    return {f"{prefix}/{key}": float(value) for key, value in metrics.items()}
-
-
-def critic_warmup(
-    policy: PolicySupernet,
-    critic_model: PPO,
-    env: VecEnv,
-    arch: ArchConfig,
-    rollout_buffer: DynamicsRolloutBuffer,
-    initial_observation: np.ndarray,
-    initial_episode_starts: np.ndarray,
-    target_timesteps: int,
-    ppo_config: Any,
-    critic_lr_schedule: Any,
-    device: torch.device,
-) -> tuple[np.ndarray, np.ndarray, int, dict[str, float]]:
-    observation = np.asarray(initial_observation)
-    episode_starts = np.asarray(initial_episode_starts, dtype=np.bool_)
-    actual_timesteps = 0
-    last_metrics: dict[str, float] = {}
-    target_timesteps = max(0, int(target_timesteps))
-
-    while actual_timesteps < target_timesteps:
-        progress_remaining = 1.0 - float(actual_timesteps) / float(
-            max(1, target_timesteps)
-        )
-        critic_lr = (
-            float(critic_lr_schedule(progress_remaining))
-            if callable(critic_lr_schedule)
-            else float(critic_lr_schedule)
-        )
-        update_optimizer_learning_rate(critic_model.policy.optimizer, critic_lr)
-        observation, episode_starts, rollout_metrics = collect_candidate_rollout(
-            policy=policy,
-            critic_model=critic_model,
-            env=env,
-            arch=arch,
-            rollout_buffer=rollout_buffer,
-            initial_observation=observation,
-            initial_episode_starts=episode_starts,
-            n_steps=int(ppo_config.n_steps),
-            gamma=float(ppo_config.gamma),
-            device=device,
-        )
-        actual_timesteps += int(ppo_config.n_steps) * int(env.num_envs)
-        critic_metrics = critic_update(
-            critic_model=critic_model,
-            optimizer=critic_model.policy.optimizer,
-            rollout_buffer=rollout_buffer,
-            n_epochs=int(ppo_config.n_epochs),
-            batch_size=int(ppo_config.batch_size),
-            max_grad_norm=float(ppo_config.max_grad_norm),
-        )
-        last_metrics = {
-            "progress_remaining": float(progress_remaining),
-            "critic_lr": float(critic_lr),
-            **prefixed_metrics("critic_warmup_rollout", rollout_metrics),
-            **prefixed_metrics("critic_warmup", critic_metrics),
-        }
-
-    return observation, episode_starts, actual_timesteps, last_metrics
-
-
-def set_global_seeds(seed: int) -> None:
-    random.seed(int(seed))
-    np.random.seed(int(seed))
-    torch.manual_seed(int(seed))
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(int(seed))
-
-
-def count_parameters(parameters: list[torch.nn.Parameter]) -> int:
-    return int(sum(parameter.numel() for parameter in parameters))
-
-
 def finetune_and_evaluate_candidate(
     args: argparse.Namespace,
     ppo_config: Any,
@@ -611,7 +232,6 @@ def finetune_and_evaluate_candidate(
     device = resolve_device(str(ppo_config.device))
     search_space = SearchSpace()
     checkpoint = load_checkpoint(args.supernet_checkpoint, map_location=device)
-    validate_checkpoint_search_space(checkpoint, search_space)
 
     train_env = make_vec_env_from_ppo_config(
         ppo_config, seed=train_seed, n_envs=ppo_config.train_n_envs
@@ -629,6 +249,14 @@ def finetune_and_evaluate_candidate(
         )
         policy.set_active_arch(arch_config)
 
+        beta_dyn = float(ppo_config.beta_dyn)
+        ema_policy: PolicySupernet | None = None
+        if beta_dyn > 0.0:
+            ema_policy = create_ema_policy(
+                policy, device,
+                checkpoint_ema_state_dict=checkpoint.get("ema_policy_state_dict"),
+            )
+
         actor_lr_schedule = parse_schedule_value(ppo_config.policy_head_lr)
         backbone_lr_schedule = parse_schedule_value(ppo_config.policy_backbone_lr)
         critic_lr_schedule = parse_schedule_value(ppo_config.critic_lr)
@@ -639,11 +267,8 @@ def finetune_and_evaluate_candidate(
             backbone_lr=backbone_lr_schedule,
         )
 
-        critic_ppo_config = build_network_ppo_config(
-            checkpoint.get("ppo_config", {}), ppo_config, seed=train_seed
-        )
         critic_model = build_sb3_critic_model(
-            ppo_config=critic_ppo_config,
+            ppo_config=ppo_config,
             env=train_env,
             learning_rate=critic_lr_schedule,
         )
@@ -686,7 +311,7 @@ def finetune_and_evaluate_candidate(
         total_timesteps = 0
         last_metrics: dict[str, float] = {}
         target_timesteps = max(0, int(ppo_config.total_timesteps))
-        target_kl = parse_optional_float(ppo_config.target_kl)
+        target_kl = ppo_config.target_kl
 
         while total_timesteps < target_timesteps:
             progress_remaining = 1.0 - float(total_timesteps) / float(
@@ -741,7 +366,11 @@ def finetune_and_evaluate_candidate(
                 ent_coef=float(ppo_config.ent_coef),
                 max_grad_norm=float(ppo_config.max_grad_norm),
                 target_kl=target_kl,
+                ema_policy=ema_policy,
+                beta_dyn=beta_dyn,
             )
+            if ema_policy is not None and beta_dyn > 0.0:
+                update_ema_model(ema_policy, policy, tau=float(ppo_config.ema_tau))
             critic_metrics = critic_update(
                 critic_model=critic_model,
                 optimizer=critic_model.policy.optimizer,

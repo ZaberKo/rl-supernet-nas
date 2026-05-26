@@ -14,44 +14,40 @@ from stable_baselines3.common.vec_env import VecEnv
 from tqdm.auto import tqdm
 
 from checkpoint_utils import (
-    build_network_ppo_config,
     build_policy_from_checkpoint,
     load_checkpoint,
     load_critic_from_checkpoint,
-    validate_checkpoint_search_space,
+    save_checkpoint,
 )
-from config_utils import (
-    add_ppo_config_args,
-    build_run_config,
-    load_ppo_config,
-    ppo_config_to_dict,
-)
-from env_utils import EVAL_SEED_OFFSET
-from new_stage1_train_policy_supernet import (
-    DynamicsRolloutBuffer,
-    build_sb3_critic_model,
-    evaluate_actor_subnet,
-)
-from new_stage2_ea_search import (
+from env_utils import EVAL_SEED_OFFSET, make_vec_env_from_ppo_config
+from ppo_utils import (
+    PolicySupernet,
     actor_head_parameters,
+    append_jsonl_record,
+    build_sb3_critic_model,
     collect_candidate_rollout,
     configure_actor_optimizer,
     count_parameters,
+    create_ema_policy,
     critic_update,
+    evaluate_actor_subnet,
     fixed_arch_actor_update,
     prefixed_metrics,
-    set_global_seeds,
     update_actor_optimizer_learning_rate,
+    update_ema_model,
     update_optimizer_learning_rate,
 )
-from ppo_utils import (
-    append_jsonl_record,
-    make_vec_env_from_ppo_config,
-    parse_optional_float,
+from setup_utils import (
+    add_ppo_config_args,
+    build_run_config,
+    load_ppo_config,
     parse_schedule_value,
+    ppo_config_to_dict,
     resolve_device,
+    set_global_seeds,
 )
 from supernet_backbone import ArchConfig, SearchSpace
+from trajectory_data import DynamicsRolloutBuffer
 from wandb_utils import finish_wandb_run, init_wandb_run, log_wandb
 
 
@@ -165,22 +161,6 @@ def log_record(
     log_wandb(wandb_run, numeric_values(record), step=step)
 
 
-def write_progress(progress_bar: tqdm | None, message: str) -> None:
-    if progress_bar is None:
-        print(message, flush=True)
-        return
-    progress_bar.write(message)
-
-
-def update_progress_bar(
-    progress_bar: tqdm | None, configured_total: int, current_total: int
-) -> None:
-    if progress_bar is None:
-        return
-    bounded_total = min(max(0, int(configured_total)), max(0, int(current_total)))
-    progress_bar.update(max(0, bounded_total - int(progress_bar.n)))
-
-
 def evaluate_and_record(
     policy,
     train_env: VecEnv,
@@ -218,44 +198,41 @@ def evaluate_and_record(
     return record
 
 
-def save_arch_checkpoint(
+def _save_arch_checkpoint(
     path: Path,
     args: argparse.Namespace,
     ppo_config: DictConfig,
-    policy,
+    policy: PolicySupernet,
     critic_model: PPO,
     actor_optimizer: torch.optim.Optimizer,
     critic_optimizer: torch.optim.Optimizer,
-    search_space: SearchSpace,
     arch_config: ArchConfig,
-    checkpoint: Mapping[str, Any],
+    source_stage: str | None,
     actual_timesteps: int,
     critic_warmup_timesteps: int,
     total_env_timesteps: int,
     stage_name: str,
+    ema_policy: PolicySupernet | None = None,
 ) -> None:
-    torch.save(
-        {
-            "stage": stage_name,
-            "source_stage": checkpoint.get("stage"),
-            "total_timesteps": int(actual_timesteps),
-            "critic_warmup_timesteps": int(critic_warmup_timesteps),
-            "total_env_timesteps": int(total_env_timesteps),
-            "policy_state_dict": policy.state_dict(),
-            "critic_policy_state_dict": critic_model.policy.state_dict(),
-            "actor_optimizer_state_dict": actor_optimizer.state_dict(),
-            "critic_optimizer_state_dict": critic_optimizer.state_dict(),
-            "search_space": search_space.to_dict(),
-            "arch_config": arch_config.to_dict(),
-            "supernet_checkpoint": str(args.supernet_checkpoint),
-            "features_dim": checkpoint.get("features_dim", ppo_config.features_dim),
-            "projection_dim": checkpoint.get(
-                "projection_dim", ppo_config.projection_dim
-            ),
-            "args": vars(args),
-            "ppo_config": ppo_config_to_dict(ppo_config),
-        },
+    extra: dict[str, Any] = {}
+    if ema_policy is not None:
+        extra["ema_policy_state_dict"] = ema_policy.state_dict()
+    save_checkpoint(
         path,
+        stage=stage_name,
+        args=args,
+        ppo_config=ppo_config,
+        policy_state_dict=policy.state_dict(),
+        critic_policy_state_dict=critic_model.policy.state_dict(),
+        actor_optimizer_state_dict=actor_optimizer.state_dict(),
+        critic_optimizer_state_dict=critic_optimizer.state_dict(),
+        source_stage=source_stage,
+        arch_config=arch_config.to_dict(),
+        supernet_checkpoint=args.supernet_checkpoint,
+        total_timesteps=actual_timesteps,
+        critic_warmup_timesteps=critic_warmup_timesteps,
+        total_env_timesteps=total_env_timesteps,
+        **extra,
     )
 
 
@@ -290,7 +267,6 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
         device = resolve_device(str(ppo_config.device))
 
         checkpoint = load_checkpoint(args.supernet_checkpoint, map_location=device)
-        validate_checkpoint_search_space(checkpoint, search_space)
 
         train_env = make_vec_env_from_ppo_config(
             ppo_config, seed=train_seed, n_envs=ppo_config.train_n_envs
@@ -312,6 +288,14 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
         )
         policy.set_active_arch(arch_config)
 
+        beta_dyn = float(ppo_config.beta_dyn)
+        ema_policy: PolicySupernet | None = None
+        if beta_dyn > 0.0:
+            ema_policy = create_ema_policy(
+                policy, device,
+                checkpoint_ema_state_dict=checkpoint.get("ema_policy_state_dict"),
+            )
+
         critic_lr_schedule = parse_schedule_value(ppo_config.critic_lr)
         policy_head_lr_schedule = parse_schedule_value(ppo_config.policy_head_lr)
         policy_backbone_lr_schedule = parse_schedule_value(
@@ -325,11 +309,8 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             backbone_lr=policy_backbone_lr_schedule,
         )
 
-        critic_ppo_config = build_network_ppo_config(
-            checkpoint.get("ppo_config", {}), ppo_config, seed=train_seed
-        )
         critic_model = build_sb3_critic_model(
-            ppo_config=critic_ppo_config,
+            ppo_config=ppo_config,
             env=train_env,
             learning_rate=critic_lr_schedule,
         )
@@ -393,7 +374,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             if best_eval_ep_return is None or ep_return > best_eval_ep_return:
                 best_eval_ep_return = ep_return
                 best_eval_record = dict(record)
-                save_arch_checkpoint(
+                _save_arch_checkpoint(
                     best_checkpoint_path,
                     args=args,
                     ppo_config=ppo_config,
@@ -401,13 +382,13 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                     critic_model=critic_model,
                     actor_optimizer=actor_optimizer,
                     critic_optimizer=critic_optimizer,
-                    search_space=search_space,
                     arch_config=arch_config,
-                    checkpoint=checkpoint,
+                    source_stage=checkpoint.get("stage"),
                     actual_timesteps=current_actual_timesteps,
                     critic_warmup_timesteps=critic_warmup_actual_timesteps,
                     total_env_timesteps=current_total_env_timesteps,
                     stage_name=stage_name,
+                    ema_policy=ema_policy,
                 )
 
         if eval_env is not None:
@@ -425,15 +406,13 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                 total_env_timesteps=0,
                 phase="initial",
             )
-            write_progress(
-                progress_bar,
-                (
+            if progress_bar is not None:
+                progress_bar.write(
                     "new_stage1_arch_eval phase=initial step=0 "
                     f"ep_return={initial_eval_record['eval/ep_return']:.6g} "
                     f"ep_return_std={initial_eval_record['eval/ep_return_std']:.6g} "
                     f"ep_length={initial_eval_record['eval/ep_length']:.6g}"
-                ),
-            )
+                )
             maybe_save_best_checkpoint(initial_eval_record, 0, 0)
 
         observation = train_env.reset()
@@ -487,9 +466,8 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                 **prefixed_metrics("critic_warmup", critic_metrics),
             }
             log_record(metrics_path, wandb_run, record, step=total_env_timesteps)
-            update_progress_bar(
-                progress_bar, configured_progress_total, total_env_timesteps
-            )
+            if progress_bar is not None:
+                progress_bar.update(total_env_timesteps - progress_bar.n)
             if progress_bar is not None:
                 progress_bar.set_postfix(
                     {
@@ -501,7 +479,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                     refresh=True,
                 )
 
-        target_kl = parse_optional_float(ppo_config.target_kl)
+        target_kl = ppo_config.target_kl
         next_eval_timestep = eval_freq if eval_freq > 0 else 0
         train_iteration = 0
         last_train_record: dict[str, Any] = {}
@@ -560,7 +538,11 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                 ent_coef=float(ppo_config.ent_coef),
                 max_grad_norm=float(ppo_config.max_grad_norm),
                 target_kl=target_kl,
+                ema_policy=ema_policy,
+                beta_dyn=beta_dyn,
             )
+            if ema_policy is not None and beta_dyn > 0.0:
+                update_ema_model(ema_policy, policy, tau=float(ppo_config.ema_tau))
             critic_metrics = critic_update(
                 critic_model=critic_model,
                 optimizer=critic_optimizer,
@@ -586,9 +568,8 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             }
             last_train_record = dict(train_record)
             log_record(metrics_path, wandb_run, train_record, step=total_env_timesteps)
-            update_progress_bar(
-                progress_bar, configured_progress_total, total_env_timesteps
-            )
+            if progress_bar is not None:
+                progress_bar.update(total_env_timesteps - progress_bar.n)
             if progress_bar is not None:
                 progress_bar.set_postfix(
                     {
@@ -622,20 +603,18 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                     total_env_timesteps=total_env_timesteps,
                     phase="periodic",
                 )
-                write_progress(
-                    progress_bar,
-                    (
+                if progress_bar is not None:
+                    progress_bar.write(
                         f"new_stage1_arch_eval phase=periodic step={actual_timesteps} "
                         f"ep_return={eval_record['eval/ep_return']:.6g} "
                         f"ep_return_std={eval_record['eval/ep_return_std']:.6g} "
                         f"ep_length={eval_record['eval/ep_length']:.6g}"
-                    ),
-                )
+                    )
                 maybe_save_best_checkpoint(
                     eval_record, actual_timesteps, total_env_timesteps
                 )
 
-            save_arch_checkpoint(
+            _save_arch_checkpoint(
                 last_checkpoint_path,
                 args=args,
                 ppo_config=ppo_config,
@@ -643,13 +622,13 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                 critic_model=critic_model,
                 actor_optimizer=actor_optimizer,
                 critic_optimizer=critic_optimizer,
-                search_space=search_space,
                 arch_config=arch_config,
-                checkpoint=checkpoint,
+                source_stage=checkpoint.get("stage"),
                 actual_timesteps=actual_timesteps,
                 critic_warmup_timesteps=critic_warmup_actual_timesteps,
                 total_env_timesteps=total_env_timesteps,
                 stage_name=stage_name,
+                ema_policy=ema_policy,
             )
 
         if eval_env is not None:
@@ -667,15 +646,13 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                 total_env_timesteps=total_env_timesteps,
                 phase="final",
             )
-            write_progress(
-                progress_bar,
-                (
+            if progress_bar is not None:
+                progress_bar.write(
                     f"new_stage1_arch_eval phase=final step={actual_timesteps} "
                     f"ep_return={final_eval_record['eval/ep_return']:.6g} "
                     f"ep_return_std={final_eval_record['eval/ep_return_std']:.6g} "
                     f"ep_length={final_eval_record['eval/ep_length']:.6g}"
-                ),
-            )
+                )
             maybe_save_best_checkpoint(
                 final_eval_record, actual_timesteps, total_env_timesteps
             )
@@ -692,7 +669,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             )
         )
 
-        save_arch_checkpoint(
+        _save_arch_checkpoint(
             last_checkpoint_path,
             args=args,
             ppo_config=ppo_config,
@@ -700,13 +677,13 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             critic_model=critic_model,
             actor_optimizer=actor_optimizer,
             critic_optimizer=critic_optimizer,
-            search_space=search_space,
             arch_config=arch_config,
-            checkpoint=checkpoint,
+            source_stage=checkpoint.get("stage"),
             actual_timesteps=actual_timesteps,
             critic_warmup_timesteps=critic_warmup_actual_timesteps,
             total_env_timesteps=total_env_timesteps,
             stage_name=stage_name,
+            ema_policy=ema_policy,
         )
 
         manifest = {
