@@ -479,14 +479,6 @@ class SupernetCNNBackbone(nn.Module):
         return int(total)
 
 
-def infer_input_channels(observation_shape: tuple[int, ...]) -> int:
-    if len(observation_shape) != 3:
-        raise ValueError("Only image observations with three dimensions are supported.")
-    if observation_shape[0] in (1, 3, 4):
-        return int(observation_shape[0])
-    return int(observation_shape[-1])
-
-
 POLICY_BACKBONE_PREFIX = "features_extractor.backbone."
 
 

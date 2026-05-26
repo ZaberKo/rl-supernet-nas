@@ -24,13 +24,10 @@ from stable_baselines3.common.vec_env import (
 from env_utils import make_vec_env_from_ppo_config
 from ppo_utils import jsonable_metric_value, normalize_metric_key
 from setup_utils import parse_schedule_value, resolve_activation_fn
-
-
 from supernet_backbone import (
     ArchConfig,
     SearchSpace,
     SupernetCNNBackbone,
-    infer_input_channels,
     load_backbone_from_backbone_checkpoint,
 )
 
@@ -50,7 +47,7 @@ class SupernetFeaturesExtractor(BaseFeaturesExtractor):
         search_space = SearchSpace()
         arch = _resolve_arch_config(arch_config, search_space)
         self.backbone = SupernetCNNBackbone(
-            input_channels=infer_input_channels(tuple(observation_space.shape)),
+            input_channels=int(observation_space.shape[0]),
             search_space=search_space,
             feature_dim=features_dim,
         )

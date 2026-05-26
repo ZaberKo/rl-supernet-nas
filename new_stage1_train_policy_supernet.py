@@ -203,8 +203,6 @@ def collect_rollout(
     return observation, episode_starts, metrics
 
 
-
-
 def logit_standardization(logits: torch.Tensor) -> torch.Tensor:
     """Standardizes logits along the last dimension to have zero mean and unit variance."""
     mean = logits.mean(dim=-1, keepdim=True)
@@ -222,18 +220,18 @@ def policy_kl_distillation_loss(
     if isinstance(action_space, spaces.Discrete):
         if temperature <= 0.0:
             raise ValueError("distill_temperature must be positive.")
-            
+
         student_logits = student_params["logits"]
         teacher_logits = teacher_params["logits"].detach()
-        
+
         if use_logit_standardization:
             student_logits = logit_standardization(student_logits)
             teacher_logits = logit_standardization(teacher_logits)
-            
+
         teacher_log_probs = F.log_softmax(teacher_logits / float(temperature), dim=-1)
         teacher_probs = teacher_log_probs.exp()
         student_log_probs = F.log_softmax(student_logits / float(temperature), dim=-1)
-        
+
         return (
             F.kl_div(student_log_probs, teacher_probs, reduction="batchmean")
             * float(temperature) ** 2
@@ -393,7 +391,9 @@ def sandwich_actor_update(
             actor_optimizer.step()
 
             subnet_loss_value = float(np.mean(subnet_loss_values))
-            subnet_policy_distill_loss_value = float(np.mean(subnet_policy_distill_loss_values))
+            subnet_policy_distill_loss_value = float(
+                np.mean(subnet_policy_distill_loss_values)
+            )
             update_count += 1
             loss_sum += max_loss_value + subnet_loss_value
             max_loss_sum += max_loss_value
@@ -419,7 +419,8 @@ def sandwich_actor_update(
         "actor/entropy_loss": entropy_loss_sum / denominator,
         "actor/max_dynamic_loss": max_dynamic_loss_sum / denominator,
         "actor/subnet_loss": subnet_loss_sum / denominator,
-        "actor/subnet_policy_distill_loss": subnet_policy_distill_loss_sum / denominator,
+        "actor/subnet_policy_distill_loss": subnet_policy_distill_loss_sum
+        / denominator,
         "actor/approx_kl": approx_kl_sum / denominator,
         "actor/clip_fraction": clip_fraction_sum / denominator,
     }

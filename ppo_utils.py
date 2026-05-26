@@ -20,7 +20,6 @@ from stable_baselines3.common.vec_env import (
     unwrap_vec_normalize,
 )
 
-
 from representation_losses import (
     LatentDynamicsPredictor,
     ProjectionHead,
@@ -37,16 +36,12 @@ from supernet_backbone import (
     ArchConfig,
     SearchSpace,
     SupernetCNNBackbone,
-    infer_input_channels,
 )
 from trajectory_data import (
     DynamicsRolloutBuffer,
     resolve_terminal_next_observations,
     split_done_flags,
 )
-
-
-
 
 
 def jsonable_metric_value(value: Any) -> Any:
@@ -134,7 +129,7 @@ class PolicySupernet(nn.Module):
         self.search_space = search_space
         self.features_dim = int(features_dim)
         self.backbone = SupernetCNNBackbone(
-            input_channels=infer_input_channels(tuple(observation_space.shape)),
+            input_channels=int(observation_space.shape[0]),
             search_space=search_space,
             feature_dim=self.features_dim,
         )
