@@ -83,22 +83,10 @@ def parse_args() -> argparse.Namespace:
         help="Number of NSGA-II generations to evaluate.",
     )
     parser.add_argument(
-        "--candidate_timesteps",
-        type=int,
-        default=None,
-        help="PPO finetune timesteps per candidate; defaults to ppo.total_timesteps.",
-    )
-    parser.add_argument(
         "--eval_workers",
         type=int,
         default=1,
         help="Torch multiprocessing workers for parallel subnet evaluation.",
-    )
-    parser.add_argument(
-        "--supernet_backbone_lr",
-        type=float,
-        default=None,
-        help="Optional fixed backbone learning rate during candidate finetune; <= 0 freezes the backbone. Defaults to ppo.policy_backbone_lr.",
     )
     parser.add_argument(
         "--critic_warmup_timesteps",
@@ -112,8 +100,6 @@ def parse_args() -> argparse.Namespace:
         help="Store full EvoX monitor history in memory for debugging.",
     )
     args = parser.parse_args()
-    if args.candidate_timesteps is not None and args.candidate_timesteps < 0:
-        raise ValueError("candidate_timesteps must be non-negative.")
     if args.critic_warmup_timesteps < 0:
         raise ValueError("critic_warmup_timesteps must be non-negative.")
     args.eval_call_seed_stride = 10_000
@@ -122,19 +108,6 @@ def parse_args() -> argparse.Namespace:
     args.mp_start_method = "spawn"
     args.worker_torch_threads = 1
     return args
-
-
-def configured_candidate_timesteps(args: argparse.Namespace, ppo_config: Any) -> int:
-    value = args.candidate_timesteps
-    if value is None:
-        value = ppo_config.total_timesteps
-    return max(0, int(value))
-
-
-def configured_backbone_lr(args: argparse.Namespace, ppo_config: Any) -> Any:
-    if args.supernet_backbone_lr is not None:
-        return float(args.supernet_backbone_lr)
-    return parse_schedule_value(ppo_config.policy_backbone_lr)
 
 
 def build_initial_population(
@@ -657,7 +630,7 @@ def finetune_and_evaluate_candidate(
         policy.set_active_arch(arch_config)
 
         actor_lr_schedule = parse_schedule_value(ppo_config.policy_head_lr)
-        backbone_lr_schedule = configured_backbone_lr(args, ppo_config)
+        backbone_lr_schedule = parse_schedule_value(ppo_config.policy_backbone_lr)
         critic_lr_schedule = parse_schedule_value(ppo_config.critic_lr)
         clip_range_schedule = parse_schedule_value(ppo_config.clip_range)
         actor_optimizer = configure_actor_optimizer(
@@ -712,7 +685,7 @@ def finetune_and_evaluate_candidate(
 
         total_timesteps = 0
         last_metrics: dict[str, float] = {}
-        target_timesteps = configured_candidate_timesteps(args, ppo_config)
+        target_timesteps = max(0, int(ppo_config.total_timesteps))
         target_kl = parse_optional_float(ppo_config.target_kl)
 
         while total_timesteps < target_timesteps:

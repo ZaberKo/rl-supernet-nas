@@ -53,5 +53,4 @@ ppo:
   ortho_init: false
   activation_fn: gelu
   device: auto
-
   quiet: false

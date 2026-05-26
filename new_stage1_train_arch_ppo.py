@@ -36,8 +36,6 @@ from new_stage2_ea_search import (
     actor_head_parameters,
     collect_candidate_rollout,
     configure_actor_optimizer,
-    configured_backbone_lr,
-    configured_candidate_timesteps,
     count_parameters,
     critic_update,
     fixed_arch_actor_update,
@@ -56,10 +54,6 @@ from ppo_utils import (
 from supernet_backbone import ArchConfig, SearchSpace
 from wandb_utils import finish_wandb_run, init_wandb_run, log_wandb
 
-DEFAULT_ARCH_CONFIG_PATH = (
-    Path(__file__).resolve().parent / "arch_configs" / "max_arch.json"
-)
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -69,7 +63,7 @@ def parse_args() -> argparse.Namespace:
     add_ppo_config_args(parser)
     parser.add_argument(
         "--arch_config",
-        default=str(DEFAULT_ARCH_CONFIG_PATH),
+        default="arch_configs/max_arch.json",
         help="JSON file containing one ArchConfig object.",
     )
     parser.add_argument(
@@ -82,18 +76,7 @@ def parse_args() -> argparse.Namespace:
         default="runs/new_stage1_arch_ppo",
         help="Directory for PPO metrics, checkpoint, and manifest.",
     )
-    parser.add_argument(
-        "--candidate_timesteps",
-        type=int,
-        default=None,
-        help="PPO finetune timesteps for this architecture; defaults to ppo.total_timesteps.",
-    )
-    parser.add_argument(
-        "--supernet_backbone_lr",
-        type=float,
-        default=None,
-        help="Optional fixed backbone learning rate during finetune; <= 0 freezes the backbone. Defaults to ppo.policy_backbone_lr.",
-    )
+
     parser.add_argument(
         "--critic_warmup_timesteps",
         type=int,
@@ -102,11 +85,11 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--suffix", default="", help="Optional suffix to append to the stage name."
+        "--suffix",
+        default="max-arch",
+        help="Optional suffix to append to the stage name.",
     )
     args = parser.parse_args()
-    if args.candidate_timesteps is not None and args.candidate_timesteps < 0:
-        raise ValueError("candidate_timesteps must be non-negative.")
     if args.critic_warmup_timesteps < 0:
         raise ValueError("critic_warmup_timesteps must be non-negative.")
     return args
@@ -331,9 +314,11 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
 
         critic_lr_schedule = parse_schedule_value(ppo_config.critic_lr)
         policy_head_lr_schedule = parse_schedule_value(ppo_config.policy_head_lr)
-        policy_backbone_lr_schedule = configured_backbone_lr(args, ppo_config)
+        policy_backbone_lr_schedule = parse_schedule_value(
+            ppo_config.policy_backbone_lr
+        )
         clip_range_schedule = parse_schedule_value(ppo_config.clip_range)
-        target_timesteps = configured_candidate_timesteps(args, ppo_config)
+        target_timesteps = max(0, int(ppo_config.total_timesteps))
         actor_optimizer = configure_actor_optimizer(
             policy=policy,
             head_lr=policy_head_lr_schedule,

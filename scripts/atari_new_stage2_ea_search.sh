@@ -8,8 +8,6 @@ python new_stage2_ea_search.py \
   --output_dir runs/atari_space_invaders/new_stage2_ea_search \
   --population_size 6 \
   --generations 3 \
-  --candidate_timesteps 10000 \
   --critic_warmup_timesteps 0 \
   --eval_workers 1 \
-  --supernet_backbone_lr 0.0 \
-  --ppo_config_override ppo.eval_episodes=3
+  --ppo_config_override ppo.total_timesteps=10000 ppo.policy_backbone_lr=0.0

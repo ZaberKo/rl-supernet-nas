@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from pathlib import Path
 from types import MethodType
 from typing import Any
 
@@ -9,7 +8,6 @@ import torch
 import torch.nn as nn
 from gymnasium import spaces
 from stable_baselines3 import PPO
-from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.vec_env import VecEnv
 
@@ -192,37 +190,3 @@ def configure_policy_optimizer(
     model._update_learning_rate = MethodType(update_group_learning_rates, model)
 
 
-def save_policy_backbone(
-    policy: ActorCriticPolicy,
-    path: str | Path,
-    search_space: SearchSpace,
-    extra: dict[str, Any] | None = None,
-) -> None:
-    state_dict: dict[str, Any] = {
-        "backbone_state_dict": policy.features_extractor.backbone.state_dict(),
-        "search_space": search_space.to_dict(),
-        "active_arch": policy.features_extractor.backbone.active_arch.to_dict(),
-    }
-    if extra:
-        state_dict.update(extra)
-    torch.save(state_dict, Path(path))
-
-
-def save_ppo_supernet_checkpoint(
-    model: PPO,
-    path: str | Path,
-    search_space: SearchSpace,
-    extra: dict[str, Any] | None = None,
-) -> None:
-    policy = model.policy
-    state_dict: dict[str, Any] = {
-        "policy_state_dict": policy.state_dict(),
-        "search_space": search_space.to_dict(),
-        "active_arch": policy.features_extractor.backbone.active_arch.to_dict(),
-        "policy_class": policy.__class__.__name__,
-        "features_extractor_class": policy.features_extractor.__class__.__name__,
-        "num_timesteps": int(model.num_timesteps),
-    }
-    if extra:
-        state_dict.update(extra)
-    torch.save(state_dict, Path(path))

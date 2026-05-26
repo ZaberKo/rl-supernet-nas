@@ -53,5 +53,4 @@ ppo:
   ortho_init: true
   activation_fn: tanh
   device: auto
-
   quiet: false
