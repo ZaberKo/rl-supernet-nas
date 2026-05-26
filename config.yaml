@@ -24,9 +24,9 @@ ppo:
   eval_deterministic: true
   total_timesteps: 10000000
   features_dim: 256
-  policy_backbone_lr: lin_2.5e-4
-  policy_head_lr: lin_2.5e-4
-  critic_lr: lin_2.5e-4
+  policy_backbone_lr: 2.5e-4
+  policy_head_lr: 2.5e-4
+  critic_lr: 2.5e-4
   projection_dim: 128
   predictor_hidden_dim: 512
   z_dyn_coef: 0.0
@@ -36,7 +36,7 @@ ppo:
   n_epochs: 4 # repeat rollout data for multiple epochs
   gamma: 0.99
   gae_lambda: 0.95
-  clip_range: lin_0.1
+  clip_range: 0.1
   clip_range_vf: null
   normalize_advantage: true
   ent_coef: 0.01
