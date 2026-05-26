@@ -29,7 +29,7 @@ def safe_artifact_name(name: str) -> str:
     return "".join(clean).strip("-") or "artifact"
 
 
-def init_wandb_run(stage: str, args: Any, output_dir: str | Path):
+def init_wandb_run(stage: str, run_config: dict[str, Any], output_dir: str | Path):
     try:
         import wandb
     except Exception as exc:
@@ -40,16 +40,20 @@ def init_wandb_run(stage: str, args: Any, output_dir: str | Path):
     wandb_dir = output_dir / "wandb"
     wandb_dir.mkdir(parents=True, exist_ok=True)
     mode = os.environ.get("WANDB_MODE", "online")
-    config = sanitize_wandb_value(vars(args) if hasattr(args, "__dict__") else args)
+    config = sanitize_wandb_value(run_config)
+    
+    env_id = config.get("ppo_config", {}).get("env_id", "unknown_env")
+    clean_env_id = env_id.replace("/", "-")
+    tags = [env_id] if env_id != "unknown_env" else []
+
     try:
         return wandb.init(
             project=WANDB_PROJECT,
-            name=f"{stage}-{output_dir.name}",
+            name=f"{stage}-{clean_env_id}",
+            tags=tags,
             config=config,
             dir=str(wandb_dir),
             mode=mode,
-            reinit="finish_previous",
-            settings=wandb.Settings(silent=True),
         )
     except Exception as exc:
         print(f"wandb_init_failed stage={stage} error={exc}", flush=True)
