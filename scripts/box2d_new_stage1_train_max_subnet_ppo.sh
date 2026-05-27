@@ -6,7 +6,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 python new_stage1_train_max_subnet_ppo.py \
   --ppo_config config_box2d.yaml \
   --ppo_config_override ppo.n_epochs=10 \
-  --ppo_config_override ppo.total_timesteps=12000000 \
+  --ppo_config_override ppo.total_timesteps=4000000 \
   --ppo_config_override ppo.z_dyn_coef=0.1 \
   --ppo_config_override ppo.ema_tau=0.99 \
   --ppo_config_override ppo.projection_dim=128 \
