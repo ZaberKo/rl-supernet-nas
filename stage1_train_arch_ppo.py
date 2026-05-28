@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -21,6 +22,7 @@ from checkpoint_utils import (
 )
 from env_utils import EVAL_SEED_OFFSET, make_vec_env_from_ppo_config
 from ppo_utils import (
+    FixedPolicySubnet,
     PolicySupernet,
     actor_head_parameters,
     append_jsonl_record,
@@ -28,7 +30,6 @@ from ppo_utils import (
     collect_candidate_rollout,
     configure_actor_optimizer,
     count_parameters,
-    create_ema_policy,
     critic_update,
     evaluate_actor_subnet,
     fixed_arch_actor_update,
@@ -183,7 +184,6 @@ def evaluate_and_record(
     eval_metrics = evaluate_actor_subnet(
         policy=policy,
         eval_env=eval_env,
-        arch=arch_config,
         n_eval_episodes=int(n_eval_episodes),
         deterministic=bool(deterministic),
         device=device,
@@ -207,7 +207,7 @@ def _save_arch_checkpoint(
     path: Path,
     args: argparse.Namespace,
     ppo_config: DictConfig,
-    policy: PolicySupernet,
+    policy: PolicySupernet | FixedPolicySubnet,
     critic_model: PPO,
     actor_optimizer: torch.optim.Optimizer,
     critic_optimizer: torch.optim.Optimizer,
@@ -217,7 +217,7 @@ def _save_arch_checkpoint(
     critic_warmup_timesteps: int,
     total_env_timesteps: int,
     stage_name: str,
-    ema_policy: PolicySupernet | None = None,
+    ema_policy: PolicySupernet | FixedPolicySubnet | None = None,
 ) -> None:
     extra: dict[str, Any] = {}
     if ema_policy is not None:
@@ -307,23 +307,29 @@ def run(
                 ppo_config, seed=eval_seed, n_envs=ppo_config.eval_n_envs
             )
 
-        policy = build_policy_from_checkpoint(
+        supernet = build_policy_from_checkpoint(
             ppo_config=ppo_config,
             env=train_env,
             search_space=search_space,
             checkpoint=checkpoint,
             device=device,
         )
-        policy.set_active_arch(arch_config)
+        supernet.set_sample_config(arch_config)
+        policy = supernet.get_active_subnet().to(device)
 
         z_dyn_coef = float(ppo_config.z_dyn_coef)
-        ema_policy: PolicySupernet | None = None
+        ema_policy: FixedPolicySubnet | None = None
         if z_dyn_coef > 0.0:
-            ema_policy = create_ema_policy(
-                policy,
-                device,
-                checkpoint_ema_state_dict=checkpoint.get("ema_policy_state_dict"),
-            )
+            ema_state_dict = checkpoint.get("ema_policy_state_dict")
+            if ema_state_dict is not None:
+                supernet.load_state_dict(ema_state_dict, strict=True)
+                supernet.set_sample_config(arch_config)
+                ema_policy = supernet.get_active_subnet().to(device)
+            else:
+                ema_policy = copy.deepcopy(policy)
+            for parameter in ema_policy.parameters():
+                parameter.requires_grad_(False)
+        del supernet
 
         critic_lr_schedule = parse_schedule_value(ppo_config.critic_lr)
         policy_head_lr_schedule = parse_schedule_value(ppo_config.policy_head_lr)
@@ -435,7 +441,6 @@ def run(
                     policy=policy,
                     critic_model=critic_model,
                     env=train_env,
-                    arch=arch_config,
                     rollout_buffer=rollout_buffer,
                     initial_observation=observation,
                     initial_episode_starts=episode_starts,
@@ -548,7 +553,6 @@ def run(
                 policy=policy,
                 critic_model=critic_model,
                 env=train_env,
-                arch=arch_config,
                 rollout_buffer=rollout_buffer,
                 initial_observation=observation,
                 initial_episode_starts=episode_starts,
@@ -562,7 +566,6 @@ def run(
                 policy=policy,
                 actor_optimizer=actor_optimizer,
                 rollout_buffer=rollout_buffer,
-                arch=arch_config,
                 action_space=train_env.action_space,
                 n_epochs=int(ppo_config.n_epochs),
                 batch_size=int(ppo_config.batch_size),
@@ -690,10 +693,11 @@ def run(
                 final_eval_record, total_timesteps, total_env_timesteps
             )
 
-        policy.set_active_arch(arch_config)
-        policy_backbone_params = int(policy.backbone.elastic_num_params)
+        policy_backbone_params = sum(
+            p.numel() for p in policy.backbone.parameters()
+        )
         policy_head_params = count_parameters(actor_head_parameters(policy))
-        policy_params = int(policy.elastic_num_params)
+        policy_params = policy_backbone_params + policy_head_params
         trainable_policy_params = policy_head_params
         if any(p.requires_grad for p in policy.backbone.parameters()):
             trainable_policy_params += policy_backbone_params

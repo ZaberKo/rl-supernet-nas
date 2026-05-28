@@ -357,6 +357,8 @@ class ElasticBatchNorm2d(nn.BatchNorm2d):
             self.momentum,
             self.affine,
             self.track_running_stats,
+            device=self.weight.device,
+            dtype=self.weight.dtype,
         )
         with torch.no_grad():
             sub.weight.copy_(self.weight[: self.sample_num_features])

@@ -22,23 +22,20 @@ from checkpoint_utils import (
     load_critic_from_checkpoint,
 )
 from ea_codec import GeneCodec
-from env_utils import EVAL_SEED_OFFSET
+from env_utils import EVAL_SEED_OFFSET, make_vec_env_from_ppo_config
 from nsga2_search import DiscreteNSGA2
 from ppo_utils import (
+    FixedPolicySubnet,
     PolicySupernet,
     actor_head_parameters,
     build_sb3_critic_model,
     collect_candidate_rollout,
     configure_actor_optimizer,
     count_parameters,
-    create_ema_policy,
     critic_update,
     critic_warmup,
     evaluate_actor_subnet,
     fixed_arch_actor_update,
-    make_vec_env_from_ppo_config,
-    parse_schedule_value,
-    resolve_device,
     update_actor_optimizer_learning_rate,
     update_ema_model,
     update_optimizer_learning_rate,
@@ -47,7 +44,9 @@ from setup_utils import (
     add_ppo_config_args,
     build_run_config,
     load_ppo_config,
+    parse_schedule_value,
     ppo_config_to_dict,
+    resolve_device,
     set_global_seeds,
 )
 from supernet_backbone import ArchConfig, SearchSpace
@@ -249,23 +248,29 @@ def finetune_and_evaluate_candidate(
         ppo_config, seed=eval_seed, n_envs=ppo_config.eval_n_envs
     )
     try:
-        policy = build_policy_from_checkpoint(
+        supernet = build_policy_from_checkpoint(
             ppo_config=ppo_config,
             env=train_env,
             search_space=search_space,
             checkpoint=checkpoint,
             device=device,
         )
-        policy.set_active_arch(arch_config)
+        supernet.set_sample_config(arch_config)
+        policy = supernet.get_active_subnet().to(device)
 
         z_dyn_coef = float(ppo_config.z_dyn_coef)
-        ema_policy: PolicySupernet | None = None
+        ema_policy: FixedPolicySubnet | None = None
         if z_dyn_coef > 0.0:
-            ema_policy = create_ema_policy(
-                policy,
-                device,
-                checkpoint_ema_state_dict=checkpoint.get("ema_policy_state_dict"),
-            )
+            ema_state_dict = checkpoint.get("ema_policy_state_dict")
+            if ema_state_dict is not None:
+                supernet.load_state_dict(ema_state_dict, strict=True)
+                supernet.set_sample_config(arch_config)
+                ema_policy = supernet.get_active_subnet().to(device)
+            else:
+                ema_policy = copy.deepcopy(policy)
+            for parameter in ema_policy.parameters():
+                parameter.requires_grad_(False)
+        del supernet
 
         actor_lr_schedule = parse_schedule_value(ppo_config.policy_head_lr)
         backbone_lr_schedule = parse_schedule_value(ppo_config.policy_backbone_lr)
@@ -308,7 +313,6 @@ def finetune_and_evaluate_candidate(
                 policy=policy,
                 critic_model=critic_model,
                 env=train_env,
-                arch=arch_config,
                 rollout_buffer=rollout_buffer,
                 initial_observation=observation,
                 initial_episode_starts=episode_starts,
@@ -354,7 +358,6 @@ def finetune_and_evaluate_candidate(
                 policy=policy,
                 critic_model=critic_model,
                 env=train_env,
-                arch=arch_config,
                 rollout_buffer=rollout_buffer,
                 initial_observation=observation,
                 initial_episode_starts=episode_starts,
@@ -367,7 +370,6 @@ def finetune_and_evaluate_candidate(
                 policy=policy,
                 actor_optimizer=actor_optimizer,
                 rollout_buffer=rollout_buffer,
-                arch=arch_config,
                 action_space=train_env.action_space,
                 n_epochs=int(ppo_config.n_epochs),
                 batch_size=int(ppo_config.batch_size),
@@ -407,15 +409,16 @@ def finetune_and_evaluate_candidate(
         eval_metrics = evaluate_actor_subnet(
             policy=policy,
             eval_env=eval_env,
-            arch=arch_config,
             n_eval_episodes=eval_episodes,
             deterministic=ppo_config.eval_deterministic,
             device=device,
             train_env=train_env,
         )
-        policy_backbone_params = int(policy.backbone.elastic_num_params)
+        policy_backbone_params = sum(
+            p.numel() for p in policy.backbone.parameters()
+        )
         policy_head_params = count_parameters(actor_head_parameters(policy))
-        policy_params = int(policy.elastic_num_params)
+        policy_params = policy_backbone_params + policy_head_params
         trainable_policy_params = policy_head_params
         if any(p.requires_grad for p in policy.backbone.parameters()):
             trainable_policy_params += policy_backbone_params

@@ -428,8 +428,6 @@ class SupernetCNNBackbone(nn.Module):
                     sample_expand_ratio=layer_config.expand_ratio,
                 )
 
-    def set_active_arch(self, arch: ArchConfig) -> None:
-        self.set_sample_config(arch)
 
     def set_max_arch(self) -> None:
         self.set_sample_config(self.search_space.max_arch())

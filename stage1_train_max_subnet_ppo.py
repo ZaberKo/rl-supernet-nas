@@ -221,10 +221,10 @@ def evaluate_and_record(
     total_timesteps: int,
     phase: str,
 ) -> dict[str, Any]:
+    policy.set_sample_config(arch_config)
     eval_metrics = evaluate_actor_subnet(
         policy=policy,
         eval_env=eval_env,
-        arch=arch_config,
         n_eval_episodes=int(n_eval_episodes),
         deterministic=bool(deterministic),
         device=device,
@@ -336,7 +336,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             projection_dim=ppo_config.projection_dim,
             predictor_hidden_dim=ppo_config.predictor_hidden_dim,
         ).to(device)
-        policy.set_active_arch(max_arch)
+        policy.set_sample_config(max_arch)
 
         z_dyn_coef = float(ppo_config.z_dyn_coef)
         ema_policy: PolicySupernet | None = None
@@ -501,7 +501,6 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                 policy=policy,
                 actor_optimizer=actor_optimizer,
                 rollout_buffer=rollout_buffer,
-                arch=max_arch,
                 action_space=train_env.action_space,
                 n_epochs=int(ppo_config.n_epochs),
                 batch_size=int(ppo_config.batch_size),
@@ -617,7 +616,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
         maybe_save_best_checkpoint(final_eval_record)
 
         # --- Parameter stats ---
-        policy.set_active_arch(max_arch)
+        policy.set_sample_config(max_arch)
         policy_backbone_params = int(policy.backbone.elastic_num_params)
         policy_head_params = count_parameters(actor_head_parameters(policy))
         policy_params = int(policy.elastic_num_params)

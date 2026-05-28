@@ -134,15 +134,14 @@ def evaluate_single_arch(
         raise ValueError(
             "ppo.eval_episodes must be positive for evaluation."
         )
+    policy.set_sample_config(arch_config)
     eval_metrics = evaluate_actor_subnet(
         policy=policy,
         eval_env=eval_env,
-        arch=arch_config,
         n_eval_episodes=eval_episodes,
         deterministic=ppo_config.eval_deterministic,
         device=device,
     )
-    policy.set_active_arch(arch_config)
     policy_backbone_params = int(policy.backbone.elastic_num_params)
     policy_head_params = count_parameters(actor_head_parameters(policy))
     policy_params = int(policy.elastic_num_params)

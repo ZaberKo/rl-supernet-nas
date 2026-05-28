@@ -302,7 +302,7 @@ def sandwich_actor_update(
 
             actor_optimizer.zero_grad(set_to_none=True)
 
-            policy.set_active_arch(max_arch)
+            policy.set_sample_config(max_arch)
             max_features = policy.encode(batch_observations)
             max_params = policy.distribution_params_from_features(max_features)
             new_log_probs, entropy = policy.evaluate_actions_from_params(
@@ -320,7 +320,6 @@ def sandwich_actor_update(
             max_dyn_loss = compute_dynamics_loss(
                 online_policy=policy,
                 ema_policy=ema_policy,
-                arch=max_arch,
                 start_features=max_features,
                 next_observations=rollout_data.next_observations,
                 actions=batch_actions,
@@ -360,7 +359,7 @@ def sandwich_actor_update(
             subnet_policy_distill_loss_values = []
             subnet_scale = 1.0 / float(len(sampled_arches))
             for arch in sampled_arches:
-                policy.set_active_arch(arch)
+                policy.set_sample_config(arch)
                 subnet_features = policy.encode(batch_observations)
                 student_params = policy.distribution_params_from_features(
                     subnet_features
@@ -636,19 +635,19 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             if total_timesteps >= next_eval_timestep:
                 while next_eval_timestep <= total_timesteps:
                     next_eval_timestep += eval_freq
+                policy.set_sample_config(search_space.max_arch())
                 max_subnet_eval = evaluate_actor_subnet(
                     policy=policy,
                     eval_env=eval_env,
-                    arch=search_space.max_arch(),
                     n_eval_episodes=eval_episodes,
                     deterministic=bool(ppo_config.eval_deterministic),
                     device=device,
                     train_env=train_env,
                 )
+                policy.set_sample_config(search_space.min_arch())
                 min_subnet_eval = evaluate_actor_subnet(
                     policy=policy,
                     eval_env=eval_env,
-                    arch=search_space.min_arch(),
                     n_eval_episodes=eval_episodes,
                     deterministic=bool(ppo_config.eval_deterministic),
                     device=device,

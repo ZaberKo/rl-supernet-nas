@@ -164,7 +164,7 @@ class PolicySupernet(nn.Module):
             hidden_dim=predictor_hidden_dim,
         )
 
-    def set_active_arch(self, arch: ArchConfig) -> None:
+    def set_sample_config(self, arch: ArchConfig) -> None:
         self.backbone.set_sample_config(arch)
 
     def set_max_arch(self) -> None:
@@ -172,6 +172,29 @@ class PolicySupernet(nn.Module):
 
     def set_min_arch(self) -> None:
         self.backbone.set_min_arch()
+
+    def get_active_subnet(self) -> FixedPolicySubnet:
+        """Extract an independent fixed-architecture subnet.
+
+        Returns a ``FixedPolicySubnet`` with copies of the currently active
+        weights.  The returned module can be trained independently without
+        affecting the supernet.  Call ``set_sample_config`` before this method
+        to configure which sub-network to extract.
+        """
+        return FixedPolicySubnet(
+            backbone=self.backbone.get_active_subnet(),
+            policy_net=copy.deepcopy(self.policy_net),
+            action_net=copy.deepcopy(self.action_net),
+            log_std=(
+                nn.Parameter(self.log_std.data.clone())
+                if self.log_std is not None
+                else None
+            ),
+            projection=copy.deepcopy(self.projection),
+            predictor=copy.deepcopy(self.predictor),
+            action_space=self.action_space,
+            arch_config=self.backbone.active_arch,
+        )
 
     def encode(self, observations: torch.Tensor) -> torch.Tensor:
         return self.backbone(observations)
@@ -256,6 +279,124 @@ class PolicySupernet(nn.Module):
         if self.log_std is not None:
             total += self.log_std.numel()
         return total
+
+
+class FixedPolicySubnet(nn.Module):
+    """A fixed-architecture policy subnet extracted from a ``PolicySupernet``.
+
+    This module has the same forward API as ``PolicySupernet`` but contains
+    only the active sub-network weights (independent copies, not shared).
+    It is produced by ``PolicySupernet.get_active_subnet()`` and is intended
+    for independent fine-tuning without modifying the source supernet.
+    """
+
+    def __init__(
+        self,
+        backbone: nn.Module,
+        policy_net: nn.Module,
+        action_net: nn.Module,
+        log_std: nn.Parameter | None,
+        projection: nn.Module,
+        predictor: nn.Module,
+        action_space: spaces.Space,
+        arch_config: ArchConfig,
+    ):
+        super().__init__()
+        self.backbone = backbone
+        self.policy_net = policy_net
+        self.action_net = action_net
+        if log_std is not None:
+            self.log_std = log_std
+        else:
+            self.log_std = None
+        self.projection = projection
+        self.predictor = predictor
+        self.action_space = action_space
+        self.arch_config = arch_config
+
+        if isinstance(action_space, spaces.Discrete):
+            self.action_kind = "discrete"
+            self.action_dim = int(action_space.n)
+        else:
+            self.action_kind = "box"
+            self.action_shape = tuple(int(v) for v in action_space.shape)
+            self.action_dim = int(np.prod(self.action_shape, dtype=np.int64))
+
+    def encode(self, observations: torch.Tensor) -> torch.Tensor:
+        return self.backbone(observations)
+
+    def distribution_params_from_features(
+        self, features: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        action_output = self.action_net(self.policy_net(features))
+        if self.action_kind == "discrete":
+            return {"logits": action_output}
+        if self.log_std is None:
+            raise RuntimeError("Continuous policy is missing log_std.")
+        return {
+            "mean": action_output,
+            "log_std": self.log_std.view(1, -1).expand_as(action_output),
+        }
+
+    def distribution_params(
+        self, observations: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        return self.distribution_params_from_features(self.encode(observations))
+
+    def distribution_from_params(self, params: Mapping[str, torch.Tensor]):
+        if self.action_kind == "discrete":
+            return torch.distributions.Categorical(logits=params["logits"])
+        std = torch.exp(params["log_std"])
+        base_dist = torch.distributions.Normal(params["mean"], std)
+        return torch.distributions.Independent(base_dist, 1)
+
+    def act(
+        self,
+        observations: torch.Tensor,
+        deterministic: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        params = self.distribution_params(observations)
+        distribution = self.distribution_from_params(params)
+        if self.action_kind == "discrete":
+            if deterministic:
+                actions = torch.argmax(params["logits"], dim=-1)
+            else:
+                actions = distribution.sample()
+        else:
+            actions = params["mean"] if deterministic else distribution.sample()
+        log_prob = distribution.log_prob(actions)
+        entropy = distribution.entropy()
+        return actions, log_prob, entropy
+
+    def evaluate_actions_from_params(
+        self,
+        params: Mapping[str, torch.Tensor],
+        actions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        distribution = self.distribution_from_params(params)
+        if self.action_kind == "discrete":
+            prepared_actions = actions.long().view(-1)
+        else:
+            prepared_actions = actions.float().view(actions.size(0), self.action_dim)
+        log_prob = distribution.log_prob(prepared_actions)
+        entropy = distribution.entropy()
+        return log_prob, entropy
+
+    def evaluate_actions(
+        self,
+        observations: torch.Tensor,
+        actions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.evaluate_actions_from_params(
+            self.distribution_params(observations), actions
+        )
+
+    def project_features(self, features: torch.Tensor) -> torch.Tensor:
+        return self.projection(features)
+
+    def project_observations(self, observations: torch.Tensor) -> torch.Tensor:
+        return self.project_features(self.encode(observations))
+
 
 # TODO: build model only, donot use PPO
 def build_sb3_critic_model (
@@ -491,7 +632,6 @@ def collect_candidate_rollout(
     policy: PolicySupernet,
     critic_model: PPO,
     env: VecEnv,
-    arch: ArchConfig,
     rollout_buffer: DynamicsRolloutBuffer,
     initial_observation: np.ndarray,
     initial_episode_starts: np.ndarray,
@@ -501,7 +641,6 @@ def collect_candidate_rollout(
 ) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
     policy.eval()
     critic_model.policy.eval()
-    policy.set_active_arch(arch)
     rollout_buffer.reset()
 
     num_envs = int(env.num_envs)
@@ -595,7 +734,6 @@ def fixed_arch_actor_update(
     policy: PolicySupernet,
     actor_optimizer: torch.optim.Optimizer,
     rollout_buffer: DynamicsRolloutBuffer,
-    arch: ArchConfig,
     action_space: spaces.Space,
     n_epochs: int,
     batch_size: int,
@@ -637,7 +775,6 @@ def fixed_arch_actor_update(
                 )
 
             actor_optimizer.zero_grad(set_to_none=True)
-            policy.set_active_arch(arch)
 
             if use_dynamics:
                 features = policy.encode(rollout_data.observations)
@@ -663,7 +800,6 @@ def fixed_arch_actor_update(
                 dyn_loss = compute_dynamics_loss(
                     online_policy=policy,
                     ema_policy=ema_policy,
-                    arch=arch,
                     start_features=features,
                     next_observations=rollout_data.next_observations,
                     actions=batch_actions,
@@ -729,7 +865,6 @@ def fixed_arch_actor_update(
 def evaluate_actor_subnet(
     policy: PolicySupernet,
     eval_env: VecEnv,
-    arch: ArchConfig,
     n_eval_episodes: int,
     deterministic: bool,
     device: torch.device,
@@ -750,7 +885,6 @@ def evaluate_actor_subnet(
         eval_vec_normalize.norm_reward = False
 
     policy.eval()
-    policy.set_active_arch(arch)
     observations = eval_env.reset()
     n_eval_episodes = int(n_eval_episodes)
     if n_eval_episodes <= 0:
@@ -795,7 +929,6 @@ def critic_warmup(
     policy: PolicySupernet,
     critic_model: PPO,
     env: VecEnv,
-    arch: ArchConfig,
     rollout_buffer: DynamicsRolloutBuffer,
     initial_observation: np.ndarray,
     initial_episode_starts: np.ndarray,
@@ -824,7 +957,6 @@ def critic_warmup(
             policy=policy,
             critic_model=critic_model,
             env=env,
-            arch=arch,
             rollout_buffer=rollout_buffer,
             initial_observation=observation,
             initial_episode_starts=episode_starts,
@@ -897,7 +1029,6 @@ def update_ema_model(
 def compute_dynamics_loss(
     online_policy: PolicySupernet,
     ema_policy: PolicySupernet,
-    arch: ArchConfig,
     start_features: torch.Tensor,
     next_observations: torch.Tensor,
     actions: torch.Tensor,
@@ -926,7 +1057,6 @@ def compute_dynamics_loss(
         start_latent, action_features
     )
     with torch.no_grad():
-        ema_policy.set_active_arch(arch)
         target_next_latent = ema_policy.project_observations(next_observations)
 
     return latent_dynamics_loss(
