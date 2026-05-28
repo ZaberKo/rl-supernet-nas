@@ -59,19 +59,19 @@ from wandb_utils import finish_wandb_run, init_wandb_run, log_wandb
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="New stage 2 NSGA-II subnet search initialized from a policy supernet.",
+        description="Stage 2 NSGA-II subnet search initialized from a policy supernet.",
         allow_abbrev=False,
     )
     add_ppo_config_args(parser)
     parser.add_argument(
         "--output_dir",
-        default="runs/new_stage2_ea_search",
+        default="runs/stage2_ea_search",
         help="Directory for NSGA-II records, search space, and manifest.",
     )
     parser.add_argument(
         "--supernet_checkpoint",
-        default="runs/new_stage1_policy_supernet/policy_supernet_best.pt",
-        help="New stage1 policy-supernet checkpoint used to initialize subnet candidates.",
+        default="runs/stage1_policy_supernet/policy_supernet_best.pt",
+        help="Stage 1 policy-supernet checkpoint used to initialize subnet candidates.",
     )
     parser.add_argument(
         "--population_size", type=int, default=6, help="NSGA-II population size."
@@ -98,6 +98,11 @@ def parse_args() -> argparse.Namespace:
         "--save_full_history",
         action="store_true",
         help="Store full EvoX monitor history in memory for debugging.",
+    )
+    parser.add_argument(
+        "--suffix",
+        default="",
+        help="Optional suffix to append to the stage name (for W&B and manifests).",
     )
     args = parser.parse_args()
     if args.critic_warmup_timesteps < 0:
@@ -576,7 +581,12 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     run_config = build_run_config(args, ppo_config)
-    wandb_run = init_wandb_run("new_stage2_ea_search", run_config, output_dir)
+    stage_name = (
+        f"stage2_ea_search_{args.suffix}"
+        if getattr(args, "suffix", "")
+        else "stage2_ea_search"
+    )
+    wandb_run = init_wandb_run(stage_name, run_config, output_dir)
     search_space = SearchSpace()
     codec = GeneCodec(search_space)
     (output_dir / "search_space.json").write_text(
@@ -644,7 +654,7 @@ def main() -> None:
     )
     pareto_records = [record for record in final_records if record["is_pareto_front"]]
     manifest = {
-        "stage": "new_stage2_ea_search",
+        "stage": stage_name,
         "records": str(records_path),
         "log": str(log_path),
         "search_space": str(output_dir / "search_space.json"),

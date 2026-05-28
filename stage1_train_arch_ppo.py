@@ -53,7 +53,7 @@ from wandb_utils import finish_wandb_run, init_wandb_run, log_wandb
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="New stage 1 single-architecture PPO finetune diagnostic initialized from a policy supernet checkpoint.",
+        description="Stage 1 single-architecture PPO finetune diagnostic initialized from a policy supernet checkpoint.",
         allow_abbrev=False,
     )
     add_ppo_config_args(parser)
@@ -64,12 +64,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--supernet_checkpoint",
-        default="runs/new_stage1_policy_supernet/policy_supernet_best.pt",
-        help="New stage1 policy-supernet checkpoint used to initialize the actor supernet and critic.",
+        default="runs/stage1_policy_supernet/policy_supernet_best.pt",
+        help="Stage 1 policy-supernet checkpoint used to initialize the actor supernet and critic.",
     )
     parser.add_argument(
         "--output_dir",
-        default="runs/new_stage1_arch_ppo",
+        default="runs/stage1_arch_ppo",
         help="Directory for PPO metrics, checkpoint, and manifest.",
     )
 
@@ -245,9 +245,9 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
     best_checkpoint_path = output_dir / "policy_supernet_arch_ppo_best.pt"
 
     stage_name = (
-        f"new_stage1_train_arch_ppo_{args.suffix}"
+        f"stage1_train_arch_ppo_{args.suffix}"
         if getattr(args, "suffix", "")
-        else "new_stage1_train_arch_ppo"
+        else "stage1_train_arch_ppo"
     )
     run_config = build_run_config(args, ppo_config)
     wandb_run = init_wandb_run(stage_name, run_config, output_dir)
@@ -350,7 +350,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
         if configured_progress_total > 0:
             progress_bar = tqdm(
                 total=configured_progress_total,
-                desc="new_stage1_arch_ppo",
+                desc="stage1_arch_ppo",
                 unit="step",
                 dynamic_ncols=True,
                 disable=ppo_config.quiet,
@@ -408,7 +408,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             )
             if progress_bar is not None:
                 progress_bar.write(
-                    "new_stage1_arch_eval phase=initial step=0 "
+                    "stage1_arch_eval phase=initial step=0 "
                     f"ep_return={initial_eval_record['eval/ep_return']:.6g} "
                     f"ep_return_std={initial_eval_record['eval/ep_return_std']:.6g} "
                     f"ep_length={initial_eval_record['eval/ep_length']:.6g}"
@@ -605,7 +605,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                 )
                 if progress_bar is not None:
                     progress_bar.write(
-                        f"new_stage1_arch_eval phase=periodic step={actual_timesteps} "
+                        f"stage1_arch_eval phase=periodic step={actual_timesteps} "
                         f"ep_return={eval_record['eval/ep_return']:.6g} "
                         f"ep_return_std={eval_record['eval/ep_return_std']:.6g} "
                         f"ep_length={eval_record['eval/ep_length']:.6g}"
@@ -648,7 +648,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             )
             if progress_bar is not None:
                 progress_bar.write(
-                    f"new_stage1_arch_eval phase=final step={actual_timesteps} "
+                    f"stage1_arch_eval phase=final step={actual_timesteps} "
                     f"ep_return={final_eval_record['eval/ep_return']:.6g} "
                     f"ep_return_std={final_eval_record['eval/ep_return_std']:.6g} "
                     f"ep_length={final_eval_record['eval/ep_length']:.6g}"

@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-python new_stage1_train_max_subnet_ppo.py \
+python stage1_train_max_subnet_ppo.py \
   --ppo_config config.yaml \
   --ppo_config_override ppo.n_epochs=4 \
   --ppo_config_override ppo.total_timesteps=10000000 \
@@ -15,4 +15,4 @@ python new_stage1_train_max_subnet_ppo.py \
   --ppo_config_override ppo.policy_head_lr=lin_2.5e-4 \
   --ppo_config_override ppo.critic_lr=lin_2.5e-4 \
   --ppo_config_override ppo.clip_range=lin_0.1 \
-  --output_dir runs/atari_space_invaders/new_stage1_max_subnet_ppo
+  --output_dir runs/atari_space_invaders/stage1_max_subnet_ppo

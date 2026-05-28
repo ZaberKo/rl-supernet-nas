@@ -51,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--supernet_checkpoint",
-        default="runs/new_stage1_policy_supernet/policy_supernet_best.pt",
+        default="runs/stage1_policy_supernet/policy_supernet_best.pt",
         help="Policy-supernet checkpoint whose parameters subnets inherit.",
     )
     parser.add_argument(

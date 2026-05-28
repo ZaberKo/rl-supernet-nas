@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-python new_stage1_train_max_subnet_ppo.py \
+python stage1_train_max_subnet_ppo.py \
   --ppo_config config_box2d.yaml \
   --ppo_config_override ppo.n_epochs=10 \
   --ppo_config_override ppo.total_timesteps=4000000 \
@@ -15,4 +15,4 @@ python new_stage1_train_max_subnet_ppo.py \
   --ppo_config_override ppo.policy_head_lr=lin_1e-4 \
   --ppo_config_override ppo.critic_lr=lin_1e-4 \
   --ppo_config_override ppo.clip_range=0.2 \
-  --output_dir runs/box2d_carracing/new_stage1_max_subnet_ppo
+  --output_dir runs/box2d_carracing/stage1_max_subnet_ppo

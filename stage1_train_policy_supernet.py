@@ -58,13 +58,13 @@ from wandb_utils import finish_wandb_run, init_wandb_run, log_wandb
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="New stage 1: train a policy supernet with PPO max-subnet updates and subnet distillation.",
+        description="Stage 1: train a policy supernet with PPO max-subnet updates and subnet distillation.",
         allow_abbrev=False,
     )
     add_ppo_config_args(parser)
     parser.add_argument(
         "--output_dir",
-        default="runs/new_stage1_policy_supernet",
+        default="runs/stage1_policy_supernet",
         help="Directory for checkpoints, metrics, and manifest.",
     )
     parser.add_argument(
@@ -78,6 +78,11 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help="Temperature for discrete policy KL distillation.",
+    )
+    parser.add_argument(
+        "--suffix",
+        default="",
+        help="Optional suffix to append to the stage name (for W&B and manifests).",
     )
     return parser.parse_args()
 
@@ -440,7 +445,7 @@ def _save_supernet_checkpoint(
 ) -> None:
     save_checkpoint(
         path,
-        stage="new_stage1_policy_supernet",
+        stage="stage1_policy_supernet",
         args=args,
         ppo_config=ppo_config,
         policy_state_dict=policy.state_dict(),
@@ -464,8 +469,13 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
     set_global_seeds(int(ppo_config.seed))
     device = resolve_device(str(ppo_config.device))
     run_config = build_run_config(args, ppo_config)
+    stage_name = (
+        f"stage1_train_policy_supernet_{args.suffix}"
+        if getattr(args, "suffix", "")
+        else "stage1_train_policy_supernet"
+    )
     wandb_run = init_wandb_run(
-        "new_stage1_train_policy_supernet", run_config, output_dir
+        stage_name, run_config, output_dir
     )
     search_space = SearchSpace()
     search_space_path.write_text(json.dumps(search_space.to_dict(), indent=2))
@@ -475,7 +485,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
     eval_episodes = int(ppo_config.eval_episodes)
     if eval_freq <= 0 or eval_episodes <= 0:
         raise ValueError(
-            "new_stage1 requires positive ppo.eval_freq and ppo.eval_episodes."
+            "stage1 requires positive ppo.eval_freq and ppo.eval_episodes."
         )
 
     train_env = make_vec_env_from_ppo_config(
@@ -556,7 +566,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
         )
         progress_bar = tqdm(
             total=ppo_config.total_timesteps,
-            desc="new_stage1_policy_supernet",
+            desc="stage1_policy_supernet",
             unit="step",
             dynamic_ncols=True,
             disable=ppo_config.quiet,
@@ -700,7 +710,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                     step=total_timesteps,
                 )
                 progress_bar.write(
-                    f"new_stage1_eval step={total_timesteps} "
+                    f"stage1_eval step={total_timesteps} "
                     f"max_subnet_ep_return={max_subnet_eval['ep_return']:.6g} "
                     f"min_subnet_ep_return={min_subnet_eval['ep_return']:.6g} "
                     f"is_best_max_subnet={is_best_max_subnet}"
@@ -768,7 +778,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             )
 
         manifest = {
-            "stage": "new_stage1_policy_supernet",
+            "stage": stage_name,
             "last_checkpoint": str(last_checkpoint_path),
             "best_checkpoint": str(best_checkpoint_path),
             "metrics": str(metrics_path),

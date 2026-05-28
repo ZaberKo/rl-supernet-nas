@@ -3,9 +3,9 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-python new_stage2_ea_search.py \
-  --supernet_checkpoint runs/box2d_carracing/new_stage1_policy_supernet/policy_supernet_best.pt \
-  --output_dir runs/box2d_carracing/new_stage2_ea_search \
+python stage2_ea_search.py \
+  --supernet_checkpoint runs/box2d_carracing/stage1_policy_supernet/policy_supernet_best.pt \
+  --output_dir runs/box2d_carracing/stage2_ea_search \
   --population_size 6 \
   --generations 3 \
   --critic_warmup_timesteps 0 \

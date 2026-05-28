@@ -46,7 +46,7 @@ from trajectory_data import DynamicsRolloutBuffer
 from wandb_utils import finish_wandb_run, init_wandb_run, log_wandb
 
 # ---------------------------------------------------------------------------
-# Re-use the same collect_rollout from new_stage1_train_policy_supernet
+# Re-use the same collect_rollout from stage1_train_policy_supernet
 # but inline it here so the script is self-contained.
 # ---------------------------------------------------------------------------
 from ppo_utils import (
@@ -59,20 +59,25 @@ from trajectory_data import resolve_terminal_next_observations, split_done_flags
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="New stage 1: train the max subnet (supernet) from scratch with PPO (no distillation).",
+        description="Stage 1: train the max subnet (supernet) from scratch with PPO (no distillation).",
         allow_abbrev=False,
     )
     add_ppo_config_args(parser)
     parser.add_argument(
         "--output_dir",
-        default="runs/new_stage1_max_subnet_ppo",
+        default="runs/stage1_max_subnet_ppo",
         help="Directory for checkpoints, metrics, and manifest.",
+    )
+    parser.add_argument(
+        "--suffix",
+        default="",
+        help="Optional suffix to append to the stage name (for W&B and manifests).",
     )
     return parser.parse_args()
 
 
 # ---------------------------------------------------------------------------
-# Rollout collection — identical to new_stage1_train_policy_supernet.py
+# Rollout collection — identical to stage1_train_policy_supernet.py
 # ---------------------------------------------------------------------------
 def collect_rollout(
     policy: PolicySupernet,
@@ -293,7 +298,11 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
     last_checkpoint_path = output_dir / "max_subnet_ppo_last.pt"
     best_checkpoint_path = output_dir / "max_subnet_ppo_best.pt"
 
-    stage_name = "new_stage1_train_max_subnet_ppo"
+    stage_name = (
+        f"stage1_train_max_subnet_ppo_{args.suffix}"
+        if getattr(args, "suffix", "")
+        else "stage1_train_max_subnet_ppo"
+    )
     run_config = build_run_config(args, ppo_config)
     wandb_run = init_wandb_run(stage_name, run_config, output_dir)
     train_env = None
@@ -318,7 +327,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
         eval_freq = int(ppo_config.eval_freq)
         if eval_freq <= 0 or eval_episodes <= 0:
             raise ValueError(
-                "new_stage1_max_subnet_ppo requires positive ppo.eval_freq and ppo.eval_episodes."
+                "stage1_max_subnet_ppo requires positive ppo.eval_freq and ppo.eval_episodes."
             )
         eval_env = make_vec_env_from_ppo_config(
             ppo_config, seed=eval_seed, n_envs=ppo_config.eval_n_envs
@@ -393,7 +402,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
 
         progress_bar = tqdm(
             total=target_timesteps,
-            desc="new_stage1_max_subnet_ppo",
+            desc="stage1_max_subnet_ppo",
             unit="step",
             dynamic_ncols=True,
             disable=ppo_config.quiet,
@@ -445,7 +454,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             phase="initial",
         )
         progress_bar.write(
-            "new_stage1_max_subnet_eval phase=initial step=0 "
+            "stage1_max_subnet_eval phase=initial step=0 "
             f"ep_return={initial_eval_record['eval/ep_return']:.6g} "
             f"ep_return_std={initial_eval_record['eval/ep_return_std']:.6g} "
             f"ep_length={initial_eval_record['eval/ep_length']:.6g}"
@@ -573,7 +582,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                     phase="periodic",
                 )
                 progress_bar.write(
-                    f"new_stage1_max_subnet_eval phase=periodic step={actual_timesteps} "
+                    f"stage1_max_subnet_eval phase=periodic step={actual_timesteps} "
                     f"ep_return={eval_record['eval/ep_return']:.6g} "
                     f"ep_return_std={eval_record['eval/ep_return_std']:.6g} "
                     f"ep_length={eval_record['eval/ep_length']:.6g}"
@@ -610,7 +619,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             phase="final",
         )
         progress_bar.write(
-            f"new_stage1_max_subnet_eval phase=final step={actual_timesteps} "
+            f"stage1_max_subnet_eval phase=final step={actual_timesteps} "
             f"ep_return={final_eval_record['eval/ep_return']:.6g} "
             f"ep_return_std={final_eval_record['eval/ep_return_std']:.6g} "
             f"ep_length={final_eval_record['eval/ep_length']:.6g}"
