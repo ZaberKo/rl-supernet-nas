@@ -1,9 +1,10 @@
 """Stage 1: Multi-worker PPO finetune for a list of subnet architectures.
 
 Accepts ``--arch_configs`` (a JSON list of ArchConfig dicts, same format as
-``stage1_eval_archs.py``).  Spawns ``--train_workers`` processes via
-``torch.multiprocessing`` – workers can exceed the number of GPUs since each is
-assigned a GPU in round-robin fashion.
+``stage1_eval_archs.py``).  Spawns ``num_gpus * workers_per_gpu`` processes
+via ``torch.multiprocessing``.  Each worker is pinned to a GPU (round-robin)
+and pulls architectures from a shared task queue, so fast-finishing workers
+automatically pick up the next available arch.
 
 Each subnet gets its own independent wandb run under a shared wandb **group**,
 with run name suffixed ``_<arch_index>`` (0-based, preserving the JSON order).
@@ -16,11 +17,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import time
 import traceback
-from itertools import batched
 from pathlib import Path
 from typing import Any
 
@@ -68,10 +67,11 @@ def parse_args() -> argparse.Namespace:
         help="Root output directory. Per-arch results are stored under <output_dir>/arch_<i>/.",
     )
     parser.add_argument(
-        "--train_workers",
+        "--workers_per_gpu",
         type=int,
         default=1,
-        help="Number of torch.mp workers.  Can exceed the number of GPUs (round-robin assignment).",
+        help="Number of concurrent training processes per GPU (default: 1). "
+             "Total workers = num_gpus * workers_per_gpu.",
     )
     parser.add_argument(
         "--critic_warmup_timesteps",
@@ -87,6 +87,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.critic_warmup_timesteps < 0:
         raise ValueError("critic_warmup_timesteps must be non-negative.")
+    if args.workers_per_gpu < 1:
+        raise ValueError("workers_per_gpu must be >= 1.")
     args.mp_start_method = "spawn"
     return args
 
@@ -138,25 +140,34 @@ def _make_wandb_init_fn(group: str, run_name: str):
 
 
 # ---------------------------------------------------------------------------
-# Worker entry-point
+# Worker loop (pulls tasks from a shared queue)
 # ---------------------------------------------------------------------------
 
 
-def _train_worker(
+def _worker_loop(
+    task_queue: mp.Queue,
+    result_queue: mp.Queue,
     args: argparse.Namespace,
     ppo_config: Any,
-    arch_entries: list[tuple[int, ArchConfig]],
     gpu_id: int,
     stage_name: str,
     wandb_group: str,
-) -> list[dict[str, Any]]:
-    """Worker process: trains a batch of architectures sequentially on one GPU."""
+) -> None:
+    """Worker process: pulls (arch_index, arch_config) from *task_queue*,
+    trains each one, and pushes the result dict into *result_queue*.
+
+    Stops when it receives a ``None`` sentinel from the queue.
+    """
     env_id = ppo_config_to_dict(ppo_config).get("env_id", "unknown_env")
     clean_env_id = env_id.replace("/", "-")
     device = torch.device(f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu")
 
-    results: list[dict[str, Any]] = []
-    for arch_index, arch_config in arch_entries:
+    while True:
+        item = task_queue.get()
+        if item is None:  # sentinel → shut down
+            break
+
+        arch_index, arch_config = item
         per_arch_output_dir = Path(args.output_dir) / f"arch_{arch_index}"
         run_name = f"{stage_name}-{clean_env_id}_{arch_index}"
         wandb_init_fn = _make_wandb_init_fn(group=wandb_group, run_name=run_name)
@@ -181,35 +192,21 @@ def _train_worker(
             manifest["gpu_id"] = gpu_id
             manifest["train_time_s"] = round(elapsed, 2)
             manifest["status"] = "success"
-            results.append(manifest)
+            result_queue.put(manifest)
         except Exception as exc:
             elapsed = time.monotonic() - t0
             print(
-                f"[worker pid={os.getpid()}] arch_{arch_index} FAILED after {elapsed:.1f}s: {exc}",
+                f"[worker pid={os.getpid()} gpu={gpu_id}] "
+                f"arch_{arch_index} FAILED after {elapsed:.1f}s: {exc}",
                 flush=True,
             )
             traceback.print_exc()
-            results.append({
+            result_queue.put({
                 "arch_index": arch_index,
                 "status": "error",
                 "error": str(exc),
                 "train_time_s": round(elapsed, 2),
             })
-    return results
-
-
-def _train_worker_entry(
-    result_queue: mp.Queue,
-    args: argparse.Namespace,
-    ppo_config: Any,
-    arch_entries: list[tuple[int, ArchConfig]],
-    gpu_id: int,
-    stage_name: str,
-    wandb_group: str,
-) -> None:
-    """Entry-point for ``mp.Process``; puts results into *result_queue*."""
-    results = _train_worker(args, ppo_config, arch_entries, gpu_id, stage_name, wandb_group)
-    result_queue.put(results)
 
 
 # ---------------------------------------------------------------------------
@@ -250,40 +247,74 @@ def main() -> None:
         except (KeyError, ValueError, TypeError) as e:
             raise ValueError(f"Invalid arch config at index {i}: {e}") from e
 
+    num_archs = len(arch_configs)
     num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    train_workers = max(1, int(args.train_workers))
+    effective_gpu_count = max(1, num_gpus)  # treat CPU-only as 1 device
+    workers_per_gpu = max(1, int(args.workers_per_gpu))
+    total_workers = effective_gpu_count * workers_per_gpu
+
     print(
-        f"Training {len(arch_configs)} architectures with {train_workers} worker(s) "
-        f"across {num_gpus} GPU(s)...",
+        f"Training {num_archs} architectures with {total_workers} worker(s) "
+        f"({workers_per_gpu}/gpu x {effective_gpu_count} gpu(s))...",
         flush=True,
     )
 
-    arch_entries = list(enumerate(arch_configs))
-
-    if train_workers <= 1:
-        all_results = _train_worker(
-            args, ppo_config, arch_entries,
-            gpu_id=0,
-            stage_name=stage_name, wandb_group=wandb_group,
-        )
+    if total_workers <= 1 and num_archs <= 1:
+        # Fast path: single arch, single worker - no mp overhead
+        all_results: list[dict[str, Any]] = []
+        for arch_index, arch_config in enumerate(arch_configs):
+            device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+            per_arch_output_dir = output_dir / f"arch_{arch_index}"
+            run_name = f"{stage_name}-{clean_env_id}_{arch_index}"
+            wandb_init_fn = _make_wandb_init_fn(group=wandb_group, run_name=run_name)
+            t0 = time.monotonic()
+            manifest = run_single_arch(
+                args,
+                ppo_config,
+                arch_config=arch_config,
+                device=device,
+                output_dir=per_arch_output_dir,
+                wandb_init_fn=wandb_init_fn,
+                extra_config={"arch_index": arch_index, "gpu_id": 0},
+                progress_bar_desc=f"arch_{arch_index}",
+            )
+            elapsed = time.monotonic() - t0
+            manifest["arch_index"] = arch_index
+            manifest["gpu_id"] = 0
+            manifest["train_time_s"] = round(elapsed, 2)
+            manifest["status"] = "success"
+            all_results.append(manifest)
     else:
-        batch_size = math.ceil(len(arch_entries) / train_workers)
-        partitions = list(batched(arch_entries, batch_size))
+        # Multi-worker path with shared task queue
         context = mp.get_context(args.mp_start_method)
+        task_queue: mp.Queue = context.Queue()
         result_queue: mp.Queue = context.Queue()
+
+        # Fill task queue
+        for arch_index, arch_config in enumerate(arch_configs):
+            task_queue.put((arch_index, arch_config))
+
+        # Add sentinels (one per worker)
+        for _ in range(total_workers):
+            task_queue.put(None)
+
+        # Start workers
         processes: list[mp.Process] = []
-        for worker_idx, part in enumerate(partitions):
-            gpu_id = worker_idx % max(1, num_gpus)
+        for worker_idx in range(total_workers):
+            gpu_id = worker_idx % effective_gpu_count
             p = context.Process(
-                target=_train_worker_entry,
-                args=(result_queue, args, ppo_config, list(part),
+                target=_worker_loop,
+                args=(task_queue, result_queue, args, ppo_config,
                       gpu_id, stage_name, wandb_group),
             )
             p.start()
             processes.append(p)
-        all_results: list[dict[str, Any]] = []
-        for _ in processes:
-            all_results.extend(result_queue.get())
+
+        # Collect results (one per arch)
+        all_results = []
+        for _ in range(num_archs):
+            all_results.append(result_queue.get())
+
         for p in processes:
             p.join()
 
@@ -336,8 +367,9 @@ def main() -> None:
         "stage": stage_name,
         "supernet_checkpoint": str(args.supernet_checkpoint),
         "arch_configs_path": str(args.arch_configs),
-        "num_archs": len(arch_configs),
-        "train_workers": train_workers,
+        "num_archs": num_archs,
+        "total_workers": total_workers,
+        "workers_per_gpu": workers_per_gpu,
         "num_gpus": num_gpus,
         "wandb_group": wandb_group,
         "records": str(records_path),

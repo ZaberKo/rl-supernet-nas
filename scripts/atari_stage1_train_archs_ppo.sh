@@ -8,7 +8,7 @@ python stage1_train_archs_ppo.py \
   --supernet_checkpoint runs/atari_space_invaders/stage1_policy_supernet/policy_supernet_best.pt \
   --arch_configs arch_configs/random_archs.json \
   --output_dir runs/atari_space_invaders/stage1_train_archs_ppo \
-  --train_workers 4 \
+  --workers_per_gpu 2 \
   --critic_warmup_timesteps 0 \
   --ppo_config_override ppo.n_epochs=4 \
   --ppo_config_override ppo.total_timesteps=1000000 \
