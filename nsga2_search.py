@@ -134,7 +134,7 @@ def _evaluate_subnet_worker(config: SubnetEvalConfig) -> dict[str, Any]:
         "arch_config": config.arch_config,
         "return": float(mean_return),
         "return_std": float(std_return),
-        "params": int(backbone.elastic_num_params),
+        "policy_backbone_params": int(backbone.elastic_num_params),
         "policy_params": int(
             sum(parameter.numel() for parameter in model.policy.parameters())
         ),
@@ -226,7 +226,7 @@ class RLSubnetProblem(Problem):
         self.last_records = [record for record in records if record is not None]
         self.eval_call_index += 1
         objectives = [
-            [-float(record["return"]), float(record["params"])]
+            [-float(record["return"]), float(record["policy_params"])]
             for record in self.last_records
         ]
         return torch.tensor(objectives, dtype=torch.float32, device=pop.device)

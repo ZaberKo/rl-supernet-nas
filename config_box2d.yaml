@@ -33,13 +33,13 @@ ppo:
   ema_tau: 0.99
   n_steps: 512 # num rollout steps per env
   batch_size: 128 # minibatch for PPO update
-  n_epochs: 10 # repeat rollout data for multiple epochs
+  n_epochs: 4 # repeat rollout data for multiple epochs
   gamma: 0.99
   gae_lambda: 0.95
-  clip_range: 0.2
+  clip_range: 0.1
   clip_range_vf: null
   normalize_advantage: true
-  ent_coef: 0.0
+  ent_coef: 0.01
   vf_coef: 0.5
   max_grad_norm: 0.5
   target_kl: null

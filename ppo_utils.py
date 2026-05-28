@@ -248,6 +248,15 @@ class PolicySupernet(nn.Module):
     def project_observations(self, observations: torch.Tensor) -> torch.Tensor:
         return self.project_features(self.encode(observations))
 
+    @property
+    def elastic_num_params(self) -> int:
+        total = int(self.backbone.elastic_num_params)
+        total += sum(parameter.numel() for parameter in self.policy_net.parameters())
+        total += sum(parameter.numel() for parameter in self.action_net.parameters())
+        if self.log_std is not None:
+            total += self.log_std.numel()
+        return total
+
 
 def build_sb3_critic_model(
     ppo_config: DictConfig,

@@ -634,16 +634,12 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
 
         # --- Parameter stats ---
         policy.set_active_arch(max_arch)
-        active_backbone_params = int(policy.backbone.elastic_num_params)
-        actor_head_params = count_parameters(actor_head_parameters(policy))
-        policy_params = int(sum(parameter.numel() for parameter in policy.parameters()))
-        trainable_policy_params = int(
-            sum(
-                parameter.numel()
-                for parameter in policy.parameters()
-                if parameter.requires_grad
-            )
-        )
+        policy_backbone_params = int(policy.backbone.elastic_num_params)
+        policy_head_params = count_parameters(actor_head_parameters(policy))
+        policy_params = int(policy.elastic_num_params)
+        trainable_policy_params = policy_head_params
+        if any(p.requires_grad for p in policy.backbone.parameters()):
+            trainable_policy_params += policy_backbone_params
 
         # --- Final last checkpoint ---
         _save_max_subnet_checkpoint(
@@ -670,8 +666,8 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             "search_space": str(search_space_path),
             "configured_total_timesteps": int(target_timesteps),
             "actual_timesteps": int(actual_timesteps),
-            "active_backbone_params": active_backbone_params,
-            "actor_head_params": actor_head_params,
+            "policy_backbone_params": policy_backbone_params,
+            "policy_head_params": policy_head_params,
             "policy_params": policy_params,
             "trainable_policy_params": trainable_policy_params,
             "train_seed": train_seed,
@@ -696,8 +692,8 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             wandb_run,
             {
                 "actual_timesteps": int(actual_timesteps),
-                "active_backbone_params": active_backbone_params,
-                "actor_head_params": actor_head_params,
+                "policy_backbone_params": policy_backbone_params,
+                "policy_head_params": policy_head_params,
                 "policy_params": policy_params,
                 "trainable_policy_params": trainable_policy_params,
                 "best_eval_ep_return": best_eval_ep_return,

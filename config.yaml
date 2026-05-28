@@ -32,7 +32,7 @@ ppo:
   z_dyn_coef: 0.0
   ema_tau: 0.99
   n_steps: 128 # num rollout steps per env
-  batch_size: 256 # minibatch for PPO update
+  batch_size: 512 # minibatch for PPO update
   n_epochs: 4 # repeat rollout data for multiple epochs
   gamma: 0.99
   gae_lambda: 0.95

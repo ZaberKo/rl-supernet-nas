@@ -143,18 +143,9 @@ def evaluate_single_arch(
         device=device,
     )
     policy.set_active_arch(arch_config)
-    active_backbone_params = int(policy.backbone.elastic_num_params)
-    actor_head_params = count_parameters(actor_head_parameters(policy))
-    policy_params = int(
-        sum(parameter.numel() for parameter in policy.parameters())
-    )
-    trainable_policy_params = int(
-        sum(
-            parameter.numel()
-            for parameter in policy.parameters()
-            if parameter.requires_grad
-        )
-    )
+    policy_backbone_params = int(policy.backbone.elastic_num_params)
+    policy_head_params = count_parameters(actor_head_parameters(policy))
+    policy_params = int(policy.elastic_num_params)
     return {
         "return": float(eval_metrics["ep_return"]),
         "return_std": float(eval_metrics["ep_return_std"]),
@@ -162,10 +153,9 @@ def evaluate_single_arch(
         "ep_return_std": float(eval_metrics["ep_return_std"]),
         "ep_length": float(eval_metrics["ep_length"]),
         "ep_length_std": float(eval_metrics["ep_length_std"]),
-        "params": active_backbone_params,
-        "actor_head_params": actor_head_params,
+        "policy_backbone_params": policy_backbone_params,
+        "policy_head_params": policy_head_params,
         "policy_params": policy_params,
-        "trainable_policy_params": trainable_policy_params,
     }
 
 
@@ -287,7 +277,7 @@ def main() -> None:
             f"  arch[{record['arch_index']}] "
             f"return={record['ep_return']:.6g} "
             f"return_std={record['ep_return_std']:.6g} "
-            f"params={record['params']} "
+            f"policy_backbone_params={record['policy_backbone_params']} "
             f"time={record['eval_time_s']:.1f}s",
             flush=True,
         )
@@ -296,7 +286,7 @@ def main() -> None:
     best = max(results, key=lambda r: r["ep_return"])
     print(
         f"\nBest: arch[{best['arch_index']}] "
-        f"return={best['ep_return']:.6g} params={best['params']}",
+        f"return={best['ep_return']:.6g} policy_backbone_params={best['policy_backbone_params']}",
         flush=True,
     )
 
@@ -313,7 +303,7 @@ def main() -> None:
         "results": results,
         "best_arch_index": best["arch_index"],
         "best_return": best["ep_return"],
-        "best_params": best["params"],
+        "best_policy_backbone_params": best["policy_backbone_params"],
         "args": vars(args),
         "ppo_config": ppo_config_dict,
     }
@@ -325,13 +315,11 @@ def main() -> None:
         {
             "num_archs": len(arch_configs),
             "best_return": best["ep_return"],
-            "best_params": best["params"],
+            "best_policy_backbone_params": best["policy_backbone_params"],
             "best_arch_index": best["arch_index"],
         },
     )
     finish_wandb_run(wandb_run)
-    print(json.dumps(manifest, indent=2))
-
 
 if __name__ == "__main__":
     main()

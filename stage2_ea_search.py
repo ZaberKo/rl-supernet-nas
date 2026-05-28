@@ -161,10 +161,10 @@ def build_generation_records(
                 "arch": codec.gene_to_arch(gene).to_dict(),
                 "objectives": {
                     "negative_return": objectives[0],
-                    "params": objectives[1],
+                    "policy_params": objectives[1],
                 },
                 "return": -objectives[0],
-                "params": objectives[1],
+                "policy_params": objectives[1],
                 "pareto_rank": pareto_rank,
                 "is_pareto": bool(pareto_rank == 0),
                 "is_pareto_front": bool(pareto_rank == 0),
@@ -197,7 +197,7 @@ def generation_summary(
         "candidates": len(records),
         "pareto": sum(1 for record in records if bool(record["is_pareto"])),
         "best_return": max(float(record["return"]) for record in records),
-        "min_params": min(float(record["params"]) for record in records),
+        "min_policy_params": min(float(record["policy_params"]) for record in records),
         "cache_hits": cache_hits,
     }
 
@@ -210,7 +210,7 @@ def format_generation_log(
         f"gen={int(summary['gen'])} candidates={int(summary['candidates'])} "
         f"pareto={int(summary['pareto'])} "
         f"best_return={float(summary['best_return']):.6g} "
-        f"min_params={float(summary['min_params']):.0f} "
+        f"min_policy_params={float(summary['min_policy_params']):.0f} "
         f"cache_hits={int(summary['cache_hits'])}"
     )
 
@@ -413,15 +413,12 @@ def finetune_and_evaluate_candidate(
             device=device,
             train_env=train_env,
         )
-        active_backbone_params = int(policy.backbone.elastic_num_params)
-        actor_head_params = count_parameters(actor_head_parameters(policy))
-        trainable_params = int(
-            sum(
-                parameter.numel()
-                for parameter in policy.parameters()
-                if parameter.requires_grad
-            )
-        )
+        policy_backbone_params = int(policy.backbone.elastic_num_params)
+        policy_head_params = count_parameters(actor_head_parameters(policy))
+        policy_params = int(policy.elastic_num_params)
+        trainable_policy_params = policy_head_params
+        if any(p.requires_grad for p in policy.backbone.parameters()):
+            trainable_policy_params += policy_backbone_params
 
         return {
             "return": float(eval_metrics["ep_return"]),
@@ -430,12 +427,10 @@ def finetune_and_evaluate_candidate(
             "ep_return_std": float(eval_metrics["ep_return_std"]),
             "ep_length": float(eval_metrics["ep_length"]),
             "ep_length_std": float(eval_metrics["ep_length_std"]),
-            "params": active_backbone_params,
-            "actor_head_params": actor_head_params,
-            "policy_params": int(
-                sum(parameter.numel() for parameter in policy.parameters())
-            ),
-            "trainable_policy_params": trainable_params,
+            "policy_backbone_params": policy_backbone_params,
+            "policy_head_params": policy_head_params,
+            "policy_params": policy_params,
+            "trainable_policy_params": trainable_policy_params,
             "actual_timesteps": int(total_timesteps),
             "candidate_timesteps": int(target_timesteps),
             "critic_warmup_configured_timesteps": int(args.critic_warmup_timesteps),
@@ -569,7 +564,7 @@ class NewPolicySubnetProblem(Problem):
         self.last_records = [record for record in records if record is not None]
         self.eval_call_index += 1
         objectives = [
-            [-float(record["return"]), float(record["params"])]
+            [-float(record["return"]), float(record["policy_params"])]
             for record in self.last_records
         ]
         return torch.tensor(objectives, dtype=torch.float32, device=pop.device)
@@ -665,7 +660,7 @@ def main() -> None:
         "log": str(log_path),
         "search_space": str(output_dir / "search_space.json"),
         "supernet_checkpoint": str(args.supernet_checkpoint),
-        "objectives": ["negative_return", "params"],
+        "objectives": ["negative_return", "policy_params"],
         "fitness_procedure": "load_policy_supernet_then_ppo_finetune_then_eval_return",
         "pareto_front": pareto_records,
         "final_population": final_records,
