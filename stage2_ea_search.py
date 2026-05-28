@@ -431,7 +431,7 @@ def finetune_and_evaluate_candidate(
             "policy_head_params": policy_head_params,
             "policy_params": policy_params,
             "trainable_policy_params": trainable_policy_params,
-            "actual_timesteps": int(total_timesteps),
+            "total_timesteps": int(total_timesteps),
             "candidate_timesteps": int(target_timesteps),
             "critic_warmup_configured_timesteps": int(args.critic_warmup_timesteps),
             "critic_warmup_actual_timesteps": int(critic_warmup_actual_timesteps),

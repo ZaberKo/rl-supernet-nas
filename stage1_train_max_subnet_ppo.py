@@ -234,7 +234,7 @@ def evaluate_and_record(
     device: torch.device,
     metrics_path: Path,
     wandb_run: Any,
-    num_timesteps: int,
+    total_timesteps: int,
     phase: str,
 ) -> dict[str, Any]:
     eval_metrics = evaluate_actor_subnet(
@@ -249,13 +249,13 @@ def evaluate_and_record(
     record = {
         "type": "eval",
         "phase": phase,
-        "total_timesteps": int(num_timesteps),
+        "total_timesteps": int(total_timesteps),
         "eval/ep_return": float(eval_metrics["ep_return"]),
         "eval/ep_return_std": float(eval_metrics["ep_return_std"]),
         "eval/ep_length": float(eval_metrics["ep_length"]),
         "eval/ep_length_std": float(eval_metrics["ep_length_std"]),
     }
-    log_record(metrics_path, wandb_run, record, step=int(num_timesteps))
+    log_record(metrics_path, wandb_run, record, step=int(total_timesteps))
     return record
 
 
@@ -416,7 +416,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
 
         initial_eval_record = None
         final_eval_record = None
-        actual_timesteps = 0
+        total_timesteps = 0
         best_eval_ep_return: float | None = None
         best_eval_record: dict[str, Any] | None = None
         target_kl = ppo_config.target_kl
@@ -440,7 +440,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                     critic_model=critic_model,
                     actor_optimizer=actor_optimizer,
                     critic_optimizer=critic_optimizer,
-                    total_timesteps=actual_timesteps,
+                    total_timesteps=total_timesteps,
                     iteration=train_iteration,
                     stage_name=stage_name,
                 )
@@ -456,7 +456,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             device=device,
             metrics_path=metrics_path,
             wandb_run=wandb_run,
-            num_timesteps=0,
+            total_timesteps=0,
             phase="initial",
         )
         progress_bar.write(
@@ -471,9 +471,9 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
         observation = train_env.reset()
         episode_starts = np.ones((train_env.num_envs,), dtype=np.bool_)
 
-        while actual_timesteps < target_timesteps:
+        while total_timesteps < target_timesteps:
             train_iteration += 1
-            progress_remaining = 1.0 - float(actual_timesteps) / float(
+            progress_remaining = 1.0 - float(total_timesteps) / float(
                 max(1, target_timesteps)
             )
             actor_lr = (
@@ -511,7 +511,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                 gamma=float(ppo_config.gamma),
                 device=device,
             )
-            actual_timesteps += int(ppo_config.n_steps) * int(train_env.num_envs)
+            total_timesteps += int(ppo_config.n_steps) * int(train_env.num_envs)
 
             actor_metrics = fixed_arch_actor_update(
                 policy=policy,
@@ -543,7 +543,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             train_record = {
                 "type": "train",
                 "iteration": int(train_iteration),
-                "total_timesteps": int(actual_timesteps),
+                "total_timesteps": int(total_timesteps),
                 "progress_remaining": float(progress_remaining),
                 "actor_lr": float(actor_lr),
                 "critic_lr": float(critic_lr),
@@ -554,10 +554,10 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                 **critic_metrics,
             }
             last_train_record = dict(train_record)
-            log_record(metrics_path, wandb_run, train_record, step=actual_timesteps)
+            log_record(metrics_path, wandb_run, train_record, step=total_timesteps)
 
             progress_bar.update(
-                max(0, min(actual_timesteps, target_timesteps) - progress_bar.n)
+                max(0, min(total_timesteps, target_timesteps) - progress_bar.n)
             )
             progress_bar.set_postfix(
                 {
@@ -571,8 +571,8 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             )
 
             # --- Periodic evaluation ---
-            if actual_timesteps >= next_eval_timestep:
-                while next_eval_timestep <= actual_timesteps:
+            if total_timesteps >= next_eval_timestep:
+                while next_eval_timestep <= total_timesteps:
                     next_eval_timestep += eval_freq
                 eval_record = evaluate_and_record(
                     policy=policy,
@@ -584,11 +584,11 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                     device=device,
                     metrics_path=metrics_path,
                     wandb_run=wandb_run,
-                    num_timesteps=actual_timesteps,
+                    total_timesteps=total_timesteps,
                     phase="periodic",
                 )
                 progress_bar.write(
-                    f"stage1_max_subnet_eval phase=periodic step={actual_timesteps} "
+                    f"stage1_max_subnet_eval phase=periodic step={total_timesteps} "
                     f"ep_return={eval_record['eval/ep_return']:.6g} "
                     f"ep_return_std={eval_record['eval/ep_return_std']:.6g} "
                     f"ep_length={eval_record['eval/ep_length']:.6g}"
@@ -605,7 +605,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                 critic_model=critic_model,
                 actor_optimizer=actor_optimizer,
                 critic_optimizer=critic_optimizer,
-                total_timesteps=actual_timesteps,
+                total_timesteps=total_timesteps,
                 iteration=train_iteration,
                 stage_name=stage_name,
             )
@@ -621,11 +621,11 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             device=device,
             metrics_path=metrics_path,
             wandb_run=wandb_run,
-            num_timesteps=actual_timesteps,
+            total_timesteps=total_timesteps,
             phase="final",
         )
         progress_bar.write(
-            f"stage1_max_subnet_eval phase=final step={actual_timesteps} "
+            f"stage1_max_subnet_eval phase=final step={total_timesteps} "
             f"ep_return={final_eval_record['eval/ep_return']:.6g} "
             f"ep_return_std={final_eval_record['eval/ep_return_std']:.6g} "
             f"ep_length={final_eval_record['eval/ep_length']:.6g}"
@@ -651,7 +651,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             critic_model=critic_model,
             actor_optimizer=actor_optimizer,
             critic_optimizer=critic_optimizer,
-            total_timesteps=actual_timesteps,
+            total_timesteps=total_timesteps,
             iteration=train_iteration,
             stage_name=stage_name,
         )
@@ -665,7 +665,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             "metrics": str(metrics_path),
             "search_space": str(search_space_path),
             "configured_total_timesteps": int(target_timesteps),
-            "actual_timesteps": int(actual_timesteps),
+            "total_timesteps": int(total_timesteps),
             "policy_backbone_params": policy_backbone_params,
             "policy_head_params": policy_head_params,
             "policy_params": policy_params,
@@ -691,7 +691,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
         update_wandb_summary(
             wandb_run,
             {
-                "actual_timesteps": int(actual_timesteps),
+                "total_timesteps": int(total_timesteps),
                 "policy_backbone_params": policy_backbone_params,
                 "policy_head_params": policy_head_params,
                 "policy_params": policy_params,
