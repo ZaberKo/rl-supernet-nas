@@ -262,6 +262,7 @@ def build_sb3_critic_model(
     ppo_config: DictConfig,
     env: VecEnv,
     learning_rate: Any,
+    device: str | torch.device | None = None,
 ) -> PPO:
     policy_kwargs: dict[str, Any] = {
         "net_arch": {
@@ -278,6 +279,9 @@ def build_sb3_critic_model(
     log_std_init = ppo_config.log_std_init
     if log_std_init is not None:
         policy_kwargs["log_std_init"] = log_std_init
+
+    if device is None:
+        device = str(ppo_config.device)
 
     return PPO(
         "CnnPolicy",
@@ -300,7 +304,7 @@ def build_sb3_critic_model(
         use_sde=ppo_config.use_sde and isinstance(env.action_space, spaces.Box),
         sde_sample_freq=ppo_config.sde_sample_freq,
         seed=ppo_config.seed,
-        device=str(ppo_config.device),
+        device=str(device),
         verbose=0 if ppo_config.quiet else 1,
     )
 

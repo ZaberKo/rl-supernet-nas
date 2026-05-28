@@ -342,6 +342,7 @@ def run(
             ppo_config=ppo_config,
             env=train_env,
             learning_rate=critic_lr_schedule,
+            device=device,
         )
         loaded_critic = load_critic_from_checkpoint(critic_model, checkpoint)
         critic_optimizer = critic_model.policy.optimizer
