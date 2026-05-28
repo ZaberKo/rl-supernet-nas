@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -241,13 +241,29 @@ def _save_arch_checkpoint(
     )
 
 
-def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    metrics_path = output_dir / "metrics.jsonl"
-    search_space_path = output_dir / "search_space.json"
-    last_checkpoint_path = output_dir / "policy_supernet_arch_ppo_last.pt"
-    best_checkpoint_path = output_dir / "policy_supernet_arch_ppo_best.pt"
+def run(
+    args: argparse.Namespace,
+    ppo_config: DictConfig,
+    *,
+    arch_config: ArchConfig | None = None,
+    device: torch.device | None = None,
+    output_dir: str | Path | None = None,
+    wandb_init_fn: Callable[..., Any] | None = None,
+    extra_config: dict[str, Any] | None = None,
+    progress_bar_desc: str | None = None,
+) -> dict[str, Any]:
+    """Run single-architecture PPO finetune.
+
+    When called from the multi-worker script (``stage1_train_archs_ppo``),
+    callers pass *arch_config*, *device*, *output_dir*, and *wandb_init_fn*
+    to override the defaults derived from ``args``.
+    """
+    output_dir_resolved = Path(output_dir) if output_dir is not None else Path(args.output_dir)
+    output_dir_resolved.mkdir(parents=True, exist_ok=True)
+    metrics_path = output_dir_resolved / "metrics.jsonl"
+    search_space_path = output_dir_resolved / "search_space.json"
+    last_checkpoint_path = output_dir_resolved / "policy_supernet_arch_ppo_last.pt"
+    best_checkpoint_path = output_dir_resolved / "policy_supernet_arch_ppo_best.pt"
 
     stage_name = (
         f"stage1_train_arch_ppo_{args.suffix}"
@@ -255,7 +271,12 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
         else "stage1_train_arch_ppo"
     )
     run_config = build_run_config(args, ppo_config)
-    wandb_run = init_wandb_run(stage_name, run_config, output_dir)
+    if extra_config:
+        run_config.update(extra_config)
+    if wandb_init_fn is not None:
+        wandb_run = wandb_init_fn(stage_name, run_config, output_dir_resolved)
+    else:
+        wandb_run = init_wandb_run(stage_name, run_config, output_dir_resolved)
     train_env = None
     eval_env = None
     progress_bar = None
@@ -263,13 +284,15 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
     try:
         search_space = SearchSpace()
         search_space_path.write_text(json.dumps(search_space.to_dict(), indent=2))
-        arch_config = load_arch_config(args.arch_config)
+        if arch_config is None:
+            arch_config = load_arch_config(args.arch_config)
         validate_arch_config(search_space, arch_config)
 
         train_seed = int(ppo_config.seed)
         eval_seed = train_seed + EVAL_SEED_OFFSET
         set_global_seeds(train_seed)
-        device = resolve_device(str(ppo_config.device))
+        if device is None:
+            device = resolve_device(str(ppo_config.device))
 
         checkpoint = load_checkpoint(args.supernet_checkpoint, map_location=device)
 
@@ -333,22 +356,23 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             n_envs=int(train_env.num_envs),
         )
 
-        append_jsonl_record(
-            metrics_path,
-            {
-                "type": "config",
-                "stage": stage_name,
-                "supernet_checkpoint": str(args.supernet_checkpoint),
-                "arch_config_path": str(args.arch_config),
-                "candidate_timesteps": int(target_timesteps),
-                "train_seed": train_seed,
-                "eval_seed": eval_seed,
-                "device": str(device),
-                "loaded_critic": bool(loaded_critic),
-                "observation_shape": list(train_env.observation_space.shape),
-                "action_space": type(train_env.action_space).__name__,
-            },
-        )
+        config_record: dict[str, Any] = {
+            "type": "config",
+            "stage": stage_name,
+            "supernet_checkpoint": str(args.supernet_checkpoint),
+            "candidate_timesteps": int(target_timesteps),
+            "train_seed": train_seed,
+            "eval_seed": eval_seed,
+            "device": str(device),
+            "loaded_critic": bool(loaded_critic),
+            "observation_shape": list(train_env.observation_space.shape),
+            "action_space": type(train_env.action_space).__name__,
+        }
+        if hasattr(args, "arch_config"):
+            config_record["arch_config_path"] = str(args.arch_config)
+        if extra_config:
+            config_record.update(extra_config)
+        append_jsonl_record(metrics_path, config_record)
 
         configured_progress_total = max(0, int(args.critic_warmup_timesteps)) + int(
             target_timesteps
@@ -356,7 +380,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
         if configured_progress_total > 0:
             progress_bar = tqdm(
                 total=configured_progress_total,
-                desc="stage1_arch_ppo",
+                desc=progress_bar_desc or "stage1_arch_ppo",
                 unit="step",
                 dynamic_ncols=True,
                 disable=ppo_config.quiet,
@@ -427,11 +451,11 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
         warmup_iteration = 0
         while critic_warmup_actual_timesteps < warmup_target:
             warmup_iteration += 1
-            progress_remaining = 1.0 - float(critic_warmup_actual_timesteps) / float(
-                max(1, warmup_target)
+            critic_progress_remaining = 1.0 - float(critic_warmup_actual_timesteps) / float(
+                max(1, configured_progress_total)
             )
             critic_lr = (
-                float(critic_lr_schedule(progress_remaining))
+                float(critic_lr_schedule(critic_progress_remaining))
                 if callable(critic_lr_schedule)
                 else float(critic_lr_schedule)
             )
@@ -466,7 +490,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                 "total_timesteps": int(actual_timesteps),
                 "critic_warmup_timesteps": int(critic_warmup_actual_timesteps),
                 "total_env_timesteps": int(total_env_timesteps),
-                "progress_remaining": float(progress_remaining),
+                "progress_remaining": float(critic_progress_remaining),
                 "critic_lr": float(critic_lr),
                 **prefixed_metrics("critic_warmup_rollout", rollout_metrics),
                 **prefixed_metrics("critic_warmup", critic_metrics),
@@ -491,26 +515,29 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
         last_train_record: dict[str, Any] = {}
         while actual_timesteps < target_timesteps:
             train_iteration += 1
-            progress_remaining = 1.0 - float(actual_timesteps) / float(
+            actor_progress_remaining = 1.0 - float(actual_timesteps) / float(
                 max(1, target_timesteps)
             )
+            critic_progress_remaining = 1.0 - float(
+                critic_warmup_actual_timesteps + actual_timesteps
+            ) / float(max(1, configured_progress_total))
             actor_lr = (
-                float(policy_head_lr_schedule(progress_remaining))
+                float(policy_head_lr_schedule(actor_progress_remaining))
                 if callable(policy_head_lr_schedule)
                 else float(policy_head_lr_schedule)
             )
             backbone_lr = (
-                float(policy_backbone_lr_schedule(progress_remaining))
+                float(policy_backbone_lr_schedule(actor_progress_remaining))
                 if callable(policy_backbone_lr_schedule)
                 else float(policy_backbone_lr_schedule)
             )
             critic_lr = (
-                float(critic_lr_schedule(progress_remaining))
+                float(critic_lr_schedule(critic_progress_remaining))
                 if callable(critic_lr_schedule)
                 else float(critic_lr_schedule)
             )
             clip_range = (
-                float(clip_range_schedule(progress_remaining))
+                float(clip_range_schedule(actor_progress_remaining))
                 if callable(clip_range_schedule)
                 else float(clip_range_schedule)
             )
@@ -563,7 +590,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                 "total_timesteps": int(actual_timesteps),
                 "critic_warmup_timesteps": int(critic_warmup_actual_timesteps),
                 "total_env_timesteps": int(total_env_timesteps),
-                "progress_remaining": float(progress_remaining),
+                "progress_remaining": float(actor_progress_remaining),
                 "actor_lr": float(actor_lr),
                 "critic_lr": float(critic_lr),
                 "backbone_lr": float(backbone_lr),
@@ -688,11 +715,10 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             ema_policy=ema_policy,
         )
 
-        manifest = {
+        manifest: dict[str, Any] = {
             "stage": stage_name,
             "source_stage": checkpoint.get("stage"),
             "arch_config": arch_config.to_dict(),
-            "arch_config_path": str(args.arch_config),
             "supernet_checkpoint": str(args.supernet_checkpoint),
             "last_checkpoint": str(last_checkpoint_path),
             "best_checkpoint": str(best_checkpoint_path),
@@ -716,7 +742,11 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             "args": vars(args),
             "ppo_config": ppo_config_to_dict(ppo_config),
         }
-        manifest_path = output_dir / "manifest.json"
+        if hasattr(args, "arch_config"):
+            manifest["arch_config_path"] = str(args.arch_config)
+        if extra_config:
+            manifest.update(extra_config)
+        manifest_path = output_dir_resolved / "manifest.json"
         manifest_path.write_text(json.dumps(manifest, indent=2))
         update_wandb_summary(
             wandb_run,
