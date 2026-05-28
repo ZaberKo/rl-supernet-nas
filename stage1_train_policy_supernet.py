@@ -53,7 +53,12 @@ from trajectory_data import (
     resolve_terminal_next_observations,
     split_done_flags,
 )
-from wandb_utils import finish_wandb_run, init_wandb_run, log_wandb
+from wandb_utils import (
+    finish_wandb_run,
+    init_wandb_run,
+    log_wandb,
+    update_wandb_summary,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -474,9 +479,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
         if getattr(args, "suffix", "")
         else "stage1_train_policy_supernet"
     )
-    wandb_run = init_wandb_run(
-        stage_name, run_config, output_dir
-    )
+    wandb_run = init_wandb_run(stage_name, run_config, output_dir)
     search_space = SearchSpace()
     search_space_path.write_text(json.dumps(search_space.to_dict(), indent=2))
 
@@ -815,6 +818,13 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
         manifest_path = output_dir / "manifest.json"
         manifest_path.write_text(json.dumps(manifest, indent=2))
 
+        update_wandb_summary(
+            wandb_run,
+            {
+                "best_eval_max_subnet_ep_return": best_eval_max_subnet_ep_return,
+                "total_timesteps": int(total_timesteps),
+            },
+        )
         finish_wandb_run(wandb_run)
         return manifest
     finally:

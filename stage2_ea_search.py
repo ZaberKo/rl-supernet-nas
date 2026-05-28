@@ -54,7 +54,12 @@ from supernet_backbone import ArchConfig, SearchSpace
 from trajectory_data import (
     DynamicsRolloutBuffer,
 )
-from wandb_utils import finish_wandb_run, init_wandb_run, log_wandb
+from wandb_utils import (
+    finish_wandb_run,
+    init_wandb_run,
+    log_wandb,
+    update_wandb_summary,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -257,7 +262,8 @@ def finetune_and_evaluate_candidate(
         ema_policy: PolicySupernet | None = None
         if z_dyn_coef > 0.0:
             ema_policy = create_ema_policy(
-                policy, device,
+                policy,
+                device,
                 checkpoint_ema_state_dict=checkpoint.get("ema_policy_state_dict"),
             )
 
@@ -670,14 +676,13 @@ def main() -> None:
     }
     manifest_path = output_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2))
-    log_wandb(
+    update_wandb_summary(
         wandb_run,
         {
             "num_logged_records": len(all_records),
             "cache_size": len(problem.cache),
             "final_pareto_count": len(pareto_records),
         },
-        step=max(0, args.generations - 1),
     )
 
     finish_wandb_run(wandb_run)
