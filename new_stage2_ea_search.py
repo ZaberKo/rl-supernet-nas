@@ -25,7 +25,6 @@ from ea_codec import GeneCodec
 from env_utils import EVAL_SEED_OFFSET
 from nsga2_search import DiscreteNSGA2
 from ppo_utils import (
-from sb3_nas_policy import finetune_and_evaluate_arch
     PolicySupernet,
     actor_head_parameters,
     build_sb3_critic_model,

@@ -51,6 +51,6 @@ ppo:
   sde_sample_freq: 4
   log_std_init: -2
   ortho_init: false
-  activation_fn: gelu
+  activation_fn: gelu # shared activation for policy_net_arch and value_net_arch hidden layers; rl_zoo3 CarRacing default
   device: auto
   quiet: false

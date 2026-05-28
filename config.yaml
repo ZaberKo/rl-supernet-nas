@@ -51,6 +51,6 @@ ppo:
   sde_sample_freq: -1
   log_std_init: null
   ortho_init: true
-  activation_fn: tanh
+  activation_fn: tanh # shared activation for policy_net_arch and value_net_arch hidden layers; SB3/rl_zoo3 Atari default
   device: auto
   quiet: false
