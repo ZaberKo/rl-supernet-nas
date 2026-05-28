@@ -177,12 +177,12 @@ def evaluate_and_record(
 ) -> dict[str, Any]:
     eval_metrics = evaluate_actor_subnet(
         policy=policy,
-        train_env=train_env,
         eval_env=eval_env,
         arch=arch_config,
         n_eval_episodes=int(n_eval_episodes),
         deterministic=bool(deterministic),
         device=device,
+        train_env=train_env,
     )
     record = {
         "type": "eval",
@@ -281,7 +281,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
 
         policy = build_policy_from_checkpoint(
             ppo_config=ppo_config,
-            train_env=train_env,
+            env=train_env,
             search_space=search_space,
             checkpoint=checkpoint,
             device=device,

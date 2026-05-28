@@ -70,6 +70,17 @@ def log_wandb(run: Any, values: dict[str, Any], step: int | None = None) -> None
         print(f"wandb_log_failed error={exc}", flush=True)
 
 
+def update_wandb_summary(run: Any, values: dict[str, Any]) -> None:
+    if run is None:
+        return
+    sanitized_values = sanitize_wandb_value(values)
+    try:
+        for key, value in sanitized_values.items():
+            run.summary[key] = value
+    except Exception as exc:
+        print(f"wandb_summary_failed error={exc}", flush=True)
+
+
 def finish_wandb_run(run: Any) -> None:
     if run is None:
         return

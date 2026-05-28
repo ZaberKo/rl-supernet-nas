@@ -233,12 +233,12 @@ def evaluate_and_record(
 ) -> dict[str, Any]:
     eval_metrics = evaluate_actor_subnet(
         policy=policy,
-        train_env=train_env,
         eval_env=eval_env,
         arch=arch_config,
         n_eval_episodes=int(n_eval_episodes),
         deterministic=bool(deterministic),
         device=device,
+        train_env=train_env,
     )
     record = {
         "type": "eval",

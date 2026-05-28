@@ -2,17 +2,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import time
-from collections.abc import Mapping
-from dataclasses import dataclass
+from itertools import batched
 from pathlib import Path
 from typing import Any
 
-
 import torch
 import torch.multiprocessing as mp
-from omegaconf import OmegaConf
 
 from checkpoint_utils import (
     build_policy_from_checkpoint,
@@ -20,6 +18,7 @@ from checkpoint_utils import (
 )
 from env_utils import EVAL_SEED_OFFSET, make_vec_env_from_ppo_config
 from ppo_utils import (
+    PolicySupernet,
     actor_head_parameters,
     count_parameters,
     evaluate_actor_subnet,
@@ -33,7 +32,7 @@ from setup_utils import (
     set_global_seeds,
 )
 from supernet_backbone import ArchConfig, SearchSpace
-from wandb_utils import finish_wandb_run, init_wandb_run, log_wandb
+from wandb_utils import finish_wandb_run, init_wandb_run, update_wandb_summary
 
 
 def parse_args() -> argparse.Namespace:
@@ -72,27 +71,17 @@ def parse_args() -> argparse.Namespace:
     )
     args = parser.parse_args()
     args.mp_start_method = "spawn"
-    args.worker_torch_threads = 1
     return args
 
 
 def load_arch_configs_list(path: str | Path) -> list[dict[str, Any]]:
-    """Load a JSON file that is a list of ArchConfig dicts."""
+    """Load a JSON file containing a list of ArchConfig dicts."""
     arch_path = Path(path)
     if not arch_path.exists():
         raise FileNotFoundError(f"Arch configs file does not exist: {arch_path}")
     data = json.loads(arch_path.read_text())
-    if isinstance(data, Mapping):
-        # Single arch config wrapped in a dict with an "archs" key
-        if "archs" in data:
-            data = data["archs"]
-        else:
-            # Single arch config, wrap in a list
-            data = [data]
-    if not isinstance(data, list):
-        raise ValueError("arch_configs JSON must be a list of ArchConfig dicts.")
-    if len(data) == 0:
-        raise ValueError("arch_configs JSON list must not be empty.")
+    if not isinstance(data, list) or len(data) == 0:
+        raise ValueError("arch_configs JSON must be a non-empty list of ArchConfig dicts.")
     return data
 
 
@@ -133,12 +122,60 @@ def validate_arch_config(search_space: SearchSpace, arch_config: ArchConfig) -> 
 
 
 def evaluate_single_arch(
+    policy: PolicySupernet,
+    eval_env: Any,
+    arch_config: ArchConfig,
+    ppo_config: Any,
+    device: torch.device,
+) -> dict[str, Any]:
+    """Set arch on the shared policy, evaluate on the shared eval_env, return metrics."""
+    eval_episodes = ppo_config.eval_episodes
+    if eval_episodes <= 0:
+        raise ValueError(
+            "ppo.eval_episodes must be positive for evaluation."
+        )
+    eval_metrics = evaluate_actor_subnet(
+        policy=policy,
+        eval_env=eval_env,
+        arch=arch_config,
+        n_eval_episodes=eval_episodes,
+        deterministic=ppo_config.eval_deterministic,
+        device=device,
+    )
+    policy.set_active_arch(arch_config)
+    active_backbone_params = int(policy.backbone.elastic_num_params)
+    actor_head_params = count_parameters(actor_head_parameters(policy))
+    policy_params = int(
+        sum(parameter.numel() for parameter in policy.parameters())
+    )
+    trainable_policy_params = int(
+        sum(
+            parameter.numel()
+            for parameter in policy.parameters()
+            if parameter.requires_grad
+        )
+    )
+    return {
+        "return": float(eval_metrics["ep_return"]),
+        "return_std": float(eval_metrics["ep_return_std"]),
+        "ep_return": float(eval_metrics["ep_return"]),
+        "ep_return_std": float(eval_metrics["ep_return_std"]),
+        "ep_length": float(eval_metrics["ep_length"]),
+        "ep_length_std": float(eval_metrics["ep_length_std"]),
+        "params": active_backbone_params,
+        "actor_head_params": actor_head_params,
+        "policy_params": policy_params,
+        "trainable_policy_params": trainable_policy_params,
+    }
+
+
+def _eval_arch_worker(
     args: argparse.Namespace,
     ppo_config: Any,
-    arch_config: ArchConfig,
-    eval_seed: int,
-) -> dict[str, Any]:
-    """Load supernet checkpoint, set arch, evaluate and return metrics."""
+    arch_entries: list[tuple[int, ArchConfig]],
+) -> list[dict[str, Any]]:
+    """Evaluate a batch of architectures sharing one policy and one eval_env."""
+    eval_seed = int(ppo_config.seed) + EVAL_SEED_OFFSET
     set_global_seeds(eval_seed)
     device = resolve_device(str(ppo_config.device))
     search_space = SearchSpace()
@@ -147,96 +184,37 @@ def evaluate_single_arch(
     eval_env = make_vec_env_from_ppo_config(
         ppo_config, seed=eval_seed, n_envs=ppo_config.eval_n_envs
     )
-    # We still need a train_env for evaluate_actor_subnet (obs normalization stats)
-    train_env = make_vec_env_from_ppo_config(
-        ppo_config, seed=eval_seed, n_envs=ppo_config.train_n_envs
-    )
     try:
         policy = build_policy_from_checkpoint(
             ppo_config=ppo_config,
-            train_env=train_env,
+            env=eval_env,
             search_space=search_space,
             checkpoint=checkpoint,
             device=device,
         )
-        policy.set_active_arch(arch_config)
-
-        eval_episodes = ppo_config.eval_episodes
-        if eval_episodes <= 0:
-            raise ValueError(
-                "ppo.eval_episodes must be positive for evaluation."
+        results: list[dict[str, Any]] = []
+        for arch_index, arch_config in arch_entries:
+            t0 = time.monotonic()
+            result = evaluate_single_arch(
+                policy=policy,
+                eval_env=eval_env,
+                arch_config=arch_config,
+                ppo_config=ppo_config,
+                device=device,
             )
-        eval_metrics = evaluate_actor_subnet(
-            policy=policy,
-            train_env=train_env,
-            eval_env=eval_env,
-            arch=arch_config,
-            n_eval_episodes=eval_episodes,
-            deterministic=ppo_config.eval_deterministic,
-            device=device,
-        )
-        active_backbone_params = int(policy.backbone.elastic_num_params)
-        actor_head_params = count_parameters(actor_head_parameters(policy))
-        policy_params = int(
-            sum(parameter.numel() for parameter in policy.parameters())
-        )
-        trainable_policy_params = int(
-            sum(
-                parameter.numel()
-                for parameter in policy.parameters()
-                if parameter.requires_grad
-            )
-        )
-        return {
-            "return": float(eval_metrics["ep_return"]),
-            "return_std": float(eval_metrics["ep_return_std"]),
-            "ep_return": float(eval_metrics["ep_return"]),
-            "ep_return_std": float(eval_metrics["ep_return_std"]),
-            "ep_length": float(eval_metrics["ep_length"]),
-            "ep_length_std": float(eval_metrics["ep_length_std"]),
-            "params": active_backbone_params,
-            "actor_head_params": actor_head_params,
-            "policy_params": policy_params,
-            "trainable_policy_params": trainable_policy_params,
-        }
+            elapsed = time.monotonic() - t0
+            results.append({
+                "arch_index": arch_index,
+                "arch_config": arch_config.to_dict(),
+                "eval_seed": eval_seed,
+                "pid": os.getpid(),
+                "eval_time_s": round(elapsed, 2),
+                **result,
+            })
+        return results
     finally:
-        train_env.close()
         eval_env.close()
 
-
-@dataclass(frozen=True)
-class EvalArchWorkerConfig:
-    args: dict[str, Any]
-    ppo_config: dict[str, Any]
-    arch_config: dict[str, Any]
-    arch_index: int
-    eval_seed: int
-
-
-def _eval_arch_worker(config: EvalArchWorkerConfig) -> dict[str, Any]:
-    worker_threads = int(config.args.get("worker_torch_threads", 1))
-    if worker_threads > 0:
-        torch.set_num_threads(worker_threads)
-    args = argparse.Namespace(**config.args)
-    ppo_config = OmegaConf.create(config.ppo_config)
-    arch_config = ArchConfig.from_dict(config.arch_config)
-
-    t0 = time.monotonic()
-    result = evaluate_single_arch(
-        args=args,
-        ppo_config=ppo_config,
-        arch_config=arch_config,
-        eval_seed=config.eval_seed,
-    )
-    elapsed = time.monotonic() - t0
-    return {
-        "arch_index": config.arch_index,
-        "arch_config": config.arch_config,
-        "eval_seed": config.eval_seed,
-        "pid": os.getpid(),
-        "eval_time_s": round(elapsed, 2),
-        **result,
-    }
 
 
 def main() -> None:
@@ -268,20 +246,7 @@ def main() -> None:
             raise ValueError(f"Invalid arch config at index {i}: {e}") from e
 
     eval_seed = int(ppo_config.seed) + EVAL_SEED_OFFSET
-    args_dict = vars(args).copy()
     ppo_config_dict = ppo_config_to_dict(ppo_config)
-
-    # Build worker configs
-    worker_configs = [
-        EvalArchWorkerConfig(
-            args=args_dict,
-            ppo_config=ppo_config_dict,
-            arch_config=arch.to_dict(),
-            arch_index=i,
-            eval_seed=eval_seed,
-        )
-        for i, arch in enumerate(arch_configs)
-    ]
 
     eval_workers = max(1, int(args.eval_workers))
     print(
@@ -289,13 +254,23 @@ def main() -> None:
         flush=True,
     )
 
-    # Run evaluations
+    arch_entries = list(enumerate(arch_configs))
+
     if eval_workers <= 1:
-        results = [_eval_arch_worker(config) for config in worker_configs]
+        # Single-worker: call _eval_arch_worker directly
+        results = _eval_arch_worker(args, ppo_config, arch_entries)
     else:
+        # Multi-worker: partition archs among workers.
+        # Each worker creates ONE shared policy + eval_env for its batch.
+        batch_size = math.ceil(len(arch_entries) / eval_workers)
+        partitions = list(batched(arch_entries, batch_size))
+        starmap_args = [
+            (args, ppo_config, part) for part in partitions
+        ]
         context = mp.get_context(args.mp_start_method)
-        with context.Pool(processes=eval_workers) as pool:
-            results = pool.map(_eval_arch_worker, worker_configs)
+        with context.Pool(processes=len(starmap_args)) as pool:
+            nested_results = pool.starmap(_eval_arch_worker, starmap_args)
+        results = [r for batch in nested_results for r in batch]
 
     # Sort by arch_index to preserve input order
     results.sort(key=lambda r: r["arch_index"])
@@ -345,7 +320,7 @@ def main() -> None:
     manifest_path = output_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2))
 
-    log_wandb(
+    update_wandb_summary(
         wandb_run,
         {
             "num_archs": len(arch_configs),

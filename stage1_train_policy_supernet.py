@@ -651,21 +651,21 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                     next_eval_timestep += eval_freq
                 max_subnet_eval = evaluate_actor_subnet(
                     policy=policy,
-                    train_env=train_env,
                     eval_env=eval_env,
                     arch=search_space.max_arch(),
                     n_eval_episodes=eval_episodes,
                     deterministic=bool(ppo_config.eval_deterministic),
                     device=device,
+                    train_env=train_env,
                 )
                 min_subnet_eval = evaluate_actor_subnet(
                     policy=policy,
-                    train_env=train_env,
                     eval_env=eval_env,
                     arch=search_space.min_arch(),
                     n_eval_episodes=eval_episodes,
                     deterministic=bool(ppo_config.eval_deterministic),
                     device=device,
+                    train_env=train_env,
                 )
                 is_best_max_subnet = (
                     best_eval_max_subnet_ep_return is None

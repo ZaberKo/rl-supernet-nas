@@ -246,7 +246,7 @@ def finetune_and_evaluate_candidate(
     try:
         policy = build_policy_from_checkpoint(
             ppo_config=ppo_config,
-            train_env=train_env,
+            env=train_env,
             search_space=search_space,
             checkpoint=checkpoint,
             device=device,
@@ -400,12 +400,12 @@ def finetune_and_evaluate_candidate(
             )
         eval_metrics = evaluate_actor_subnet(
             policy=policy,
-            train_env=train_env,
             eval_env=eval_env,
             arch=arch_config,
             n_eval_episodes=eval_episodes,
             deterministic=ppo_config.eval_deterministic,
             device=device,
+            train_env=train_env,
         )
         active_backbone_params = int(policy.backbone.elastic_num_params)
         actor_head_params = count_parameters(actor_head_parameters(policy))

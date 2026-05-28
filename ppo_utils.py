@@ -717,14 +717,22 @@ def fixed_arch_actor_update(
 
 def evaluate_actor_subnet(
     policy: PolicySupernet,
-    train_env: VecEnv,
     eval_env: VecEnv,
     arch: ArchConfig,
     n_eval_episodes: int,
     deterministic: bool,
     device: torch.device,
+    *,
+    train_env: VecEnv | None = None,
 ) -> dict[str, float]:
-    sync_envs_normalization(train_env, eval_env)
+    """Evaluate a subnet on *eval_env* and return episode statistics.
+
+    When *train_env* is provided, ``sync_envs_normalization`` is called
+    automatically to copy observation/reward normalisation statistics from
+    the training environment before evaluation.
+    """
+    if train_env is not None:
+        sync_envs_normalization(train_env, eval_env)
     eval_vec_normalize = unwrap_vec_normalize(eval_env)
     if eval_vec_normalize is not None:
         eval_vec_normalize.training = False

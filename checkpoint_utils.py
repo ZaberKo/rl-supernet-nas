@@ -61,7 +61,7 @@ def save_checkpoint(
 
 def build_policy_from_checkpoint(
     ppo_config: Any,
-    train_env: VecEnv,
+    env: VecEnv,
     search_space: SearchSpace,
     checkpoint: Mapping[str, Any],
     device: torch.device,
@@ -72,8 +72,8 @@ def build_policy_from_checkpoint(
     the checkpoint only supplies the ``policy_state_dict``.
     """
     policy = PolicySupernet(
-        observation_space=train_env.observation_space,
-        action_space=train_env.action_space,
+        observation_space=env.observation_space,
+        action_space=env.action_space,
         search_space=search_space,
         features_dim=int(ppo_config.features_dim),
         policy_net_arch=list(ppo_config.policy_net_arch or []),
