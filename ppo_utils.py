@@ -257,8 +257,8 @@ class PolicySupernet(nn.Module):
             total += self.log_std.numel()
         return total
 
-
-def build_sb3_critic_model(
+# TODO: build model only, donot use PPO
+def build_sb3_critic_model (
     ppo_config: DictConfig,
     env: VecEnv,
     learning_rate: Any,

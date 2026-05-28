@@ -375,18 +375,6 @@ def run(
             config_record.update(extra_config)
         append_jsonl_record(metrics_path, config_record)
 
-        configured_progress_total = max(0, int(args.critic_warmup_timesteps)) + int(
-            target_timesteps
-        )
-        if configured_progress_total > 0:
-            progress_bar = tqdm(
-                total=configured_progress_total,
-                desc=progress_bar_desc or "stage1_arch_ppo",
-                unit="step",
-                dynamic_ncols=True,
-                disable=ppo_config.quiet,
-            )
-
         initial_eval_record = None
         final_eval_record = None
         actual_timesteps = 0
@@ -422,6 +410,85 @@ def run(
                     ema_policy=ema_policy,
                 )
 
+        # ----- Critic warmup (independent phase) -----
+        observation = train_env.reset()
+        episode_starts = np.ones((train_env.num_envs,), dtype=np.bool_)
+        warmup_target = max(0, int(args.critic_warmup_timesteps))
+        if warmup_target > 0:
+            warmup_critic_lr = (
+                float(critic_lr_schedule(1.0))
+                if callable(critic_lr_schedule)
+                else float(critic_lr_schedule)
+            )
+            update_optimizer_learning_rate(critic_optimizer, warmup_critic_lr)
+            warmup_bar = tqdm(
+                total=warmup_target,
+                desc=(progress_bar_desc or "arch_ppo") + "_warmup",
+                unit="step",
+                dynamic_ncols=True,
+                disable=ppo_config.quiet,
+            )
+            warmup_iteration = 0
+            while critic_warmup_actual_timesteps < warmup_target:
+                warmup_iteration += 1
+                observation, episode_starts, rollout_metrics = collect_candidate_rollout(
+                    policy=policy,
+                    critic_model=critic_model,
+                    env=train_env,
+                    arch=arch_config,
+                    rollout_buffer=rollout_buffer,
+                    initial_observation=observation,
+                    initial_episode_starts=episode_starts,
+                    n_steps=int(ppo_config.n_steps),
+                    gamma=float(ppo_config.gamma),
+                    device=device,
+                )
+                critic_warmup_actual_timesteps += int(ppo_config.n_steps) * int(
+                    train_env.num_envs
+                )
+                critic_metrics = critic_update(
+                    critic_model=critic_model,
+                    optimizer=critic_optimizer,
+                    rollout_buffer=rollout_buffer,
+                    n_epochs=int(ppo_config.n_epochs),
+                    batch_size=int(ppo_config.batch_size),
+                    max_grad_norm=float(ppo_config.max_grad_norm),
+                )
+                # Log warmup to file only (not wandb)
+                warmup_record = {
+                    "type": "critic_warmup",
+                    "iteration": int(warmup_iteration),
+                    "critic_warmup_timesteps": int(critic_warmup_actual_timesteps),
+                    "critic_lr": float(warmup_critic_lr),
+                    **prefixed_metrics("critic_warmup_rollout", rollout_metrics),
+                    **prefixed_metrics("critic_warmup", critic_metrics),
+                }
+                append_jsonl_record(metrics_path, warmup_record)
+                warmup_bar.update(
+                    min(critic_warmup_actual_timesteps, warmup_target) - warmup_bar.n
+                )
+                warmup_bar.set_postfix(
+                    {
+                        "ret": f"{rollout_metrics['rollout/ep_return']:.3g}",
+                        "critic": f"{critic_metrics['critic/loss']:.3g}",
+                        "lr": f"{warmup_critic_lr:.2g}",
+                    },
+                    refresh=True,
+                )
+            warmup_bar.close()
+
+        total_env_timesteps = critic_warmup_actual_timesteps
+
+        # ----- Main training phase -----
+        if target_timesteps > 0:
+            progress_bar = tqdm(
+                total=target_timesteps,
+                desc=progress_bar_desc or "stage1_arch_ppo",
+                unit="step",
+                dynamic_ncols=True,
+                disable=ppo_config.quiet,
+            )
+
         if eval_env is not None:
             initial_eval_record = evaluate_and_record(
                 policy=policy,
@@ -434,7 +501,7 @@ def run(
                 metrics_path=metrics_path,
                 wandb_run=wandb_run,
                 num_timesteps=0,
-                total_env_timesteps=0,
+                total_env_timesteps=total_env_timesteps,
                 phase="initial",
             )
             if progress_bar is not None:
@@ -444,71 +511,7 @@ def run(
                     f"ep_return_std={initial_eval_record['eval/ep_return_std']:.6g} "
                     f"ep_length={initial_eval_record['eval/ep_length']:.6g}"
                 )
-            maybe_save_best_checkpoint(initial_eval_record, 0, 0)
-
-        observation = train_env.reset()
-        episode_starts = np.ones((train_env.num_envs,), dtype=np.bool_)
-        warmup_target = max(0, int(args.critic_warmup_timesteps))
-        warmup_iteration = 0
-        while critic_warmup_actual_timesteps < warmup_target:
-            warmup_iteration += 1
-            critic_progress_remaining = 1.0 - float(critic_warmup_actual_timesteps) / float(
-                max(1, configured_progress_total)
-            )
-            critic_lr = (
-                float(critic_lr_schedule(critic_progress_remaining))
-                if callable(critic_lr_schedule)
-                else float(critic_lr_schedule)
-            )
-            update_optimizer_learning_rate(critic_optimizer, critic_lr)
-            observation, episode_starts, rollout_metrics = collect_candidate_rollout(
-                policy=policy,
-                critic_model=critic_model,
-                env=train_env,
-                arch=arch_config,
-                rollout_buffer=rollout_buffer,
-                initial_observation=observation,
-                initial_episode_starts=episode_starts,
-                n_steps=int(ppo_config.n_steps),
-                gamma=float(ppo_config.gamma),
-                device=device,
-            )
-            critic_warmup_actual_timesteps += int(ppo_config.n_steps) * int(
-                train_env.num_envs
-            )
-            total_env_timesteps = critic_warmup_actual_timesteps + actual_timesteps
-            critic_metrics = critic_update(
-                critic_model=critic_model,
-                optimizer=critic_optimizer,
-                rollout_buffer=rollout_buffer,
-                n_epochs=int(ppo_config.n_epochs),
-                batch_size=int(ppo_config.batch_size),
-                max_grad_norm=float(ppo_config.max_grad_norm),
-            )
-            record = {
-                "type": "critic_warmup",
-                "iteration": int(warmup_iteration),
-                "total_timesteps": int(actual_timesteps),
-                "critic_warmup_timesteps": int(critic_warmup_actual_timesteps),
-                "total_env_timesteps": int(total_env_timesteps),
-                "progress_remaining": float(critic_progress_remaining),
-                "critic_lr": float(critic_lr),
-                **prefixed_metrics("critic_warmup_rollout", rollout_metrics),
-                **prefixed_metrics("critic_warmup", critic_metrics),
-            }
-            log_record(metrics_path, wandb_run, record, step=total_env_timesteps)
-            if progress_bar is not None:
-                progress_bar.update(total_env_timesteps - progress_bar.n)
-            if progress_bar is not None:
-                progress_bar.set_postfix(
-                    {
-                        "phase": "warmup",
-                        "ret": f"{rollout_metrics['rollout/ep_return']:.3g}",
-                        "critic": f"{critic_metrics['critic/loss']:.3g}",
-                        "lr": f"{critic_lr:.2g}",
-                    },
-                    refresh=True,
-                )
+            maybe_save_best_checkpoint(initial_eval_record, 0, total_env_timesteps)
 
         target_kl = ppo_config.target_kl
         next_eval_timestep = eval_freq if eval_freq > 0 else 0
@@ -516,29 +519,26 @@ def run(
         last_train_record: dict[str, Any] = {}
         while actual_timesteps < target_timesteps:
             train_iteration += 1
-            actor_progress_remaining = 1.0 - float(actual_timesteps) / float(
+            progress_remaining = 1.0 - float(actual_timesteps) / float(
                 max(1, target_timesteps)
             )
-            critic_progress_remaining = 1.0 - float(
-                critic_warmup_actual_timesteps + actual_timesteps
-            ) / float(max(1, configured_progress_total))
             actor_lr = (
-                float(policy_head_lr_schedule(actor_progress_remaining))
+                float(policy_head_lr_schedule(progress_remaining))
                 if callable(policy_head_lr_schedule)
                 else float(policy_head_lr_schedule)
             )
             backbone_lr = (
-                float(policy_backbone_lr_schedule(actor_progress_remaining))
+                float(policy_backbone_lr_schedule(progress_remaining))
                 if callable(policy_backbone_lr_schedule)
                 else float(policy_backbone_lr_schedule)
             )
             critic_lr = (
-                float(critic_lr_schedule(critic_progress_remaining))
+                float(critic_lr_schedule(progress_remaining))
                 if callable(critic_lr_schedule)
                 else float(critic_lr_schedule)
             )
             clip_range = (
-                float(clip_range_schedule(actor_progress_remaining))
+                float(clip_range_schedule(progress_remaining))
                 if callable(clip_range_schedule)
                 else float(clip_range_schedule)
             )
@@ -591,7 +591,7 @@ def run(
                 "total_timesteps": int(actual_timesteps),
                 "critic_warmup_timesteps": int(critic_warmup_actual_timesteps),
                 "total_env_timesteps": int(total_env_timesteps),
-                "progress_remaining": float(actor_progress_remaining),
+                "progress_remaining": float(progress_remaining),
                 "actor_lr": float(actor_lr),
                 "critic_lr": float(critic_lr),
                 "backbone_lr": float(backbone_lr),
@@ -601,9 +601,9 @@ def run(
                 **critic_metrics,
             }
             last_train_record = dict(train_record)
-            log_record(metrics_path, wandb_run, train_record, step=total_env_timesteps)
+            log_record(metrics_path, wandb_run, train_record, step=actual_timesteps)
             if progress_bar is not None:
-                progress_bar.update(total_env_timesteps - progress_bar.n)
+                progress_bar.update(actual_timesteps - progress_bar.n)
             if progress_bar is not None:
                 progress_bar.set_postfix(
                     {
