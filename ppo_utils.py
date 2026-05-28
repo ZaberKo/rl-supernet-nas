@@ -472,6 +472,21 @@ def prepare_env_actions(
     raise TypeError(f"Unsupported action space: {type(action_space).__name__}")
 
 
+def require_monitor_episode_info(info: Mapping[str, Any], context: str) -> Mapping[str, Any]:
+    episode_info = info.get("episode") if isinstance(info, Mapping) else None
+    if (
+        not isinstance(episode_info, Mapping)
+        or "r" not in episode_info
+        or "l" not in episode_info
+    ):
+        raise RuntimeError(
+            f"Missing VecMonitor episode info during {context}. "
+            "Wrap the VecEnv with stable_baselines3.common.vec_env.VecMonitor "
+            "before recording episode returns."
+        )
+    return episode_info
+
+
 def collect_candidate_rollout(
     policy: PolicySupernet,
     critic_model: PPO,
@@ -496,8 +511,6 @@ def collect_candidate_rollout(
     rollout_done_count = 0
     rollout_episode_returns: list[float] = []
     rollout_episode_lengths: list[float] = []
-    current_rollout_returns = np.zeros(num_envs, dtype=np.float64)
-    current_rollout_lengths = np.zeros(num_envs, dtype=np.int64)
     last_dones = episode_starts
 
     with torch.no_grad():
@@ -540,31 +553,16 @@ def collect_candidate_rollout(
             )
 
             rollout_reward_sum += float(np.asarray(raw_rewards, dtype=np.float32).sum())
-            reward_array = np.asarray(raw_rewards, dtype=np.float64)
             done_array = np.asarray(raw_dones, dtype=np.bool_)
-            current_rollout_returns += reward_array
-            current_rollout_lengths += 1
             rollout_done_count += int(done_array.sum())
             for env_index, done in enumerate(done_array):
                 if not bool(done):
                     continue
-                episode_info = (
-                    info_list[env_index].get("episode")
-                    if isinstance(info_list[env_index], Mapping)
-                    else None
+                episode_info = require_monitor_episode_info(
+                    info_list[env_index], "training rollout"
                 )
-                if isinstance(episode_info, Mapping) and "r" in episode_info:
-                    episode_return = float(episode_info["r"])
-                else:
-                    episode_return = float(current_rollout_returns[env_index])
-                if isinstance(episode_info, Mapping) and "l" in episode_info:
-                    episode_length = float(episode_info["l"])
-                else:
-                    episode_length = float(current_rollout_lengths[env_index])
-                rollout_episode_returns.append(episode_return)
-                rollout_episode_lengths.append(episode_length)
-                current_rollout_returns[env_index] = 0.0
-                current_rollout_lengths[env_index] = 0
+                rollout_episode_returns.append(float(episode_info["r"]))
+                rollout_episode_lengths.append(float(episode_info["l"]))
             observation = np.asarray(next_observation)
             episode_starts = done_array
             last_dones = episode_starts
@@ -754,42 +752,36 @@ def evaluate_actor_subnet(
     policy.eval()
     policy.set_active_arch(arch)
     observations = eval_env.reset()
-    current_returns = np.zeros(eval_env.num_envs, dtype=np.float64)
-    current_lengths = np.zeros(eval_env.num_envs, dtype=np.int64)
+    n_eval_episodes = int(n_eval_episodes)
+    if n_eval_episodes <= 0:
+        raise ValueError("n_eval_episodes must be positive.")
+    n_envs = int(eval_env.num_envs)
+    episode_counts = np.zeros(n_envs, dtype=np.int64)
+    episode_count_targets = np.asarray(
+        [(n_eval_episodes + env_index) // n_envs for env_index in range(n_envs)],
+        dtype=np.int64,
+    )
     episode_returns: list[float] = []
     episode_lengths: list[float] = []
     with torch.no_grad():
-        while len(episode_returns) < n_eval_episodes:
+        while (episode_counts < episode_count_targets).any():
             observation_tensor = torch.as_tensor(observations, device=device)
             actions, _, _ = policy.act(observation_tensor, deterministic=deterministic)
             _stored_actions, env_actions = prepare_env_actions(
                 eval_env.action_space, actions, int(eval_env.num_envs)
             )
             observations, rewards, dones, infos = eval_env.step(env_actions)
-            current_returns += np.asarray(rewards, dtype=np.float64)
-            current_lengths += 1
             for env_index, done in enumerate(dones):
+                if episode_counts[env_index] >= episode_count_targets[env_index]:
+                    continue
                 if not bool(done):
                     continue
-                episode_info = (
-                    infos[env_index].get("episode")
-                    if isinstance(infos[env_index], dict)
-                    else None
+                episode_info = require_monitor_episode_info(
+                    infos[env_index], "policy evaluation"
                 )
-                if isinstance(episode_info, Mapping) and "r" in episode_info:
-                    episode_return = float(episode_info["r"])
-                else:
-                    episode_return = float(current_returns[env_index])
-                if isinstance(episode_info, Mapping) and "l" in episode_info:
-                    episode_length = float(episode_info["l"])
-                else:
-                    episode_length = float(current_lengths[env_index])
-                episode_returns.append(episode_return)
-                episode_lengths.append(episode_length)
-                current_returns[env_index] = 0.0
-                current_lengths[env_index] = 0
-                if len(episode_returns) >= n_eval_episodes:
-                    break
+                episode_returns.append(float(episode_info["r"]))
+                episode_lengths.append(float(episode_info["l"]))
+                episode_counts[env_index] += 1
 
     return {
         "ep_return": float(np.mean(episode_returns)),

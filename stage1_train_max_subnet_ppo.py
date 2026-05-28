@@ -35,6 +35,7 @@ from ppo_utils import (
     predict_critic_values,
     prefixed_metrics,
     prepare_env_actions,
+    require_monitor_episode_info,
     update_actor_optimizer_learning_rate,
     update_ema_model,
     update_optimizer_learning_rate,
@@ -108,8 +109,6 @@ def collect_rollout(
     rollout_done_count = 0
     rollout_episode_returns: list[float] = []
     rollout_episode_lengths: list[float] = []
-    current_rollout_returns = np.zeros(num_envs, dtype=np.float64)
-    current_rollout_lengths = np.zeros(num_envs, dtype=np.int64)
     last_dones = episode_starts
 
     with torch.no_grad():
@@ -152,31 +151,16 @@ def collect_rollout(
             )
 
             rollout_reward_sum += float(np.asarray(raw_rewards, dtype=np.float32).sum())
-            reward_array = np.asarray(raw_rewards, dtype=np.float64)
             done_array = np.asarray(raw_dones, dtype=np.bool_)
-            current_rollout_returns += reward_array
-            current_rollout_lengths += 1
             rollout_done_count += int(done_array.sum())
             for env_index, done in enumerate(done_array):
                 if not bool(done):
                     continue
-                episode_info = (
-                    info_list[env_index].get("episode")
-                    if isinstance(info_list[env_index], Mapping)
-                    else None
+                episode_info = require_monitor_episode_info(
+                    info_list[env_index], "training rollout"
                 )
-                if isinstance(episode_info, Mapping) and "r" in episode_info:
-                    episode_return = float(episode_info["r"])
-                else:
-                    episode_return = float(current_rollout_returns[env_index])
-                if isinstance(episode_info, Mapping) and "l" in episode_info:
-                    episode_length = float(episode_info["l"])
-                else:
-                    episode_length = float(current_rollout_lengths[env_index])
-                rollout_episode_returns.append(episode_return)
-                rollout_episode_lengths.append(episode_length)
-                current_rollout_returns[env_index] = 0.0
-                current_rollout_lengths[env_index] = 0
+                rollout_episode_returns.append(float(episode_info["r"]))
+                rollout_episode_lengths.append(float(episode_info["l"]))
             observation = np.asarray(next_observation)
             episode_starts = done_array
             last_dones = episode_starts
