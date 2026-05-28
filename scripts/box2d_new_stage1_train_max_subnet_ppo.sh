@@ -11,4 +11,8 @@ python new_stage1_train_max_subnet_ppo.py \
   --ppo_config_override ppo.ema_tau=0.99 \
   --ppo_config_override ppo.projection_dim=128 \
   --ppo_config_override ppo.predictor_hidden_dim=512 \
+  --ppo_config_override ppo.policy_backbone_lr=lin_1e-4 \
+  --ppo_config_override ppo.policy_head_lr=lin_1e-4 \
+  --ppo_config_override ppo.critic_lr=lin_1e-4 \
+  --ppo_config_override ppo.clip_range=0.2 \
   --output_dir runs/box2d_carracing/new_stage1_max_subnet_ppo
