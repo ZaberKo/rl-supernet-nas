@@ -24,12 +24,10 @@ from env_utils import EVAL_SEED_OFFSET, make_vec_env_from_ppo_config
 from ppo_utils import (
     FixedPolicySubnet,
     PolicySupernet,
-    actor_head_parameters,
     append_jsonl_record,
     build_sb3_critic_model,
     collect_candidate_rollout,
     configure_actor_optimizer,
-    count_parameters,
     critic_update,
     evaluate_actor_subnet,
     fixed_arch_actor_update,
@@ -693,14 +691,11 @@ def run(
                 final_eval_record, total_timesteps, total_env_timesteps
             )
 
-        policy_backbone_params = sum(
-            p.numel() for p in policy.backbone.parameters()
-        )
-        policy_head_params = count_parameters(actor_head_parameters(policy))
-        policy_params = policy_backbone_params + policy_head_params
-        trainable_policy_params = policy_head_params
-        if any(p.requires_grad for p in policy.backbone.parameters()):
-            trainable_policy_params += policy_backbone_params
+        param_stats = policy.policy_param_stats()
+        policy_backbone_params = param_stats["policy_backbone_params"]
+        policy_head_params = param_stats["policy_head_params"]
+        policy_params = param_stats["policy_params"]
+        trainable_policy_params = param_stats["trainable_policy_params"]
 
         _save_arch_checkpoint(
             last_checkpoint_path,

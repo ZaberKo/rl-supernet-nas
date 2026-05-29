@@ -19,8 +19,6 @@ from checkpoint_utils import (
 from env_utils import EVAL_SEED_OFFSET, make_vec_env_from_ppo_config
 from ppo_utils import (
     PolicySupernet,
-    actor_head_parameters,
-    count_parameters,
     evaluate_actor_subnet,
 )
 from setup_utils import (
@@ -142,9 +140,7 @@ def evaluate_single_arch(
         deterministic=ppo_config.eval_deterministic,
         device=device,
     )
-    policy_backbone_params = int(policy.backbone.elastic_num_params)
-    policy_head_params = count_parameters(actor_head_parameters(policy))
-    policy_params = int(policy.elastic_num_params)
+    param_stats = policy.policy_param_stats()
     return {
         "return": float(eval_metrics["ep_return"]),
         "return_std": float(eval_metrics["ep_return_std"]),
@@ -152,9 +148,9 @@ def evaluate_single_arch(
         "ep_return_std": float(eval_metrics["ep_return_std"]),
         "ep_length": float(eval_metrics["ep_length"]),
         "ep_length_std": float(eval_metrics["ep_length_std"]),
-        "policy_backbone_params": policy_backbone_params,
-        "policy_head_params": policy_head_params,
-        "policy_params": policy_params,
+        "policy_backbone_params": param_stats["policy_backbone_params"],
+        "policy_head_params": param_stats["policy_head_params"],
+        "policy_params": param_stats["policy_params"],
     }
 
 

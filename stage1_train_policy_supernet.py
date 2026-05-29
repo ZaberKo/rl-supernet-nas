@@ -24,7 +24,6 @@ from ppo_utils import (
     append_jsonl_record,
     bootstrap_time_limit_rewards,
     build_sb3_critic_model,
-    compute_dynamics_loss,
     configure_actor_optimizer,
     create_ema_policy,
     critic_update,
@@ -317,13 +316,11 @@ def sandwich_actor_update(
             policy_loss = -torch.min(unclipped_loss, clipped_loss).mean()
             entropy_loss = -entropy.mean()
 
-            max_dyn_loss = compute_dynamics_loss(
-                online_policy=policy,
+            max_dyn_loss = policy.compute_dynamics_loss(
                 ema_policy=ema_policy,
                 start_features=max_features,
                 next_observations=rollout_data.next_observations,
                 actions=batch_actions,
-                action_space=action_space,
                 sample_weights=rollout_data.dynamics_masks,
             )
             max_loss = (

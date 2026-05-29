@@ -102,7 +102,196 @@ def maybe_orthogonal_init(module: nn.Module, enabled: bool) -> None:
                 nn.init.constant_(item.bias, 0.0)
 
 
-class PolicySupernet(nn.Module):
+class PolicyBase(nn.Module):
+    """Base class for policy networks with shared forward API.
+
+    Subclasses must set the following attributes in ``__init__``:
+
+    Attributes:
+        backbone: CNN feature extractor module.
+        policy_net: MLP applied after backbone.
+        action_net: Linear head producing action logits or mean.
+        log_std: Learnable log-std for continuous actions, or None.
+        projection: Projection head for latent dynamics.
+        predictor: Latent dynamics predictor.
+        action_space: Gymnasium action space.
+        action_kind: ``"discrete"`` or ``"box"``.
+        action_dim: Number of action dimensions.
+    """
+
+    backbone: nn.Module
+    policy_net: nn.Module
+    action_net: nn.Module
+    log_std: nn.Parameter | None
+    projection: nn.Module
+    predictor: nn.Module
+    action_space: spaces.Space
+    action_kind: str
+    action_dim: int
+
+    def encode(self, observations: torch.Tensor) -> torch.Tensor:
+        return self.policy_net(self.backbone(observations))
+
+    def distribution_params_from_features(
+        self, features: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        action_output = self.action_net(features)
+        if self.action_kind == "discrete":
+            return {"logits": action_output}
+        if self.log_std is None:
+            raise RuntimeError("Continuous policy is missing log_std.")
+        return {
+            "mean": action_output,
+            "log_std": self.log_std.view(1, -1).expand_as(action_output),
+        }
+
+    def distribution_params(
+        self, observations: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        return self.distribution_params_from_features(self.encode(observations))
+
+    def distribution_from_params(self, params: Mapping[str, torch.Tensor]):
+        if self.action_kind == "discrete":
+            return torch.distributions.Categorical(logits=params["logits"])
+        std = torch.exp(params["log_std"])
+        base_dist = torch.distributions.Normal(params["mean"], std)
+        return torch.distributions.Independent(base_dist, 1)
+
+    def act(
+        self,
+        observations: torch.Tensor,
+        deterministic: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        params = self.distribution_params(observations)
+        distribution = self.distribution_from_params(params)
+        if self.action_kind == "discrete":
+            if deterministic:
+                actions = torch.argmax(params["logits"], dim=-1)
+            else:
+                actions = distribution.sample()
+        else:
+            actions = params["mean"] if deterministic else distribution.sample()
+        log_prob = distribution.log_prob(actions)
+        entropy = distribution.entropy()
+        return actions, log_prob, entropy
+
+    def evaluate_actions_from_params(
+        self,
+        params: Mapping[str, torch.Tensor],
+        actions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        distribution = self.distribution_from_params(params)
+        if self.action_kind == "discrete":
+            prepared_actions = actions.long().view(-1)
+        else:
+            prepared_actions = actions.float().view(actions.size(0), self.action_dim)
+        log_prob = distribution.log_prob(prepared_actions)
+        entropy = distribution.entropy()
+        return log_prob, entropy
+
+    def evaluate_actions(
+        self,
+        observations: torch.Tensor,
+        actions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.evaluate_actions_from_params(
+            self.distribution_params(observations), actions
+        )
+
+    def project_features(self, features: torch.Tensor) -> torch.Tensor:
+        return self.projection(features)
+
+    def project_observations(self, observations: torch.Tensor) -> torch.Tensor:
+        return self.project_features(self.encode(observations))
+
+    def compute_dynamics_loss(
+        self,
+        ema_policy: PolicyBase,
+        start_features: torch.Tensor,
+        next_observations: torch.Tensor,
+        actions: torch.Tensor,
+        sample_weights: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Normalised cosine-distance latent dynamics loss.
+
+        ``self`` (online policy) predicts the next latent from
+        ``start_features`` + ``actions``; the target comes from
+        ``ema_policy`` encoding ``next_observations``.
+
+        Args:
+            ema_policy: EMA target policy for computing target latents.
+            start_features: Encoded features of current observations.
+            next_observations: Raw next-step observations.
+            actions: Actions taken at current step.
+            sample_weights: Per-sample weights (dynamics mask); entries
+                <= 0 are filtered out.
+
+        Returns:
+            Scalar loss tensor.
+        """
+        if sample_weights is not None:
+            active_mask = sample_weights.to(device=start_features.device).view(-1) > 0.0
+            if not bool(active_mask.any()):
+                return torch.zeros((), dtype=torch.float32, device=start_features.device)
+            start_features = start_features[active_mask]
+            next_observations = next_observations[active_mask]
+            actions = actions[active_mask]
+            sample_weights = sample_weights.to(device=start_features.device)[active_mask]
+
+        start_latent = self.project_features(start_features)
+        action_features = encode_action_batch(actions, self.action_space).to(
+            device=start_features.device
+        )
+        predicted_next_latent = start_latent + self.predictor(
+            start_latent, action_features
+        )
+        with torch.no_grad():
+            target_next_latent = ema_policy.project_observations(next_observations)
+
+        return latent_dynamics_loss(
+            predictions=predicted_next_latent,
+            teacher_targets=target_next_latent,
+            sample_weights=sample_weights,
+        )
+
+    def policy_param_stats(self) -> dict[str, int]:
+        """Compute parameter statistics for this policy.
+
+        Returns:
+            Dict with keys:
+                - ``policy_backbone_params``: backbone + policy_net count.
+                - ``policy_head_params``: action_net + log_std count.
+                - ``policy_params``: total (backbone + head + projection
+                  + predictor).
+                - ``trainable_policy_params``: subset with
+                  ``requires_grad=True``.
+        """
+        backbone_params = list(self.backbone.parameters()) + list(
+            self.policy_net.parameters()
+        )
+        head_params: list[torch.nn.Parameter] = list(self.action_net.parameters())
+        if self.log_std is not None:
+            head_params.append(self.log_std)
+        aux_params: list[torch.nn.Parameter] = []
+        if hasattr(self, "projection") and self.projection is not None:
+            aux_params += list(self.projection.parameters())
+        if hasattr(self, "predictor") and self.predictor is not None:
+            aux_params += list(self.predictor.parameters())
+
+        backbone_count = sum(p.numel() for p in backbone_params)
+        head_count = sum(p.numel() for p in head_params)
+        aux_count = sum(p.numel() for p in aux_params)
+        all_params = backbone_params + head_params + aux_params
+        trainable_count = sum(p.numel() for p in all_params if p.requires_grad)
+
+        return {
+            "policy_backbone_params": backbone_count,
+            "policy_head_params": head_count,
+            "policy_params": backbone_count + head_count + aux_count,
+            "trainable_policy_params": trainable_count,
+        }
+
+class PolicySupernet(PolicyBase):
     def __init__(
         self,
         observation_space: spaces.Space,
@@ -157,7 +346,7 @@ class PolicySupernet(nn.Module):
 
         maybe_orthogonal_init(self.policy_net, ortho_init)
         maybe_orthogonal_init(self.action_net, ortho_init)
-        self.projection = ProjectionHead(features_dim, projection_dim)
+        self.projection = ProjectionHead(self.latent_dim, projection_dim)
         self.predictor = LatentDynamicsPredictor(
             latent_dim=projection_dim,
             action_dim=get_action_dim(action_space),
@@ -196,81 +385,6 @@ class PolicySupernet(nn.Module):
             arch_config=self.backbone.active_arch,
         )
 
-    def encode(self, observations: torch.Tensor) -> torch.Tensor:
-        return self.backbone(observations)
-
-    def distribution_params_from_features(
-        self, features: torch.Tensor
-    ) -> dict[str, torch.Tensor]:
-        action_output = self.action_net(self.policy_net(features))
-        if self.action_kind == "discrete":
-            return {"logits": action_output}
-        if self.log_std is None:
-            raise RuntimeError("Continuous policy is missing log_std.")
-        return {
-            "mean": action_output,
-            "log_std": self.log_std.view(1, -1).expand_as(action_output),
-        }
-
-    def distribution_params(
-        self, observations: torch.Tensor
-    ) -> dict[str, torch.Tensor]:
-        return self.distribution_params_from_features(self.encode(observations))
-
-    def distribution_from_params(self, params: Mapping[str, torch.Tensor]):
-        if self.action_kind == "discrete":
-            return torch.distributions.Categorical(logits=params["logits"])
-        std = torch.exp(params["log_std"])
-        base_dist = torch.distributions.Normal(params["mean"], std)
-        return torch.distributions.Independent(base_dist, 1)
-
-    def act(
-        self,
-        observations: torch.Tensor,
-        deterministic: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        params = self.distribution_params(observations)
-        distribution = self.distribution_from_params(params)
-        if self.action_kind == "discrete":
-            if deterministic:
-                actions = torch.argmax(params["logits"], dim=-1)
-            else:
-                actions = distribution.sample()
-        else:
-            actions = params["mean"] if deterministic else distribution.sample()
-        log_prob = distribution.log_prob(actions)
-        entropy = distribution.entropy()
-        return actions, log_prob, entropy
-
-    def evaluate_actions_from_params(
-        self,
-        params: Mapping[str, torch.Tensor],
-        actions: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        distribution = self.distribution_from_params(params)
-        if self.action_kind == "discrete":
-            prepared_actions = actions.long().view(-1)
-        else:
-            prepared_actions = actions.float().view(actions.size(0), self.action_dim)
-        log_prob = distribution.log_prob(prepared_actions)
-        entropy = distribution.entropy()
-        return log_prob, entropy
-
-    def evaluate_actions(
-        self,
-        observations: torch.Tensor,
-        actions: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.evaluate_actions_from_params(
-            self.distribution_params(observations), actions
-        )
-
-    def project_features(self, features: torch.Tensor) -> torch.Tensor:
-        return self.projection(features)
-
-    def project_observations(self, observations: torch.Tensor) -> torch.Tensor:
-        return self.project_features(self.encode(observations))
-
     @property
     def elastic_num_params(self) -> int:
         total = int(self.backbone.elastic_num_params)
@@ -281,7 +395,7 @@ class PolicySupernet(nn.Module):
         return total
 
 
-class FixedPolicySubnet(nn.Module):
+class FixedPolicySubnet(PolicyBase):
     """A fixed-architecture policy subnet extracted from a ``PolicySupernet``.
 
     This module has the same forward API as ``PolicySupernet`` but contains
@@ -321,81 +435,6 @@ class FixedPolicySubnet(nn.Module):
             self.action_kind = "box"
             self.action_shape = tuple(int(v) for v in action_space.shape)
             self.action_dim = int(np.prod(self.action_shape, dtype=np.int64))
-
-    def encode(self, observations: torch.Tensor) -> torch.Tensor:
-        return self.backbone(observations)
-
-    def distribution_params_from_features(
-        self, features: torch.Tensor
-    ) -> dict[str, torch.Tensor]:
-        action_output = self.action_net(self.policy_net(features))
-        if self.action_kind == "discrete":
-            return {"logits": action_output}
-        if self.log_std is None:
-            raise RuntimeError("Continuous policy is missing log_std.")
-        return {
-            "mean": action_output,
-            "log_std": self.log_std.view(1, -1).expand_as(action_output),
-        }
-
-    def distribution_params(
-        self, observations: torch.Tensor
-    ) -> dict[str, torch.Tensor]:
-        return self.distribution_params_from_features(self.encode(observations))
-
-    def distribution_from_params(self, params: Mapping[str, torch.Tensor]):
-        if self.action_kind == "discrete":
-            return torch.distributions.Categorical(logits=params["logits"])
-        std = torch.exp(params["log_std"])
-        base_dist = torch.distributions.Normal(params["mean"], std)
-        return torch.distributions.Independent(base_dist, 1)
-
-    def act(
-        self,
-        observations: torch.Tensor,
-        deterministic: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        params = self.distribution_params(observations)
-        distribution = self.distribution_from_params(params)
-        if self.action_kind == "discrete":
-            if deterministic:
-                actions = torch.argmax(params["logits"], dim=-1)
-            else:
-                actions = distribution.sample()
-        else:
-            actions = params["mean"] if deterministic else distribution.sample()
-        log_prob = distribution.log_prob(actions)
-        entropy = distribution.entropy()
-        return actions, log_prob, entropy
-
-    def evaluate_actions_from_params(
-        self,
-        params: Mapping[str, torch.Tensor],
-        actions: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        distribution = self.distribution_from_params(params)
-        if self.action_kind == "discrete":
-            prepared_actions = actions.long().view(-1)
-        else:
-            prepared_actions = actions.float().view(actions.size(0), self.action_dim)
-        log_prob = distribution.log_prob(prepared_actions)
-        entropy = distribution.entropy()
-        return log_prob, entropy
-
-    def evaluate_actions(
-        self,
-        observations: torch.Tensor,
-        actions: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.evaluate_actions_from_params(
-            self.distribution_params(observations), actions
-        )
-
-    def project_features(self, features: torch.Tensor) -> torch.Tensor:
-        return self.projection(features)
-
-    def project_observations(self, observations: torch.Tensor) -> torch.Tensor:
-        return self.project_features(self.encode(observations))
 
 
 # TODO: build model only, donot use PPO
@@ -521,10 +560,12 @@ def critic_update(
     }
 
 
-def actor_head_parameters(policy: PolicySupernet) -> list[torch.nn.Parameter]:
-    parameters = list(policy.policy_net.parameters()) + list(
-        policy.action_net.parameters()
-    )
+def actor_head_parameters(policy: PolicyBase) -> list[torch.nn.Parameter]:
+    parameters = list(policy.action_net.parameters())
+    if hasattr(policy, "projection") and policy.projection is not None:
+        parameters += list(policy.projection.parameters())
+    if hasattr(policy, "predictor") and policy.predictor is not None:
+        parameters += list(policy.predictor.parameters())
     if policy.log_std is not None:
         parameters.append(policy.log_std)
     return parameters
@@ -552,7 +593,9 @@ def configure_actor_optimizer(
         "weight_decay": 0.0,
     }
 
-    backbone_params = list(policy.backbone.parameters())
+    backbone_params = list(policy.backbone.parameters()) + list(
+        policy.policy_net.parameters()
+    )
     if float(backbone_lr_start) <= 0.0:
         return torch.optim.Adam(head_params, lr=head_lr_start, **optimizer_kwargs)
 
@@ -797,13 +840,11 @@ def fixed_arch_actor_update(
             entropy_loss = -entropy.mean()
 
             if use_dynamics:
-                dyn_loss = compute_dynamics_loss(
-                    online_policy=policy,
+                dyn_loss = policy.compute_dynamics_loss(
                     ema_policy=ema_policy,
                     start_features=features,
                     next_observations=rollout_data.next_observations,
                     actions=batch_actions,
-                    action_space=action_space,
                     sample_weights=rollout_data.dynamics_masks,
                 )
                 loss = (
@@ -1026,41 +1067,3 @@ def update_ema_model(
             ema_buffer.copy_(online_buffer)
 
 
-def compute_dynamics_loss(
-    online_policy: PolicySupernet,
-    ema_policy: PolicySupernet,
-    start_features: torch.Tensor,
-    next_observations: torch.Tensor,
-    actions: torch.Tensor,
-    action_space: spaces.Space,
-    sample_weights: torch.Tensor | None,
-) -> torch.Tensor:
-    """Normalised cosine-distance latent dynamics loss.
-
-    ``online_policy`` predicts the next latent from *start_features* + *actions*;
-    the target comes from ``ema_policy`` encoding *next_observations*.
-    """
-    if sample_weights is not None:
-        active_mask = sample_weights.to(device=start_features.device).view(-1) > 0.0
-        if not bool(active_mask.any()):
-            return torch.zeros((), dtype=torch.float32, device=start_features.device)
-        start_features = start_features[active_mask]
-        next_observations = next_observations[active_mask]
-        actions = actions[active_mask]
-        sample_weights = sample_weights.to(device=start_features.device)[active_mask]
-
-    start_latent = online_policy.project_features(start_features)
-    action_features = encode_action_batch(actions, action_space).to(
-        device=start_features.device
-    )
-    predicted_next_latent = start_latent + online_policy.predictor(
-        start_latent, action_features
-    )
-    with torch.no_grad():
-        target_next_latent = ema_policy.project_observations(next_observations)
-
-    return latent_dynamics_loss(
-        predictions=predicted_next_latent,
-        teacher_targets=target_next_latent,
-        sample_weights=sample_weights,
-    )

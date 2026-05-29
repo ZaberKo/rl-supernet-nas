@@ -26,12 +26,9 @@ from env_utils import EVAL_SEED_OFFSET, make_vec_env_from_ppo_config
 from nsga2_search import DiscreteNSGA2
 from ppo_utils import (
     FixedPolicySubnet,
-    PolicySupernet,
-    actor_head_parameters,
     build_sb3_critic_model,
     collect_candidate_rollout,
     configure_actor_optimizer,
-    count_parameters,
     critic_update,
     critic_warmup,
     evaluate_actor_subnet,
@@ -414,14 +411,11 @@ def finetune_and_evaluate_candidate(
             device=device,
             train_env=train_env,
         )
-        policy_backbone_params = sum(
-            p.numel() for p in policy.backbone.parameters()
-        )
-        policy_head_params = count_parameters(actor_head_parameters(policy))
-        policy_params = policy_backbone_params + policy_head_params
-        trainable_policy_params = policy_head_params
-        if any(p.requires_grad for p in policy.backbone.parameters()):
-            trainable_policy_params += policy_backbone_params
+        param_stats = policy.policy_param_stats()
+        policy_backbone_params = param_stats["policy_backbone_params"]
+        policy_head_params = param_stats["policy_head_params"]
+        policy_params = param_stats["policy_params"]
+        trainable_policy_params = param_stats["trainable_policy_params"]
 
         return {
             "return": float(eval_metrics["ep_return"]),
