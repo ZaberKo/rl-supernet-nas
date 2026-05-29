@@ -10,7 +10,6 @@ from typing import Any
 import numpy as np
 import torch
 from omegaconf import DictConfig
-from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import VecEnv
 from tqdm.auto import tqdm
 
@@ -24,6 +23,7 @@ from env_utils import EVAL_SEED_OFFSET, make_vec_env_from_ppo_config
 from ppo_utils import (
     FixedPolicySubnet,
     PolicySupernet,
+    SB3CriticModel,
     append_jsonl_record,
     build_sb3_critic_model,
     collect_candidate_rollout,
@@ -206,7 +206,7 @@ def _save_arch_checkpoint(
     args: argparse.Namespace,
     ppo_config: DictConfig,
     policy: PolicySupernet | FixedPolicySubnet,
-    critic_model: PPO,
+    critic_model: SB3CriticModel,
     actor_optimizer: torch.optim.Optimizer,
     critic_optimizer: torch.optim.Optimizer,
     arch_config: ArchConfig,
@@ -226,7 +226,7 @@ def _save_arch_checkpoint(
         args=args,
         ppo_config=ppo_config,
         policy_state_dict=policy.state_dict(),
-        critic_policy_state_dict=critic_model.policy.state_dict(),
+        critic_policy_state_dict=critic_model.state_dict(),
         actor_optimizer_state_dict=actor_optimizer.state_dict(),
         critic_optimizer_state_dict=critic_optimizer.state_dict(),
         source_stage=source_stage,
@@ -345,11 +345,17 @@ def run(
         critic_model = build_sb3_critic_model(
             ppo_config=ppo_config,
             env=train_env,
-            learning_rate=critic_lr_schedule,
             device=device,
         )
+        critic_lr = (
+            float(critic_lr_schedule(1.0))
+            if callable(critic_lr_schedule)
+            else float(critic_lr_schedule)
+        )
+        critic_optimizer = torch.optim.Adam(
+            critic_model.parameters(), lr=critic_lr, eps=1e-5,
+        )
         loaded_critic = load_critic_from_checkpoint(critic_model, checkpoint)
-        critic_optimizer = critic_model.policy.optimizer
 
         rollout_buffer = DynamicsRolloutBuffer(
             buffer_size=int(ppo_config.n_steps),

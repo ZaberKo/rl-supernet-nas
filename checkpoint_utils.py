@@ -5,11 +5,11 @@ from typing import Any
 
 import torch
 from omegaconf import DictConfig
-from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import VecEnv
 
 from ppo_utils import (
     PolicySupernet,
+    SB3CriticModel,
     resolve_activation_fn,
 )
 from setup_utils import ppo_config_to_dict
@@ -92,7 +92,7 @@ def build_policy_from_checkpoint(
 
 
 def load_critic_from_checkpoint(
-    critic_model: PPO,
+    critic_model: SB3CriticModel,
     checkpoint: Mapping[str, Any],
 ) -> bool:
     state_dict = checkpoint.get("critic_policy_state_dict")
@@ -100,5 +100,5 @@ def load_critic_from_checkpoint(
         raise KeyError("Checkpoint does not contain critic_policy_state_dict.")
     if not isinstance(state_dict, Mapping):
         raise TypeError("critic_policy_state_dict must be a mapping.")
-    critic_model.policy.load_state_dict(state_dict, strict=True)
+    critic_model.load_state_dict(state_dict, strict=False)
     return True

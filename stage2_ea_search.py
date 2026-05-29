@@ -282,7 +282,14 @@ def finetune_and_evaluate_candidate(
         critic_model = build_sb3_critic_model(
             ppo_config=ppo_config,
             env=train_env,
-            learning_rate=critic_lr_schedule,
+        )
+        critic_lr = (
+            float(critic_lr_schedule(1.0))
+            if callable(critic_lr_schedule)
+            else float(critic_lr_schedule)
+        )
+        critic_optimizer = torch.optim.Adam(
+            critic_model.parameters(), lr=critic_lr, eps=1e-5,
         )
         loaded_critic = load_critic_from_checkpoint(critic_model, checkpoint)
 
@@ -309,6 +316,7 @@ def finetune_and_evaluate_candidate(
             ) = critic_warmup(
                 policy=policy,
                 critic_model=critic_model,
+                critic_optimizer=critic_optimizer,
                 env=train_env,
                 rollout_buffer=rollout_buffer,
                 initial_observation=observation,
@@ -349,7 +357,7 @@ def finetune_and_evaluate_candidate(
                 else float(clip_range_schedule)
             )
             update_actor_optimizer_learning_rate(actor_optimizer, actor_lr, backbone_lr)
-            update_optimizer_learning_rate(critic_model.policy.optimizer, critic_lr)
+            update_optimizer_learning_rate(critic_optimizer, critic_lr)
 
             observation, episode_starts, rollout_metrics = collect_candidate_rollout(
                 policy=policy,
@@ -382,7 +390,7 @@ def finetune_and_evaluate_candidate(
                 update_ema_model(ema_policy, policy, tau=float(ppo_config.ema_tau))
             critic_metrics = critic_update(
                 critic_model=critic_model,
-                optimizer=critic_model.policy.optimizer,
+                optimizer=critic_optimizer,
                 rollout_buffer=rollout_buffer,
                 n_epochs=int(ppo_config.n_epochs),
                 batch_size=int(ppo_config.batch_size),

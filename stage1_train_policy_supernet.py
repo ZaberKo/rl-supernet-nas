@@ -11,7 +11,6 @@ import torch
 import torch.nn.functional as F
 from gymnasium import spaces
 from omegaconf import DictConfig
-from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import (
     VecEnv,
 )
@@ -21,6 +20,7 @@ from checkpoint_utils import save_checkpoint
 from env_utils import EVAL_SEED_OFFSET, make_vec_env_from_ppo_config
 from ppo_utils import (
     PolicySupernet,
+    SB3CriticModel,
     append_jsonl_record,
     bootstrap_time_limit_rewards,
     build_sb3_critic_model,
@@ -94,7 +94,7 @@ def parse_args() -> argparse.Namespace:
 
 def collect_rollout(
     policy: PolicySupernet,
-    critic_model: PPO,
+    critic_model: SB3CriticModel,
     env: VecEnv,
     rollout_buffer: DynamicsRolloutBuffer,
     initial_observation: np.ndarray,
@@ -104,7 +104,7 @@ def collect_rollout(
     device: torch.device,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
     policy.eval()
-    critic_model.policy.eval()
+    critic_model.eval()
     policy.set_max_arch()
     rollout_buffer.reset()
 
@@ -422,7 +422,7 @@ def _save_supernet_checkpoint(
     ppo_config: DictConfig,
     policy: PolicySupernet,
     ema_policy: PolicySupernet,
-    critic_model: PPO,
+    critic_model: SB3CriticModel,
     actor_optimizer: torch.optim.Optimizer,
     critic_optimizer: torch.optim.Optimizer,
     total_timesteps: int,
@@ -434,7 +434,7 @@ def _save_supernet_checkpoint(
         args=args,
         ppo_config=ppo_config,
         policy_state_dict=policy.state_dict(),
-        critic_policy_state_dict=critic_model.policy.state_dict(),
+        critic_policy_state_dict=critic_model.state_dict(),
         actor_optimizer_state_dict=actor_optimizer.state_dict(),
         critic_optimizer_state_dict=critic_optimizer.state_dict(),
         ema_policy_state_dict=ema_policy.state_dict(),
@@ -507,7 +507,14 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
         critic_model = build_sb3_critic_model(
             ppo_config=ppo_config,
             env=train_env,
-            learning_rate=critic_lr_schedule,
+        )
+        critic_lr = (
+            float(critic_lr_schedule(1.0))
+            if callable(critic_lr_schedule)
+            else float(critic_lr_schedule)
+        )
+        critic_optimizer = torch.optim.Adam(
+            critic_model.parameters(), lr=critic_lr, eps=1e-5,
         )
 
         actor_optimizer = configure_actor_optimizer(
@@ -515,7 +522,6 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             head_lr=policy_head_lr_schedule,
             backbone_lr=policy_backbone_lr_schedule,
         )
-        critic_optimizer = critic_model.policy.optimizer
         rollout_buffer = DynamicsRolloutBuffer(
             buffer_size=ppo_config.n_steps,
             observation_space=train_env.observation_space,

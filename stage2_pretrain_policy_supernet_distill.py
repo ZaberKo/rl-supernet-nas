@@ -10,7 +10,6 @@ from typing import Any
 import numpy as np
 import torch
 from omegaconf import DictConfig
-from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import VecEnv
 from tqdm.auto import tqdm
 
@@ -22,6 +21,7 @@ from checkpoint_utils import (
 from env_utils import EVAL_SEED_OFFSET, make_vec_env_from_ppo_config
 from ppo_utils import (
     PolicySupernet,
+    SB3CriticModel,
     append_jsonl_record,
     build_sb3_critic_model,
     configure_actor_optimizer,
@@ -362,7 +362,8 @@ def _save_distill_checkpoint(
     args: argparse.Namespace,
     ppo_config: DictConfig,
     policy: PolicySupernet,
-    critic_model: PPO,
+    critic_model: SB3CriticModel,
+    critic_optimizer: torch.optim.Optimizer,
     actor_optimizer: torch.optim.Optimizer,
     total_timesteps: int,
     iteration: int,
@@ -378,9 +379,9 @@ def _save_distill_checkpoint(
         args=args,
         ppo_config=ppo_config,
         policy_state_dict=policy.state_dict(),
-        critic_policy_state_dict=critic_model.policy.state_dict(),
+        critic_policy_state_dict=critic_model.state_dict(),
         actor_optimizer_state_dict=actor_optimizer.state_dict(),
-        critic_optimizer_state_dict=critic_model.policy.optimizer.state_dict(),
+        critic_optimizer_state_dict=critic_optimizer.state_dict(),
         total_timesteps=total_timesteps,
         iteration=iteration,
         teacher_checkpoint=str(args.teacher_checkpoint),
@@ -520,7 +521,14 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
         critic_model = build_sb3_critic_model(
             ppo_config=ppo_config,
             env=train_env,
-            learning_rate=critic_lr_schedule,
+        )
+        critic_lr = (
+            float(critic_lr_schedule(1.0))
+            if callable(critic_lr_schedule)
+            else float(critic_lr_schedule)
+        )
+        critic_optimizer = torch.optim.Adam(
+            critic_model.parameters(), lr=critic_lr, eps=1e-5,
         )
 
         target_timesteps = max(0, int(ppo_config.total_timesteps))
@@ -572,6 +580,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                     ppo_config=ppo_config,
                     policy=policy,
                     critic_model=critic_model,
+                    critic_optimizer=critic_optimizer,
                     actor_optimizer=actor_optimizer,
                     total_timesteps=total_timesteps,
                     iteration=iteration,
@@ -696,6 +705,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
                 ppo_config=ppo_config,
                 policy=policy,
                 critic_model=critic_model,
+                critic_optimizer=critic_optimizer,
                 actor_optimizer=actor_optimizer,
                 total_timesteps=total_timesteps,
                 iteration=iteration,
@@ -724,6 +734,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             ppo_config=ppo_config,
             policy=policy,
             critic_model=critic_model,
+            critic_optimizer=critic_optimizer,
             actor_optimizer=actor_optimizer,
             total_timesteps=total_timesteps,
             iteration=iteration,

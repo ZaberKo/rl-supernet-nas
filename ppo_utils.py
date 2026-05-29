@@ -13,7 +13,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from gymnasium import spaces
 from omegaconf import DictConfig
-from stable_baselines3 import PPO
+from stable_baselines3.common.preprocessing import preprocess_obs
+from stable_baselines3.common.torch_layers import NatureCNN
 from stable_baselines3.common.vec_env import (
     VecEnv,
     sync_envs_normalization,
@@ -392,6 +393,10 @@ class PolicySupernet(PolicyBase):
         total += sum(parameter.numel() for parameter in self.action_net.parameters())
         if self.log_std is not None:
             total += self.log_std.numel()
+        if hasattr(self, "projection") and self.projection is not None:
+            total += sum(parameter.numel() for parameter in self.projection.parameters())
+        if hasattr(self, "predictor") and self.predictor is not None:
+            total += sum(parameter.numel() for parameter in self.predictor.parameters())
         return total
 
 
@@ -437,69 +442,120 @@ class FixedPolicySubnet(PolicyBase):
             self.action_dim = int(np.prod(self.action_shape, dtype=np.int64))
 
 
-# TODO: build model only, donot use PPO
-def build_sb3_critic_model (
+class _CriticMlp(nn.Module):
+    """Container whose ``value_net`` attribute matches the
+    ``mlp_extractor.value_net`` key prefix in SB3's ActorCriticPolicy
+    state dict, enabling checkpoint compatibility."""
+
+    def __init__(
+        self,
+        features_dim: int,
+        value_net_arch: list[int],
+        activation_fn: type[nn.Module],
+    ):
+        super().__init__()
+        layers: list[nn.Module] = []
+        last_dim = features_dim
+        for dim in value_net_arch:
+            layers.append(nn.Linear(last_dim, dim))
+            layers.append(activation_fn())
+            last_dim = dim
+        self.value_net = nn.Sequential(*layers)
+        self.latent_dim_vf = last_dim
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        return self.value_net(features)
+
+
+class SB3CriticModel(nn.Module):
+    """Standalone value-function model using SB3's NatureCNN backbone.
+
+    Sub-module names (``features_extractor``, ``mlp_extractor.value_net``,
+    ``value_net``) are chosen to match the critic keys of SB3's
+    ``ActorCriticCnnPolicy`` state dict so that checkpoints saved by the
+    old ``PPO``-based code can be loaded with ``strict=False``.
+    """
+
+    def __init__(
+        self,
+        observation_space: spaces.Space,
+        features_dim: int,
+        value_net_arch: list[int],
+        activation_fn: type[nn.Module],
+        ortho_init: bool,
+    ):
+        super().__init__()
+        self.observation_space = observation_space
+        self.features_extractor = NatureCNN(
+            observation_space, features_dim=features_dim,
+        )
+        self.mlp_extractor = _CriticMlp(
+            features_dim=features_dim,
+            value_net_arch=value_net_arch,
+            activation_fn=activation_fn,
+        )
+        self.value_net = nn.Linear(self.mlp_extractor.latent_dim_vf, 1)
+
+        if ortho_init:
+            self._ortho_init()
+
+    def _ortho_init(self) -> None:
+        """Apply orthogonal initialization (same convention as SB3)."""
+        module_gains: dict[nn.Module, float] = {
+            self.features_extractor: math.sqrt(2.0),
+            self.mlp_extractor: math.sqrt(2.0),
+            self.value_net: 1.0,
+        }
+        for module, gain in module_gains.items():
+            for m in module.modules():
+                if isinstance(m, (nn.Linear, nn.Conv2d)):
+                    nn.init.orthogonal_(m.weight, gain=gain)
+                    if m.bias is not None:
+                        m.bias.data.fill_(0.0)
+
+    def predict_values(self, obs: torch.Tensor) -> torch.Tensor:
+        preprocessed = preprocess_obs(
+            obs, self.observation_space, normalize_images=True,
+        )
+        features = self.features_extractor(preprocessed)
+        latent_vf = self.mlp_extractor(features)
+        return self.value_net(latent_vf)
+
+
+def build_sb3_critic_model(
     ppo_config: DictConfig,
     env: VecEnv,
-    learning_rate: Any,
     device: str | torch.device | None = None,
-) -> PPO:
-    policy_kwargs: dict[str, Any] = {
-        "net_arch": {
-            "pi": [],
-            "vf": list(ppo_config.value_net_arch),
-        },
-        "features_extractor_kwargs": {"features_dim": ppo_config.features_dim},
-    }
+) -> SB3CriticModel:
     activation_fn = resolve_activation_fn(ppo_config.activation_fn)
-    if activation_fn is not None:
-        policy_kwargs["activation_fn"] = activation_fn
-    if ppo_config.ortho_init is not None:
-        policy_kwargs["ortho_init"] = ppo_config.ortho_init
-    log_std_init = ppo_config.log_std_init
-    if log_std_init is not None:
-        policy_kwargs["log_std_init"] = log_std_init
+    if activation_fn is None:
+        activation_fn = nn.Tanh
+    ortho_init = ppo_config.ortho_init if ppo_config.ortho_init is not None else True
 
     if device is None:
         device = str(ppo_config.device)
 
-    return PPO(
-        "CnnPolicy",
-        env,
-        learning_rate=learning_rate,
-        n_steps=ppo_config.n_steps,
-        batch_size=ppo_config.batch_size,
-        n_epochs=ppo_config.n_epochs,
-        gamma=ppo_config.gamma,
-        gae_lambda=ppo_config.gae_lambda,
-        clip_range=parse_schedule_value(ppo_config.clip_range),
-        normalize_advantage=ppo_config.normalize_advantage,
-        ent_coef=ppo_config.ent_coef,
-        vf_coef=ppo_config.vf_coef,
-        max_grad_norm=ppo_config.max_grad_norm,
-        target_kl=ppo_config.target_kl,
-        stats_window_size=ppo_config.stats_window_size,
-        tensorboard_log=ppo_config.tensorboard_log,
-        policy_kwargs=policy_kwargs,
-        use_sde=ppo_config.use_sde and isinstance(env.action_space, spaces.Box),
-        sde_sample_freq=ppo_config.sde_sample_freq,
-        seed=ppo_config.seed,
-        device=str(device),
-        verbose=0 if ppo_config.quiet else 1,
+    model = SB3CriticModel(
+        observation_space=env.observation_space,
+        features_dim=int(ppo_config.features_dim),
+        value_net_arch=list(ppo_config.value_net_arch),
+        activation_fn=activation_fn,
+        ortho_init=bool(ortho_init),
     )
+    return model.to(device)
 
 
 def predict_critic_values(
-    critic_model: PPO, observations: torch.Tensor
+    critic_model: SB3CriticModel, observations: torch.Tensor
 ) -> torch.Tensor:
-    return critic_model.policy.predict_values(observations).flatten()
+    return critic_model.predict_values(observations).flatten()
 
 
 def bootstrap_time_limit_rewards(
     rewards: np.ndarray,
     dones: np.ndarray,
     infos: list[dict[str, Any]],
-    critic_model: PPO,
+    critic_model: SB3CriticModel,
     device: torch.device,
     gamma: float,
 ) -> np.ndarray:
@@ -531,14 +587,14 @@ def bootstrap_time_limit_rewards(
 
 
 def critic_update(
-    critic_model: PPO,
+    critic_model: SB3CriticModel,
     optimizer: torch.optim.Optimizer,
     rollout_buffer: DynamicsRolloutBuffer,
     n_epochs: int,
     batch_size: int,
     max_grad_norm: float,
 ) -> dict[str, float]:
-    critic_model.policy.train()
+    critic_model.train()
     loss_sum = 0.0
     update_count = 0
     for _ in range(int(n_epochs)):
@@ -549,7 +605,7 @@ def critic_update(
             loss.backward()
             if max_grad_norm > 0.0:
                 torch.nn.utils.clip_grad_norm_(
-                    critic_model.policy.parameters(), float(max_grad_norm)
+                    critic_model.parameters(), float(max_grad_norm)
                 )
             optimizer.step()
             loss_sum += float(loss.detach().cpu())
@@ -572,7 +628,7 @@ def actor_head_parameters(policy: PolicyBase) -> list[torch.nn.Parameter]:
 
 
 def configure_actor_optimizer(
-    policy: PolicySupernet,
+    policy: PolicyBase,
     head_lr: Any,
     backbone_lr: Any,
 ) -> torch.optim.Optimizer:
@@ -672,8 +728,8 @@ def require_monitor_episode_info(info: Mapping[str, Any], context: str) -> Mappi
 
 
 def collect_candidate_rollout(
-    policy: PolicySupernet,
-    critic_model: PPO,
+    policy: PolicyBase,
+    critic_model: SB3CriticModel,
     env: VecEnv,
     rollout_buffer: DynamicsRolloutBuffer,
     initial_observation: np.ndarray,
@@ -683,7 +739,7 @@ def collect_candidate_rollout(
     device: torch.device,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
     policy.eval()
-    critic_model.policy.eval()
+    critic_model.eval()
     rollout_buffer.reset()
 
     num_envs = int(env.num_envs)
@@ -774,7 +830,7 @@ def collect_candidate_rollout(
 
 
 def fixed_arch_actor_update(
-    policy: PolicySupernet,
+    policy: PolicyBase,
     actor_optimizer: torch.optim.Optimizer,
     rollout_buffer: DynamicsRolloutBuffer,
     action_space: spaces.Space,
@@ -785,7 +841,7 @@ def fixed_arch_actor_update(
     ent_coef: float,
     max_grad_norm: float,
     target_kl: float | None,
-    ema_policy: PolicySupernet | None = None,
+    ema_policy: PolicyBase | None = None,
     z_dyn_coef: float = 0.0,
 ) -> dict[str, float]:
     policy.train()
@@ -904,7 +960,7 @@ def fixed_arch_actor_update(
 
 
 def evaluate_actor_subnet(
-    policy: PolicySupernet,
+    policy: PolicyBase,
     eval_env: VecEnv,
     n_eval_episodes: int,
     deterministic: bool,
@@ -967,8 +1023,9 @@ def evaluate_actor_subnet(
 
 
 def critic_warmup(
-    policy: PolicySupernet,
-    critic_model: PPO,
+    policy: PolicyBase,
+    critic_model: SB3CriticModel,
+    critic_optimizer: torch.optim.Optimizer,
     env: VecEnv,
     rollout_buffer: DynamicsRolloutBuffer,
     initial_observation: np.ndarray,
@@ -993,7 +1050,7 @@ def critic_warmup(
             if callable(critic_lr_schedule)
             else float(critic_lr_schedule)
         )
-        update_optimizer_learning_rate(critic_model.policy.optimizer, critic_lr)
+        update_optimizer_learning_rate(critic_optimizer, critic_lr)
         observation, episode_starts, rollout_metrics = collect_candidate_rollout(
             policy=policy,
             critic_model=critic_model,
@@ -1008,7 +1065,7 @@ def critic_warmup(
         actual_timesteps += int(ppo_config.n_steps) * int(env.num_envs)
         critic_metrics = critic_update(
             critic_model=critic_model,
-            optimizer=critic_model.policy.optimizer,
+            optimizer=critic_optimizer,
             rollout_buffer=rollout_buffer,
             n_epochs=int(ppo_config.n_epochs),
             batch_size=int(ppo_config.batch_size),
@@ -1029,10 +1086,10 @@ def count_parameters(parameters: list[torch.nn.Parameter]) -> int:
 
 
 def create_ema_policy(
-    policy: PolicySupernet,
+    policy: PolicyBase,
     device: torch.device,
     checkpoint_ema_state_dict: dict[str, Any] | None = None,
-) -> PolicySupernet:
+) -> PolicyBase:
     """Create an EMA copy of *policy*.
 
     If *checkpoint_ema_state_dict* is provided, the EMA model is initialised
@@ -1047,8 +1104,8 @@ def create_ema_policy(
 
 
 def update_ema_model(
-    ema_policy: PolicySupernet,
-    online_policy: PolicySupernet,
+    ema_policy: PolicyBase,
+    online_policy: PolicyBase,
     tau: float,
 ) -> None:
     """Exponential moving-average update: ``ema ← tau * ema + (1-tau) * online``."""
