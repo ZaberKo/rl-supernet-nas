@@ -2,15 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import time
-from itertools import batched
 from pathlib import Path
 from typing import Any
 
+import ray
 import torch
-import torch.multiprocessing as mp
+from ray.util.actor_pool import ActorPool
 
 from checkpoint_utils import (
     build_policy_from_checkpoint,
@@ -24,6 +23,7 @@ from ppo_utils import (
 from setup_utils import (
     add_ppo_config_args,
     build_run_config,
+    compute_ray_worker_config,
     load_ppo_config,
     ppo_config_to_dict,
     resolve_device,
@@ -31,6 +31,12 @@ from setup_utils import (
 )
 from supernet_backbone import ArchConfig, SearchSpace
 from wandb_utils import finish_wandb_run, init_wandb_run, update_wandb_summary
+
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 
 def parse_args() -> argparse.Namespace:
@@ -57,10 +63,10 @@ def parse_args() -> argparse.Namespace:
         help="Directory for evaluation results and manifest.",
     )
     parser.add_argument(
-        "--eval_workers",
+        "--workers",
         type=int,
         default=1,
-        help="Torch multiprocessing workers for parallel subnet evaluation.",
+        help="Total number of Ray actors for parallel subnet evaluation.",
     )
     parser.add_argument(
         "--suffix",
@@ -68,8 +74,12 @@ def parse_args() -> argparse.Namespace:
         help="Optional suffix to append to the stage name.",
     )
     args = parser.parse_args()
-    args.mp_start_method = "spawn"
     return args
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
 
 
 def load_arch_configs_list(path: str | Path) -> list[dict[str, Any]]:
@@ -154,52 +164,70 @@ def evaluate_single_arch(
     }
 
 
-def _eval_arch_worker(
-    args: argparse.Namespace,
-    ppo_config: Any,
-    arch_entries: list[tuple[int, ArchConfig]],
-) -> list[dict[str, Any]]:
-    """Evaluate a batch of architectures sharing one policy and one eval_env."""
-    eval_seed = int(ppo_config.seed) + EVAL_SEED_OFFSET
-    set_global_seeds(eval_seed)
-    device = resolve_device(str(ppo_config.device))
-    search_space = SearchSpace()
-    checkpoint = load_checkpoint(args.supernet_checkpoint, map_location=device)
+# ---------------------------------------------------------------------------
+# Ray Actor
+# ---------------------------------------------------------------------------
 
-    eval_env = make_vec_env_from_ppo_config(
-        ppo_config, seed=eval_seed, n_envs=ppo_config.eval_n_envs
-    )
-    try:
-        policy = build_policy_from_checkpoint(
-            ppo_config=ppo_config,
-            env=eval_env,
+
+class SubnetEvaluatorActor:
+    """Ray actor that holds a persistent policy supernet and eval env.
+
+    Each call to :meth:`evaluate` sets the arch config on the shared policy
+    and evaluates a single architecture (preemptive 1-at-a-time scheduling).
+    """
+
+    def __init__(
+        self,
+        supernet_checkpoint: str,
+        ppo_config_dict: dict[str, Any],
+    ) -> None:
+        from omegaconf import OmegaConf
+
+        self.ppo_config = OmegaConf.create(ppo_config_dict)
+        eval_seed = int(self.ppo_config.seed) + EVAL_SEED_OFFSET
+        set_global_seeds(eval_seed)
+        self.device = resolve_device(str(self.ppo_config.device))
+        search_space = SearchSpace()
+        checkpoint = load_checkpoint(supernet_checkpoint, map_location=self.device)
+
+        self.eval_env = make_vec_env_from_ppo_config(
+            self.ppo_config, seed=eval_seed, n_envs=self.ppo_config.eval_n_envs
+        )
+        self.policy = build_policy_from_checkpoint(
+            ppo_config=self.ppo_config,
+            env=self.eval_env,
             search_space=search_space,
             checkpoint=checkpoint,
-            device=device,
+            device=self.device,
         )
-        results: list[dict[str, Any]] = []
-        for arch_index, arch_config in arch_entries:
-            t0 = time.monotonic()
-            result = evaluate_single_arch(
-                policy=policy,
-                eval_env=eval_env,
-                arch_config=arch_config,
-                ppo_config=ppo_config,
-                device=device,
-            )
-            elapsed = time.monotonic() - t0
-            results.append({
-                "arch_index": arch_index,
-                "arch_config": arch_config.to_dict(),
-                "eval_seed": eval_seed,
-                "pid": os.getpid(),
-                "eval_time_s": round(elapsed, 2),
-                **result,
-            })
-        return results
-    finally:
-        eval_env.close()
 
+    def evaluate(
+        self, arch_index: int, arch_config_dict: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Evaluate a single architecture and return metrics."""
+        arch_config = ArchConfig.from_dict(arch_config_dict)
+        t0 = time.monotonic()
+        result = evaluate_single_arch(
+            policy=self.policy,
+            eval_env=self.eval_env,
+            arch_config=arch_config,
+            ppo_config=self.ppo_config,
+            device=self.device,
+        )
+        elapsed = time.monotonic() - t0
+        return {
+            "arch_index": arch_index,
+            "arch_config": arch_config_dict,
+            "eval_seed": int(self.ppo_config.seed) + EVAL_SEED_OFFSET,
+            "pid": os.getpid(),
+            "eval_time_s": round(elapsed, 2),
+            **result,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 
 def main() -> None:
@@ -233,29 +261,41 @@ def main() -> None:
     eval_seed = int(ppo_config.seed) + EVAL_SEED_OFFSET
     ppo_config_dict = ppo_config_to_dict(ppo_config)
 
-    eval_workers = max(1, int(args.eval_workers))
+    worker_cfg = compute_ray_worker_config(args.workers)
+
     print(
-        f"Evaluating {len(arch_configs)} architectures with {eval_workers} worker(s)...",
+        f"Evaluating {len(arch_configs)} architectures with {worker_cfg.summary()}...",
         flush=True,
     )
 
-    arch_entries = list(enumerate(arch_configs))
+    # Initialize Ray (idempotent)
+    ray.init(ignore_reinit_error=True)
 
-    if eval_workers <= 1:
-        # Single-worker: call _eval_arch_worker directly
-        results = _eval_arch_worker(args, ppo_config, arch_entries)
-    else:
-        # Multi-worker: partition archs among workers.
-        # Each worker creates ONE shared policy + eval_env for its batch.
-        batch_size = math.ceil(len(arch_entries) / eval_workers)
-        partitions = list(batched(arch_entries, batch_size))
-        starmap_args = [
-            (args, ppo_config, part) for part in partitions
-        ]
-        context = mp.get_context(args.mp_start_method)
-        with context.Pool(processes=len(starmap_args)) as pool:
-            nested_results = pool.starmap(_eval_arch_worker, starmap_args)
-        results = [r for batch in nested_results for r in batch]
+    # Create Ray Actor class with resource spec
+    RemoteActor = ray.remote(
+        num_gpus=worker_cfg.gpu_fraction,
+    )(SubnetEvaluatorActor)
+
+    actors = [
+        RemoteActor.remote(
+            supernet_checkpoint=args.supernet_checkpoint,
+            ppo_config_dict=ppo_config_dict,
+        )
+        for _ in range(worker_cfg.num_workers)
+    ]
+    pool = ActorPool(actors)
+
+    # Submit all archs for preemptive scheduling (1 arch per call)
+    task_args = [
+        (arch_index, arch.to_dict())
+        for arch_index, arch in enumerate(arch_configs)
+    ]
+    results: list[dict[str, Any]] = list(
+        pool.map_unordered(
+            lambda actor, item: actor.evaluate.remote(item[0], item[1]),
+            task_args,
+        )
+    )
 
     # Sort by arch_index to preserve input order
     results.sort(key=lambda r: r["arch_index"])
@@ -292,7 +332,7 @@ def main() -> None:
         "arch_configs_path": str(args.arch_configs),
         "num_archs": len(arch_configs),
         "eval_seed": eval_seed,
-        "eval_workers": eval_workers,
+        "num_workers": worker_cfg.num_workers,
         "records": str(records_path),
         "search_space": str(output_dir / "search_space.json"),
         "results": results,
@@ -315,6 +355,7 @@ def main() -> None:
         },
     )
     finish_wandb_run(wandb_run)
+
 
 if __name__ == "__main__":
     main()

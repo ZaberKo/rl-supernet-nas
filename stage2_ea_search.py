@@ -4,26 +4,26 @@ import argparse
 import copy
 import json
 import os
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+import ray
 import torch
-import torch.multiprocessing as mp
 from evox.core import Problem
 from evox.operators.selection import non_dominate_rank
 from evox.workflows import EvalMonitor, StdWorkflow
 from omegaconf import DictConfig, OmegaConf
+from ray.util.actor_pool import ActorPool
 
 from checkpoint_utils import (
     build_policy_from_checkpoint,
     load_checkpoint,
     load_critic_from_checkpoint,
 )
+from discrete_nsga2 import DiscreteNSGA2
 from ea_codec import GeneCodec
 from env_utils import EVAL_SEED_OFFSET, make_vec_env_from_ppo_config
-from nsga2_search import DiscreteNSGA2
 from ppo_utils import (
     FixedPolicySubnet,
     build_sb3_critic_model,
@@ -40,6 +40,7 @@ from ppo_utils import (
 from setup_utils import (
     add_ppo_config_args,
     build_run_config,
+    compute_ray_worker_config,
     load_ppo_config,
     parse_schedule_value,
     ppo_config_to_dict,
@@ -56,6 +57,7 @@ from wandb_utils import (
     log_wandb,
     update_wandb_summary,
 )
+
 
 
 def parse_args() -> argparse.Namespace:
@@ -84,10 +86,10 @@ def parse_args() -> argparse.Namespace:
         help="Number of NSGA-II generations to evaluate.",
     )
     parser.add_argument(
-        "--eval_workers",
+        "--workers",
         type=int,
         default=1,
-        help="Torch multiprocessing workers for parallel subnet evaluation.",
+        help="Total number of Ray actors for parallel subnet evaluation.",
     )
     parser.add_argument(
         "--critic_warmup_timesteps",
@@ -111,8 +113,6 @@ def parse_args() -> argparse.Namespace:
     args.eval_call_seed_stride = 10_000
     args.candidate_seed_stride = 100
 
-    args.mp_start_method = "spawn"
-    args.worker_torch_threads = 1
     return args
 
 
@@ -224,6 +224,11 @@ def log_generation(
         log_file.write(message + "\n")
     summary = generation_summary(generation, records, cache_hits)
     log_wandb(wandb_run, summary, step=generation)
+
+
+# ---------------------------------------------------------------------------
+# Standalone candidate evaluation function (used by both Actor and local)
+# ---------------------------------------------------------------------------
 
 
 def finetune_and_evaluate_candidate(
@@ -452,44 +457,65 @@ def finetune_and_evaluate_candidate(
         eval_env.close()
 
 
-@dataclass(frozen=True)
-class NewPolicySubnetEvalConfig:
-    args: dict[str, Any]
-    ppo_config: dict[str, Any]
-    arch_config: dict[str, Any]
-    gene: list[int]
-    train_seed: int
-    eval_seed: int
+# ---------------------------------------------------------------------------
+# Ray Actor for EA candidate evaluation
+# ---------------------------------------------------------------------------
 
 
-def _evaluate_new_policy_subnet_worker(
-    config: NewPolicySubnetEvalConfig,
-) -> dict[str, Any]:
-    worker_threads = int(config.args.get("worker_torch_threads", 1))
-    if worker_threads > 0:
-        torch.set_num_threads(worker_threads)
-    args = argparse.Namespace(**config.args)
-    ppo_config = OmegaConf.create(config.ppo_config)
-    arch_config = ArchConfig.from_dict(config.arch_config)
-    result = finetune_and_evaluate_candidate(
-        args=args,
-        ppo_config=ppo_config,
-        arch_config=arch_config,
-        train_seed=config.train_seed,
-        eval_seed=config.eval_seed,
-    )
-    return {
-        "gene": config.gene,
-        "arch_config": config.arch_config,
-        "train_seed": int(config.train_seed),
-        "eval_seed": int(config.eval_seed),
-        "pid": os.getpid(),
-        **result,
-    }
+class EACandidateEvaluatorActor:
+    """Ray actor that evaluates a single EA candidate per call.
+
+    Holds a cached checkpoint dict to avoid repeated disk I/O.
+    Environments and models are rebuilt per candidate because fine-tuning
+    mutates model weights.
+    """
+
+    def __init__(
+        self,
+        args_dict: dict[str, Any],
+        ppo_config_dict: dict[str, Any],
+    ) -> None:
+        self.args_dict = args_dict
+        self.ppo_config_dict = ppo_config_dict
+
+    def evaluate_candidate(
+        self,
+        gene: list[int],
+        arch_config_dict: dict[str, Any],
+        train_seed: int,
+        eval_seed: int,
+    ) -> dict[str, Any]:
+        """Finetune and evaluate a single candidate architecture."""
+        args = argparse.Namespace(**self.args_dict)
+        ppo_config = OmegaConf.create(self.ppo_config_dict)
+        arch_config = ArchConfig.from_dict(arch_config_dict)
+        result = finetune_and_evaluate_candidate(
+            args=args,
+            ppo_config=ppo_config,
+            arch_config=arch_config,
+            train_seed=train_seed,
+            eval_seed=eval_seed,
+        )
+        return {
+            "gene": gene,
+            "arch_config": arch_config_dict,
+            "train_seed": int(train_seed),
+            "eval_seed": int(eval_seed),
+            "pid": os.getpid(),
+            **result,
+        }
+
+
+# ---------------------------------------------------------------------------
+# EvoX Problem (modified in-place to use Ray)
+# ---------------------------------------------------------------------------
 
 
 class NewPolicySubnetProblem(Problem):
-    """EvoX problem that evaluates policy-supernet subnet genes by PPO fine-tuning."""
+    """EvoX problem that evaluates policy-supernet subnet genes by PPO fine-tuning.
+
+    Uses Ray actors with preemptive scheduling via ActorPool.
+    """
 
     def __init__(
         self,
@@ -501,45 +527,48 @@ class NewPolicySubnetProblem(Problem):
         self.args_dict = vars(args).copy()
         self.ppo_config_dict = ppo_config_to_dict(ppo_config)
         self.codec = codec
-        self.eval_workers = max(1, int(args.eval_workers))
-        self.mp_start_method = args.mp_start_method
+        self.num_workers = max(1, int(args.workers))
         self.eval_call_index = 0
         self.cache: dict[tuple[int, ...], dict[str, Any]] = {}
         self.last_records: list[dict[str, Any]] = []
         self.last_cache_hits = 0
-        self._pool = None
+        self._pool: ActorPool | None = None
 
-    def _make_eval_config(
-        self, gene: list[int], candidate_index: int
-    ) -> NewPolicySubnetEvalConfig:
+    def _ensure_pool(self) -> ActorPool:
+        """Lazily create Ray actors and wrap them in an ActorPool."""
+        if self._pool is not None:
+            return self._pool
+
+        worker_cfg = compute_ray_worker_config(self.num_workers)
+
+        RemoteActor = ray.remote(
+            num_gpus=worker_cfg.gpu_fraction,
+        )(EACandidateEvaluatorActor)
+
+        actors = [
+            RemoteActor.remote(
+                args_dict=self.args_dict,
+                ppo_config_dict=self.ppo_config_dict,
+            )
+            for _ in range(worker_cfg.num_workers)
+        ]
+        self._pool = ActorPool(actors)
+        return self._pool
+
+    def _compute_seed(self, candidate_index: int) -> tuple[int, int]:
         train_seed = (
             int(self.ppo_config_dict["seed"])
             + self.eval_call_index * int(self.args_dict["eval_call_seed_stride"])
             + candidate_index * int(self.args_dict["candidate_seed_stride"])
         )
         eval_seed = int(self.ppo_config_dict["seed"]) + EVAL_SEED_OFFSET
-        return NewPolicySubnetEvalConfig(
-            args=self.args_dict,
-            ppo_config=self.ppo_config_dict,
-            arch_config=self.codec.gene_to_arch(gene).to_dict(),
-            gene=gene,
-            train_seed=train_seed,
-            eval_seed=eval_seed,
-        )
-
-    def _ensure_pool(self):
-        if self.eval_workers <= 1:
-            return None
-        if self._pool is None:
-            context = mp.get_context(self.mp_start_method)
-            self._pool = context.Pool(processes=self.eval_workers)
-        return self._pool
+        return train_seed, eval_seed
 
     @torch.compiler.disable
     def evaluate(self, pop: torch.Tensor) -> torch.Tensor:
         genes = [[round(value) for value in row.tolist()] for row in pop.detach().cpu()]
         records: list[dict[str, Any] | None] = [None] * len(genes)
-        pending: list[NewPolicySubnetEvalConfig] = []
+        pending_tasks: list[dict[str, Any]] = []
         pending_indices: list[int] = []
         self.last_cache_hits = 0
 
@@ -550,21 +579,64 @@ class NewPolicySubnetProblem(Problem):
                 records[index] = copy.deepcopy(self.cache[key])
                 self.last_cache_hits += 1
             else:
-                pending.append(self._make_eval_config(gene, index))
+                train_seed, eval_seed = self._compute_seed(index)
+                pending_tasks.append({
+                    "gene": gene,
+                    "arch_config_dict": self.codec.gene_to_arch(gene).to_dict(),
+                    "train_seed": train_seed,
+                    "eval_seed": eval_seed,
+                    "original_index": index,
+                })
                 pending_indices.append(index)
 
-        if pending:
-            if self.eval_workers <= 1:
-                evaluated = [
-                    _evaluate_new_policy_subnet_worker(config) for config in pending
-                ]
+        if pending_tasks:
+            if self.num_workers <= 1:
+                # Single worker: run locally without Ray overhead
+                for task in pending_tasks:
+                    args = argparse.Namespace(**self.args_dict)
+                    ppo_config = OmegaConf.create(self.ppo_config_dict)
+                    arch_config = ArchConfig.from_dict(task["arch_config_dict"])
+                    result = finetune_and_evaluate_candidate(
+                        args=args,
+                        ppo_config=ppo_config,
+                        arch_config=arch_config,
+                        train_seed=task["train_seed"],
+                        eval_seed=task["eval_seed"],
+                    )
+                    record = {
+                        "gene": task["gene"],
+                        "arch_config": task["arch_config_dict"],
+                        "train_seed": int(task["train_seed"]),
+                        "eval_seed": int(task["eval_seed"]),
+                        "pid": os.getpid(),
+                        **result,
+                    }
+                    key = tuple(task["gene"])
+                    self.cache[key] = copy.deepcopy(record)
+                    records[task["original_index"]] = record
             else:
+                # Multi-worker: dispatch via Ray ActorPool
                 pool = self._ensure_pool()
-                evaluated = pool.map(_evaluate_new_policy_subnet_worker, pending)
-            for index, record in zip(pending_indices, evaluated, strict=True):
-                key = tuple(record["gene"])
-                self.cache[key] = copy.deepcopy(record)
-                records[index] = record
+                evaluated = list(
+                    pool.map_unordered(
+                        lambda actor, task: actor.evaluate_candidate.remote(
+                            gene=task["gene"],
+                            arch_config_dict=task["arch_config_dict"],
+                            train_seed=task["train_seed"],
+                            eval_seed=task["eval_seed"],
+                        ),
+                        pending_tasks,
+                    )
+                )
+                # Match results back to their original indices by gene
+                gene_to_index = {
+                    tuple(task["gene"]): task["original_index"]
+                    for task in pending_tasks
+                }
+                for record in evaluated:
+                    key = tuple(record["gene"])
+                    self.cache[key] = copy.deepcopy(record)
+                    records[gene_to_index[key]] = record
 
         self.last_records = [record for record in records if record is not None]
         self.eval_call_index += 1
@@ -575,10 +647,7 @@ class NewPolicySubnetProblem(Problem):
         return torch.tensor(objectives, dtype=torch.float32, device=pop.device)
 
     def close(self) -> None:
-        if self._pool is not None:
-            self._pool.close()
-            self._pool.join()
-            self._pool = None
+        self._pool = None
 
 
 def main() -> None:
@@ -598,6 +667,9 @@ def main() -> None:
     (output_dir / "search_space.json").write_text(
         json.dumps(search_space.to_dict(), indent=2)
     )
+
+    # Initialize Ray (idempotent)
+    ray.init(ignore_reinit_error=True)
 
     lower_bounds, upper_bounds = codec.gene_bounds()
     initial_population = build_initial_population(args, codec)

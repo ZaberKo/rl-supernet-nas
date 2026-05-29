@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import math
 import random
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -125,3 +127,59 @@ def parse_optional_float(value: Any) -> float | None:
         if name in {"", "none", "null", "off"}:
             return None
     return float(value)
+
+
+# ---------------------------------------------------------------------------
+# Ray worker resource scheduling
+# ---------------------------------------------------------------------------
+
+_GPU_EPS = 1e-5
+
+
+@dataclass(frozen=True)
+class RayWorkerConfig:
+    """Computed Ray actor resource configuration."""
+
+    num_workers: int
+    """Total number of Ray actors to create."""
+
+    num_gpus: int
+    """Number of GPUs detected on the system."""
+
+    workers_per_gpu: int
+    """Maximum number of workers that may share a single GPU."""
+
+    gpu_fraction: float
+    """Per-actor ``num_gpus`` value for ``ray.remote()``."""
+
+    def summary(self) -> str:
+        return (
+            f"workers={self.num_workers}, num_gpus={self.num_gpus}, "
+            f"workers_per_gpu={self.workers_per_gpu}, "
+            f"gpu_fraction={self.gpu_fraction:.6f}"
+        )
+
+
+def compute_ray_worker_config(num_workers: int) -> RayWorkerConfig:
+    """Derive Ray actor GPU scheduling from a total worker count.
+
+    * ``workers_per_gpu = ceil(num_workers / num_gpus)``
+    * ``gpu_fraction = (1 - eps) / workers_per_gpu``
+
+    The ``(1 - eps)`` ensures that ``workers_per_gpu`` actors fit on one GPU
+    without floating-point over-subscription.
+    """
+    num_workers = max(1, int(num_workers))
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if num_gpus > 0:
+        workers_per_gpu = math.ceil(num_workers / num_gpus)
+        gpu_fraction = (1.0 - _GPU_EPS) / workers_per_gpu
+    else:
+        workers_per_gpu = num_workers
+        gpu_fraction = 0.0
+    return RayWorkerConfig(
+        num_workers=num_workers,
+        num_gpus=num_gpus,
+        workers_per_gpu=workers_per_gpu,
+        gpu_fraction=gpu_fraction,
+    )

@@ -9,9 +9,7 @@ wandb
 omegaconf
 datasets
 evox>=1.3.0
-
 h5py
-
-
+ray
 matplotlib
 seaborn

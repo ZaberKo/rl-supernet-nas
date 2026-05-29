@@ -9,5 +9,5 @@ python stage2_ea_search.py \
   --population_size 6 \
   --generations 3 \
   --critic_warmup_timesteps 0 \
-  --eval_workers 1 \
+  --workers 1 \
   --ppo_config_override ppo.total_timesteps=10000 ppo.policy_backbone_lr=0.0
