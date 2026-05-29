@@ -37,8 +37,7 @@ def init_wandb_run(stage: str, run_config: dict[str, Any], output_dir: str | Pat
         return None
 
     output_dir = Path(output_dir)
-    wandb_dir = output_dir / "wandb"
-    wandb_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
     mode = os.environ.get("WANDB_MODE", "online")
     config = sanitize_wandb_value(run_config)
     
@@ -52,7 +51,7 @@ def init_wandb_run(stage: str, run_config: dict[str, Any], output_dir: str | Pat
             name=f"{stage}-{clean_env_id}",
             tags=tags,
             config=config,
-            dir=str(wandb_dir),
+            dir=str(output_dir),
             mode=mode,
         )
     except Exception as exc:
