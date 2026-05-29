@@ -500,6 +500,7 @@ def run(args: argparse.Namespace, ppo_config: DictConfig) -> dict[str, Any]:
             projection_dim=int(ppo_config.projection_dim),
             predictor_hidden_dim=int(ppo_config.predictor_hidden_dim),
         ).to(device)
+        policy.load_state_dict(teacher_policy.state_dict())
 
         z_dyn_coef = float(ppo_config.z_dyn_coef)
         ema_policy: PolicySupernet | None = None
