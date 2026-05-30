@@ -255,42 +255,6 @@ class PolicyBase(nn.Module):
             sample_weights=sample_weights,
         )
 
-    def policy_param_stats(self) -> dict[str, int]:
-        """Compute parameter statistics for this policy.
-
-        Returns:
-            Dict with keys:
-                - ``policy_backbone_params``: backbone + policy_net count.
-                - ``policy_head_params``: action_net + log_std count.
-                - ``policy_params``: total (backbone + head + projection
-                  + predictor).
-                - ``trainable_policy_params``: subset with
-                  ``requires_grad=True``.
-        """
-        backbone_params = list(self.backbone.parameters()) + list(
-            self.policy_net.parameters()
-        )
-        head_params: list[torch.nn.Parameter] = list(self.action_net.parameters())
-        if self.log_std is not None:
-            head_params.append(self.log_std)
-        aux_params: list[torch.nn.Parameter] = []
-        if hasattr(self, "projection") and self.projection is not None:
-            aux_params += list(self.projection.parameters())
-        if hasattr(self, "predictor") and self.predictor is not None:
-            aux_params += list(self.predictor.parameters())
-
-        backbone_count = sum(p.numel() for p in backbone_params)
-        head_count = sum(p.numel() for p in head_params)
-        aux_count = sum(p.numel() for p in aux_params)
-        all_params = backbone_params + head_params + aux_params
-        trainable_count = sum(p.numel() for p in all_params if p.requires_grad)
-
-        return {
-            "policy_backbone_params": backbone_count,
-            "policy_head_params": head_count,
-            "policy_params": backbone_count + head_count + aux_count,
-            "trainable_policy_params": trainable_count,
-        }
 
 class PolicySupernet(PolicyBase):
     def __init__(
@@ -399,6 +363,56 @@ class PolicySupernet(PolicyBase):
             total += sum(parameter.numel() for parameter in self.predictor.parameters())
         return total
 
+    def policy_param_stats(self) -> dict[str, int]:
+        """Compute parameter statistics for the **active** sub-network.
+
+        Uses ``elastic_num_params`` for the backbone so that only the
+        layers selected by the current ``set_sample_config`` are counted.
+
+        Returns:
+            Dict with keys:
+                - ``policy_backbone_params``: active backbone + policy_net.
+                - ``policy_head_params``: action_net + log_std.
+                - ``policy_params``: total (backbone + head + projection
+                  + predictor).
+                - ``trainable_policy_params``: subset with
+                  ``requires_grad=True``.
+        """
+        backbone_count = (
+            int(self.backbone.elastic_num_params)
+            + sum(p.numel() for p in self.policy_net.parameters())
+        )
+        head_params: list[torch.nn.Parameter] = list(self.action_net.parameters())
+        if self.log_std is not None:
+            head_params.append(self.log_std)
+        head_count = sum(p.numel() for p in head_params)
+
+        aux_params: list[torch.nn.Parameter] = []
+        if hasattr(self, "projection") and self.projection is not None:
+            aux_params += list(self.projection.parameters())
+        if hasattr(self, "predictor") and self.predictor is not None:
+            aux_params += list(self.predictor.parameters())
+        aux_count = sum(p.numel() for p in aux_params)
+
+        # For trainable count, backbone params must be enumerated explicitly
+        # since elastic_num_params is a scalar, not a param list.
+        all_real_params = (
+            list(self.backbone.parameters())
+            + list(self.policy_net.parameters())
+            + head_params
+            + aux_params
+        )
+        trainable_count = sum(
+            p.numel() for p in all_real_params if p.requires_grad
+        )
+
+        return {
+            "policy_backbone_params": backbone_count,
+            "policy_head_params": head_count,
+            "policy_params": backbone_count + head_count + aux_count,
+            "trainable_policy_params": trainable_count,
+        }
+
 
 class FixedPolicySubnet(PolicyBase):
     """A fixed-architecture policy subnet extracted from a ``PolicySupernet``.
@@ -440,6 +454,43 @@ class FixedPolicySubnet(PolicyBase):
             self.action_kind = "box"
             self.action_shape = tuple(int(v) for v in action_space.shape)
             self.action_dim = int(np.prod(self.action_shape, dtype=np.int64))
+
+    def policy_param_stats(self) -> dict[str, int]:
+        """Compute parameter statistics for this fixed subnet.
+
+        Returns:
+            Dict with keys:
+                - ``policy_backbone_params``: backbone + policy_net count.
+                - ``policy_head_params``: action_net + log_std count.
+                - ``policy_params``: total (backbone + head + projection
+                  + predictor).
+                - ``trainable_policy_params``: subset with
+                  ``requires_grad=True``.
+        """
+        backbone_params = list(self.backbone.parameters()) + list(
+            self.policy_net.parameters()
+        )
+        head_params: list[torch.nn.Parameter] = list(self.action_net.parameters())
+        if self.log_std is not None:
+            head_params.append(self.log_std)
+        aux_params: list[torch.nn.Parameter] = []
+        if hasattr(self, "projection") and self.projection is not None:
+            aux_params += list(self.projection.parameters())
+        if hasattr(self, "predictor") and self.predictor is not None:
+            aux_params += list(self.predictor.parameters())
+
+        backbone_count = sum(p.numel() for p in backbone_params)
+        head_count = sum(p.numel() for p in head_params)
+        aux_count = sum(p.numel() for p in aux_params)
+        all_params = backbone_params + head_params + aux_params
+        trainable_count = sum(p.numel() for p in all_params if p.requires_grad)
+
+        return {
+            "policy_backbone_params": backbone_count,
+            "policy_head_params": head_count,
+            "policy_params": backbone_count + head_count + aux_count,
+            "trainable_policy_params": trainable_count,
+        }
 
 
 class _CriticMlp(nn.Module):
