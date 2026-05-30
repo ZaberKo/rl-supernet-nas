@@ -22,7 +22,6 @@ from ppo_utils import (
 )
 from setup_utils import (
     add_ppo_config_args,
-    build_run_config,
     compute_ray_worker_config,
     load_ppo_config,
     ppo_config_to_dict,
@@ -30,7 +29,6 @@ from setup_utils import (
     set_global_seeds,
 )
 from supernet_backbone import ArchConfig, SearchSpace
-from wandb_utils import finish_wandb_run, init_wandb_run, update_wandb_summary
 
 
 
@@ -239,8 +237,6 @@ def main() -> None:
     stage_name = (
         f"stage1_eval_archs_{args.suffix}" if getattr(args, "suffix", "") else "stage1_eval_archs"
     )
-    run_config = build_run_config(args, ppo_config)
-    wandb_run = init_wandb_run(stage_name, run_config, output_dir)
 
     search_space = SearchSpace()
     (output_dir / "search_space.json").write_text(
@@ -344,17 +340,6 @@ def main() -> None:
     }
     manifest_path = output_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2))
-
-    update_wandb_summary(
-        wandb_run,
-        {
-            "num_archs": len(arch_configs),
-            "best_return": best["ep_return"],
-            "best_policy_backbone_params": best["policy_backbone_params"],
-            "best_arch_index": best["arch_index"],
-        },
-    )
-    finish_wandb_run(wandb_run)
 
 
 if __name__ == "__main__":
